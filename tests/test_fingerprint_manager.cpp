@@ -720,6 +720,157 @@ private slots:
         mgr.setSuspended(true);
     }
 
+
+    // -----------------------------------------------------------------------
+    // 现场识别流程的**失败分支**（第 26 轮由覆盖率缺口补出）
+    //
+    // 识别流程共三步：GET_IMAGE -> GEN_CHAR -> SEARCH。
+    // 此前只有"三步全成功"和"第一步无应答"被覆盖；第二步、第三步失败的
+    // 提示路径从未执行过，而它们是**用户能看到的界面提示**。
+    // -----------------------------------------------------------------------
+
+    /**
+     * GEN_CHAR（生成特征）失败时应上报"生成特征失败"，且**必须停止**后续流程。
+     *
+     * 判据是 `resp2.size() < 12 || (quint8)resp2[9] != 0x00`：
+     * 确认码非 0x00 即失败。此时不得继续下发 SEARCH —— 否则会在没有特征
+     * 的情况下搜索，搜索结果无意义。
+     *
+     * 覆盖 L145（emit "生成特征失败"）与 L149（return）。
+     */
+    void identifyReportsGenCharFailure()
+    {
+        HailinFingerprint device;
+        QVERIFY(device.open());
+        FingerprintManager mgr;
+        mgr.setDevice(&device);
+
+        QSignalSpy spy(&mgr, &FingerprintManager::identifyResult);
+
+        // 第一步 GET_IMAGE 成功（确认码 0x00）。
+        fakefp::pushConfirm(0x00);
+        // 第二步 GEN_CHAR 失败：确认码 0x01（非 0x00）。
+        fakefp::pushConfirm(0x01);
+
+        mgr.startIdentify();
+
+        // 等到"生成特征失败"这条消息出现（不能只等"有信号"：
+        // 启动时会先发一条"请按下指纹进行识别"的提示，那是**另一个**消息）。
+        QVERIFY2(waitFor([&spy]() {
+            for (int i = 0; i < spy.count(); ++i) {
+                if (spy.at(i).at(3).toString() == QStringLiteral("生成特征失败")) {
+                    return true;
+                }
+            }
+            return false;
+        }, 5000), "GEN_CHAR 返回非 0x00 时应上报『生成特征失败』");
+
+        // 该信号必须是失败（success=false）。
+        for (int i = 0; i < spy.count(); ++i) {
+            if (spy.at(i).at(3).toString() == QStringLiteral("生成特征失败")) {
+                QVERIFY2(!spy.at(i).at(0).toBool(),
+                         "『生成特征失败』不得被上报为成功");
+                break;
+            }
+        }
+
+        // 关键负面断言：失败后**不得**再下发 SEARCH（0x04）。
+        // 只看"出现了失败信号"是不够的 —— 若代码在 emit 后又继续走完流程，
+        // 信号照样出现，但现场会多发一条无意义的 SEARCH。
+        QTest::qWait(kNoMoreMs);
+        for (const QByteArray& f : fakefp::sent()) {
+            // payload 落在外显下标 9；SEARCH 的指令码是 0x04。
+            if (f.size() > 9 + 1) {
+                QVERIFY2(static_cast<quint8>(f.at(9)) != static_cast<quint8>(0x04),
+                         "GEN_CHAR 失败后不得继续下发 SEARCH");
+            }
+        }
+    }
+
+    /**
+     * SEARCH（搜索指纹）未命中时应上报"指纹识别失败"，而不是静默丢弃。
+     *
+     * 判据是 `resp3.size() >= 16 && (quint8)resp3[9] == 0x00`。
+     * 确认码非 0x00（这里用 0x09，真实模块的"未搜索到"确认码）即失败。
+     *
+     * 覆盖 L186（qDebug "指纹识别失败"）与 L188（emit "指纹识别失败"）。
+     */
+    void identifyReportsSearchFailure()
+    {
+        HailinFingerprint device;
+        QVERIFY(device.open());
+        FingerprintManager mgr;
+        mgr.setDevice(&device);
+
+        QSignalSpy spy(&mgr, &FingerprintManager::identifyResult);
+
+        fakefp::pushConfirm(0x00);                        // GET_IMAGE 成功
+        fakefp::pushConfirm(0x00);                        // GEN_CHAR 成功
+        // SEARCH 返回确认码 0x09（未搜索到）。帧长 = 9 + 6 + 2 = 17 >= 16，
+        // 所以它会被长度判据放行，只可能靠确认码被识别为失败 ——
+        // 这正是本条用例要钉住的：确认码非 0x00 必须判失败。
+        fakefp::pushSearchResult(0x09, 0, 0);
+
+        mgr.startIdentify();
+
+        QVERIFY2(waitFor([&spy]() {
+            for (int i = 0; i < spy.count(); ++i) {
+                if (spy.at(i).at(3).toString() == QStringLiteral("指纹识别失败")) {
+                    return true;
+                }
+            }
+            return false;
+        }, 5000), "SEARCH 确认码非 0x00 时应上报『指纹识别失败』");
+
+        for (int i = 0; i < spy.count(); ++i) {
+            if (spy.at(i).at(3).toString() == QStringLiteral("指纹识别失败")) {
+                QVERIFY2(!spy.at(i).at(0).toBool(),
+                         "『指纹识别失败』不得被上报为成功");
+                // 失败时 id/score 必须清零，不得把未命中的 id 报上去。
+                QCOMPARE(spy.at(i).at(1).toInt(), -1);
+                QCOMPARE(spy.at(i).at(2).toInt(), 0);
+                return;
+            }
+        }
+    }
+
+    /**
+     * 对照实验：确认码 0x00 且帧长足够时必须**成功**。
+     *
+     * 与上面两条互为对照 —— 证明失败上报不是因为"只要有应答就算失败"，
+     * 而是真的按确认码判定。缺了这条，前两条即使断言写反也可能碰巧通过。
+     */
+    void identifySuccessRequiresZeroConfirm()
+    {
+        HailinFingerprint device;
+        QVERIFY(device.open());
+        FingerprintManager mgr;
+        mgr.setDevice(&device);
+
+        QSignalSpy spy(&mgr, &FingerprintManager::identifyResult);
+
+        fakefp::pushConfirm(0x00);
+        fakefp::pushConfirm(0x00);
+        fakefp::pushSearchResult(0x00, 42, 77);   // 确认码 0x00 -> 命中
+
+        mgr.startIdentify();
+
+        QVERIFY2(waitFor([&spy]() {
+            for (int i = 0; i < spy.count(); ++i) {
+                if (spy.at(i).at(0).toBool()) return true;
+            }
+            return false;
+        }, 5000), "确认码 0x00 时应上报识别成功");
+
+        for (int i = 0; i < spy.count(); ++i) {
+            if (spy.at(i).at(0).toBool()) {
+                QCOMPARE(spy.at(i).at(1).toInt(), 42);
+                QCOMPARE(spy.at(i).at(2).toInt(), 77);
+                return;
+            }
+        }
+    }
+
     /// sendPacket 失败时不得崩溃，且轮询继续（下一轮再试）。
     void sendFailureDoesNotAbortPolling()
     {
