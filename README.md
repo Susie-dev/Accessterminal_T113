@@ -288,7 +288,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下十七条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下二十条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -794,7 +794,58 @@ return QByteArray::fromHex(compact.toLatin1());
 > **按括号配平扫描**——真实写法 `fromHex(compact.toLatin1())` 的实参含嵌套
 > 括号，用 `[^()]*` 会完全匹配不到而静默漏判。这两点都是故障注入自检抓出来的。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述十七条请以
+### 18. 配置载入必须在每次调用开头复位"已载入"状态
+
+配置类通常是**单例**且 `load()` 可被多次调用。若只在成功分支写
+`m_loadedFromFile = true`、末尾 `return m_loadedFromFile;`，而
+`applyDefaults()` 不复位该标志，则 `load(坏文件)` 会**返回 true**
+（上一次成功的残留），`configPath()` 还指向早已失效的旧文件，调用方误以为
+配置已生效。
+
+本工程使用**函数局部** `bool fileLoaded = false;`，天然无此问题；本条作为
+回归防护存在（室内机侧曾有该缺陷，并已修复）。
+
+### 19. 配置整数转窄类型前必须先夹取
+
+`static_cast<quint16>` 是**取模截断**而不是夹取，实测（真实 Qt）：
+
+| 配置值 | 取模结果 | 应该 |
+| --- | --- | --- |
+| 65536 | **0** → 随机临时端口 | 65535 |
+| 999999 | **16959** | 65535 |
+| -1 | **65535** | 1 |
+
+越界配置会变成"能用的错误值"，比直接报错更难发现。必须先 `clampInt` 再转换。
+本工程当前无 `quint16` 配置项，本条为回归防护（门口机的指纹 ID 已是 2 字节
+线格式，引端口类配置时最容易踩到）。
+
+两条均由 `check_load_state_reset` / `check_narrowing_cast_of_config` 强制，
+自检见 `tools/verify_config_state.py`（7/7）。
+
+### 20. 两个仓库的测试目标名必须唯一
+
+门口机与室内机各有 `tests/CMakeLists.txt`，目标名原本都是 `test_protocol`、
+`test_app_config`。单独构建都好，但把两个仓库作为子目录放进**同一个** CMake
+工程（跨仓库集成，或 IDE 一次性载入）时直接配置失败：
+
+```
+add_executable cannot create target "test_protocol" because another
+target with the same name already exists.
+```
+
+实测：修复前 `configure_rc=1`，两个 `add_executable` 全部失败；给目标名与
+ctest 用例名加仓库前缀（`t113_` / `desktop_`）后，超级工程 **5/5 用例通过**。
+`add_test(NAME ...)` 的用例名同理——重名会让 `ctest -R` 一次选中两个。
+
+由 `check_cross_repo_test_targets_are_unique` 强制（需传入另一仓库根目录，
+见 `tools/verify_cross_target.py`，5/5）：
+
+```bash
+python3 tools/verify.py . ../Accessterminal_desktop
+```
+
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述二十条请以
 `verify.py` 的结果为准。
 
 ---
@@ -823,7 +874,8 @@ python3 tools/check_signatures.py .
 #     check_no_running_reset_in_run / check_no_secret_in_logs /
 #     check_declared_signal_is_emitted / check_connect_signal_is_signal /
 #     check_abandoned_async_tasks / check_subproject_cmake_is_selfcontained /
-#     check_hex_parse_is_validated
+#     check_hex_parse_is_validated / check_load_state_reset /
+#     check_narrowing_cast_of_config
 #     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
@@ -834,6 +886,8 @@ python3 tools/verify_connect_signal.py .
 python3 tools/verify_abandoned_task.py .
 python3 tools/verify_subcmake.py .
 python3 tools/verify_hex_parse.py .
+python3 tools/verify_config_state.py .
+python3 tools/verify_cross_target.py .
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
 #     含「原实现对照」与随机模糊测试；无需编译即可验证定帧逻辑）

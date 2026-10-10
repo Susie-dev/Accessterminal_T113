@@ -51,31 +51,53 @@ find_package(Qt5 5.12 REQUIRED COMPONENTS Core Test)
 # ---------------------------------------------------------------------------
 # 协议契约测试
 # ---------------------------------------------------------------------------
-add_executable(test_protocol test_protocol.cpp)
+add_executable(t113_test_protocol test_protocol.cpp)
 
-target_include_directories(test_protocol PRIVATE
+target_include_directories(t113_test_protocol PRIVATE
     ${ACCESSTERMINAL_SRC_ROOT}
 )
 
-target_link_libraries(test_protocol PRIVATE
+target_link_libraries(t113_test_protocol PRIVATE
     Qt5::Core
     Qt5::Test
 )
 
-add_test(NAME protocol COMMAND test_protocol)
+add_test(NAME t113_protocol COMMAND t113_test_protocol)
 
 # ---------------------------------------------------------------------------
 # 指纹串口帧解析测试（纯逻辑，无需硬件）
 # ---------------------------------------------------------------------------
-add_executable(test_fingerprint_parser test_fingerprint_parser.cpp)
+add_executable(t113_test_fingerprint_parser test_fingerprint_parser.cpp)
 
-target_include_directories(test_fingerprint_parser PRIVATE
+target_include_directories(t113_test_fingerprint_parser PRIVATE
     ${ACCESSTERMINAL_SRC_ROOT}
 )
 
-target_link_libraries(test_fingerprint_parser PRIVATE
+target_link_libraries(t113_test_fingerprint_parser PRIVATE
     Qt5::Core
     Qt5::Test
 )
 
-add_test(NAME fingerprint_parser COMMAND test_fingerprint_parser)
+add_test(NAME t113_fingerprint_parser COMMAND t113_test_fingerprint_parser)
+
+# ---------------------------------------------------------------------------
+# 配置加载与数值兜底（第 8 轮 SIGFPE 与第 9 轮"假开关"的回归测试）
+#
+# 链接真实的 src/config/app_config.cpp。不需要 ALSA / libgpiod / OpenCV，
+# 因此可以脱离主工程独立构建。
+# ---------------------------------------------------------------------------
+add_executable(t113_test_app_config
+    test_app_config.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/config/app_config.cpp
+)
+
+target_include_directories(t113_test_app_config PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+)
+
+target_link_libraries(t113_test_app_config PRIVATE
+    Qt5::Core
+    Qt5::Test
+)
+
+add_test(NAME t113_app_config COMMAND t113_test_app_config)
