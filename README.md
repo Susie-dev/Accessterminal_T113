@@ -288,7 +288,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下十六条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下十七条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -759,7 +759,42 @@ void waitForAllTasks();               // 析构中调用（先 stop() 再等）
 `tools/verify_subcmake.py`（8/8 用例，含"缺 enable_testing""缺 AUTOMOC 但
 无 `.moc` include（真阴性）"等）。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述十六条请以
+### 17. `fromHex()` 的输入必须先逐字符校验
+
+`QByteArray::fromHex()` **不会**因为遇到非法字符而失败 —— 它会**跳过**非法字符，
+把剩下的合法字符**重新两两配对**。已用真实 Qt 5.15.19 实测确认：
+
+| 输入（偶数长度） | fromHex 结果 | 说明 |
+| --- | --- | --- |
+| `FD034C12045DDF` | `fd 03 4c 12 04 5d df` | 正确 |
+| `FD0G4C12045DDF` | `0f d0 4c 12 04 5d df` | **内容全错** |
+| `XX034C12045DDF` | `03 4c 12 04 5d df` | **错位，少一字节** |
+
+只要字符数是**偶数**，解码就总是"成功"，`!bytes.isEmpty()` 完全拦不住。
+这个缺陷是在**室内机**（Accessterminal_desktop）的灯控指令解析里发现并修复的；
+本工程当前不使用 `fromHex`，本条作为**回归防护**存在 —— 门口机同样有串口
+外设（指纹模块），一旦将来引入十六进制配置解析，这种写法会立刻被拦下。
+
+正确写法：
+
+```cpp
+if (compact.isEmpty() || compact.size() % 2 != 0) return QByteArray();
+if (!isHexOnly(compact)) return QByteArray();   // 关键，否则上面那条守卫形同虚设
+return QByteArray::fromHex(compact.toLatin1());
+```
+
+由 `check_hex_parse_is_validated` 强制：把**变量**传给 `fromHex` 而未先做
+十六进制校验即报错（传给 `fromHex` 的**字面量**不受影响）。
+自检见 `tools/verify_hex_parse.py`（5/5）。室内机侧另有可执行断言
+（`tests/test_app_config.cpp`）用真实 Qt 跑出上表结果，把该语义钉死。
+
+> 关于本检查的实现坑：`strip_comments_and_strings()` 会清空**字符字面量**
+> （`'0'` → `''`），所以判据**不能**基于 `QChar('0')` / `c >= '0'` 这类写法，
+> 只能识别"名字里含 hex 的校验型函数调用"。而且提取 `fromHex` 实参必须
+> **按括号配平扫描**——真实写法 `fromHex(compact.toLatin1())` 的实参含嵌套
+> 括号，用 `[^()]*` 会完全匹配不到而静默漏判。这两点都是故障注入自检抓出来的。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述十七条请以
 `verify.py` 的结果为准。
 
 ---
@@ -787,7 +822,8 @@ python3 tools/check_signatures.py .
 # 2b. 校验器自检：对 check_config_value_sanity / check_config_knobs_are_used /
 #     check_no_running_reset_in_run / check_no_secret_in_logs /
 #     check_declared_signal_is_emitted / check_connect_signal_is_signal /
-#     check_abandoned_async_tasks / check_subproject_cmake_is_selfcontained
+#     check_abandoned_async_tasks / check_subproject_cmake_is_selfcontained /
+#     check_hex_parse_is_validated
 #     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
@@ -797,6 +833,7 @@ python3 tools/verify_dead_signal.py .
 python3 tools/verify_connect_signal.py .
 python3 tools/verify_abandoned_task.py .
 python3 tools/verify_subcmake.py .
+python3 tools/verify_hex_parse.py .
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
 #     含「原实现对照」与随机模糊测试；无需编译即可验证定帧逻辑）
