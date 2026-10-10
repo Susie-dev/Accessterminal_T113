@@ -518,6 +518,59 @@ UTF8   设定 == 取回 ? false     （13 码元 -> 16 码元）
 固定长度：只查 `left(4)` 会漏掉 `left(2)`、`mid(0,n)`、`.at(0)` 等其它脱敏
 写法，而前缀脱敏对短密码等于全泄。
 
+### 物理门锁那条线：GpioLine 终于有了可注入失败的测试
+
+`GpioLine` 管的是门口机**物理门锁/补光**那条线（T113 的 PE5 = 线号 133，开锁
+与补光共用同一条线，见 `widget.cpp:224-226`；PE4 = 132 是红外输入）。
+它此前从未被链接进任何测试目标，而它的危险分支**全在硬件出错上**：
+
+| 故障 | 处理错的后果 |
+| --- | --- |
+| 打不开 gpiochip（权限/节点缺失） | 程序起不来，或静默无灯无锁 |
+| 拿不到线（线号越界/被占） | 同上 |
+| 请求输出失败（线已被占） | **该开门时不开** |
+| 读电平失败 | 红外误判为"没人" |
+| 请求泄漏（忘了 release） | 线一直 busy，**下次开锁直接 EBUSY** |
+
+真机 gpiochip 无法按需制造这些失败，开发机也根本没有 gpiochip。所以第 28 轮
+写了**可编程假 libgpiod**（`tests/fake_gpiod.{h,cpp}`）并接出
+`t113_test_gpio`（25 个用例）。故障注入 13 个危险退化全部被抓到。
+
+#### 夹具自造过两次假象 —— 两次都是夹具错，不是生产代码错
+
+这一轮最值得记的是：**第一版测试失败时，我先怀疑的方向全都是错的。**
+
+**假象一：线号上限设成了 64。** 假 libgpiod 第一版给每个 chip 64 条线，而工程
+用的是 132 / 133。于是**所有正常用例全部失败**（`openOutput` 返回 false）——
+看起来像"生产代码开不了线"。实际是夹具把合法线号判成了越界。
+
+**假象二：内存所有权模型不对。** 我一开始让 `gpiod_chip_get_line` 各自
+`new`、`gpiod_line_release` 各自 `delete`。但 **libgpiod 1.x 里线对象属于
+chip**（`get_line` 返回 chip 内部的数组元素），`release` **只清除"已请求"
+状态、不释放内存**，`chip_close` 才释放。于是生产代码在"请求失败"路径里
+先 `release` 再 `close` 时，夹具报出 `release:unknown`，看着像生产代码重复释放。
+
+两次都是**夹具与真实 ABI 不符**造成的。教训：写硬件替身时，**先把真实库的
+内存所有权与取值范围查清**，否则夹具会稳定地产生假阳性 —— 而且假阳性看起来
+比真缺陷更像真缺陷。
+
+#### 由此得到真正的现场度量：`busyLineCount()`
+
+第一版我用"线对象个数"判断泄漏，那在错误的所有权模型下毫无意义。改成假实现
+与真实 ABI 对齐后，真正该数的是 **仍持有有效请求的线数**：
+
+> 一条泄漏的请求会让线一直 busy，下次开锁直接 EBUSY 失败。
+
+并且假实现让**对已 busy 的线再次请求返回失败**（真实 EBUSY 行为），
+于是"泄漏了一条请求"能被**端到端**抓到（重试真的失败），而不是靠事后数数。
+
+#### 一个"只观测、不断言"的地方
+
+生产代码在"请求失败"路径里会 `release` 一条**从未成功请求**的线
+（防御性清理）。libgpiod 对这种情况的确切行为我**无法在本机验证**（没有真实
+`gpiod.h` / 库）。因此夹具只记录 `releaseUnrequestedCount()`，测试**不断言**
+它等于几 —— 把猜测写成契约比不写更糟。
+
 ### 不可达槽与"平行实现"：为死代码写测试的陷阱
 
 第 23 轮审计发现：`FingerprintManager::startEnroll(int)` 有完整实现、有挂起
@@ -781,7 +834,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下四十三条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下四十七条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -1601,7 +1654,7 @@ python3 tools/verify.py . ../Accessterminal_desktop
 > **已加载的模块**后才真正生效。这正是必须做故障注入的理由——**自检脚本自己
 > 也会骗人**。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述四十三条请以
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述四十七条请以
 `verify.py` 的结果为准。
 
 ---
@@ -1976,6 +2029,51 @@ False，真正的断言检查**永远不可达**。故障注入"去掉夹具自�
 而夹具按小写 `x` 判断，5 个用例被误报成"规则未触发"。夹具的解析逻辑同样要
 按**真实输出**写，并靠对照用例自证（第 33/38 条）。
 
+### 44. 写硬件替身之前，先查清真实库的**取值范围**与**内存所有权**
+
+第 28 轮为 `GpioLine` 写可编程假 libgpiod，第一版失败时我两次怀疑方向都错了：
+
+1. **取值范围**：假实现给每个 chip 64 条线，而工程用 132 / 133，于是所有正常
+   用例失败 —— 看着像"生产代码开不了线"，实为夹具把合法线号判成越界。
+2. **内存所有权**：libgpiod 1.x 里线对象**属于 chip**（`get_line` 返回 chip
+   内部的数组元素），`release` 只清"已请求"状态、**不释放内存**，`close` 才
+   释放。我第一版让两者各自 `new`/`delete`，于是生产代码在"请求失败"路径里
+   先 `release` 再 `close` 时被误报 `release:unknown`。
+
+**夹具与真实 ABI 不符时，会稳定地产生假阳性 —— 而假阳性比真缺陷更像真缺陷。**
+写替身的第一步是把真实库的取值域与所有权查清，不是先把测试写完。
+
+### 45. 断言"泄漏"要数**语义资源**，不是数对象
+
+第一版用"线对象个数"判断泄漏，在错误的所有权模型下毫无意义。对齐 ABI 后真正
+该数的是 **仍持有有效请求的线数**（`busyLineCount()`）：
+
+> 泄漏的请求会让线一直 busy，下次开锁直接 EBUSY。
+
+并且假实现让**对已 busy 的资源再次请求返回失败**，于是泄漏能被**端到端**抓到
+（重试真的失败），而不是靠事后数数。
+
+**推论：度量要选成"现场会痛的那个量"。** 数错了量，测试通过也说明不了问题。
+
+### 46. 无法验证的行为只观测、不断言
+
+生产代码在"请求失败"路径里会 `release` 一条**从未成功请求**的线（防御性清理）。
+libgpiod 对该情况的确切行为我**无法在本机验证**（没有真实 `gpiod.h` / 库）。
+
+所以夹具提供 `releaseUnrequestedCount()` 记录这件事，测试**不断言**它等于几，
+只在注释里说明"为何不断言"。
+
+**把猜测写成契约比不写更糟** —— 它会锁住一个可能错误的假设，后人改真代码时
+反被此测试拦住。第 21 轮 `calcChecksum` 的"已知不可区分"标注是同一取向。
+
+### 47. 规则的"登记检查"要覆盖**全部**相关文件
+
+第 28 轮给 GPIO 写新规则时，我检查了 `fake_gpiod.cpp` 与 `hal/gpio.cpp` 是否
+列进 CMakeLists，**却漏了 `test_gpio.cpp` 本身**。故障注入"测试未接进
+CMakeLists"因此没触发 —— 测试文件存在但没人编译它时，规则会静默放过。
+
+**列"必须存在的引用"时，逐个文件核对，别只挑印象最深的两个。**
+
 ## 开发约定
 
 - **标准**：C++11（不可使用 C++17 的 inline 变量等特性）
@@ -2031,6 +2129,8 @@ python3 tools/verify_fingerprint_wire_test.py .
 python3 tools/verify_identify_failure_paths_test.py .
 python3 tools/verify_password_log_test.py .
 python3 tools/verify_password_log_rule.py .
+python3 tools/verify_gpio_test.py .
+python3 tools/verify_gpio_rule.py .
 # 自检脚本必须在**不带 PYTHONIOENCODING** 的 GBK 控制台下也安全
 # （第 25 轮的教训：带 utf-8 测会掩盖真因，绿色是假的）
 env -u PYTHONIOENCODING python3 tools/verify_signaling_client_test.py .
@@ -2038,6 +2138,8 @@ env -u PYTHONIOENCODING python3 tools/verify_fingerprint_wire_test.py .
 env -u PYTHONIOENCODING python3 tools/verify_identify_failure_paths_test.py .
 env -u PYTHONIOENCODING python3 tools/verify_password_log_test.py .
 env -u PYTHONIOENCODING python3 tools/verify_password_log_rule.py .
+env -u PYTHONIOENCODING python3 tools/verify_gpio_test.py .
+env -u PYTHONIOENCODING python3 tools/verify_gpio_rule.py .
 bash tools/run_coverage.sh
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，

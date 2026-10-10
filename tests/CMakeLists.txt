@@ -416,3 +416,38 @@ target_link_libraries(t113_test_password_manager PRIVATE
 )
 
 add_test(NAME t113_password_manager COMMAND t113_test_password_manager)
+
+# ---------------------------------------------------------------------------
+# GpioLine：物理门锁/补光线的 RAII 与资源生命周期（第 28 轮补）
+#
+# GpioLine 管的是 T113 的 PE5（线号 133，开锁与补光共用同一条线，见
+# widget.cpp:224-226），此前从未被链接进任何测试目标。危险分支全在硬件出错上：
+# 打不开 chip / 拿不到线 / 请求失败 —— 处理错的后果是"该开门时不开"，
+# 或**句柄泄漏把线占死**（下一次开锁直接失败）。
+#
+# 因此链接**可编程假 libgpiod** tests/fake_gpiod.cpp：它能注入这几类失败，
+# 并用真实分配返回句柄、真的 delete，于是 liveLineCount()/liveChipCount()
+# 能直接暴露泄漏与重复释放。callLog() 记录调用**顺序**，用于断言
+# gpio.cpp 注释所声明的契约："先释放线，再关闭 chip"。
+#
+# 注意：**不能**链接 tools/devstubs/stub_impl.c —— 那是固定桩（返回值恒定、
+# 不可编程），只能做链接检查，无法注入失败；两者对本目标二选一。
+# ---------------------------------------------------------------------------
+add_executable(t113_test_gpio
+    test_gpio.cpp
+    fake_gpiod.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/hal/gpio.cpp
+)
+
+target_include_directories(t113_test_gpio PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_LIST_DIR}                     # fake_gpiod.h
+    ${CMAKE_CURRENT_LIST_DIR}/../tools/devstubs   # <gpiod.h>
+)
+
+target_link_libraries(t113_test_gpio PRIVATE
+    Qt5::Core
+    Qt5::Test
+)
+
+add_test(NAME t113_gpio COMMAND t113_test_gpio)
