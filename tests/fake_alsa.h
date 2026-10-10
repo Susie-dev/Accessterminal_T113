@@ -30,8 +30,22 @@ void setEpipeFirst(int n);
 /// 每次成功写入前休眠若干毫秒（放慢播放，便于观察打断）。
 void setWriteDelayMs(int ms);
 
+/// 让接下来 n 次 snd_pcm_writei 返回 -EAGAIN（非阻塞设备缓冲区已满）。
+/// 这是**可达的**：接收线程以 SND_PCM_NONBLOCK 打开设备。
+void setWriteEagainFirst(int n);
+
 /// snd_pcm_writei 返回 -EIO 而不是成功（模拟不可恢复错误）。
 void setFatalError(bool fatal);
+
+// ---- Mixer（setVolume 用）----
+/// snd_mixer_open 失败。
+void setMixerOpenFail(bool fail);
+/// 找不到音量控件（snd_mixer_find_selem 返回 nullptr）。
+void setSelemFound(bool found);
+/// 音量控件取值范围。
+void setVolumeRange(long minv, long maxv);
+/// 最后一次成功设置的音量值；未设置过返回 -1。
+long lastVolumeSet();
 
 // ---- 采集（readi）方向的控制，供 AudioSenderThread 测试使用 ----
 

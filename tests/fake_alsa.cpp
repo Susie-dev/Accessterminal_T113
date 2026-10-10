@@ -48,6 +48,18 @@ int g_dropCount = 0;
 int g_writeiCount = 0;
 int g_framesWritten = 0;
 
+// 写入方向（writei）的 EAGAIN
+int g_writeEagainFirst = 0;
+
+// Mixer
+bool g_mixerOpenFail = false;
+bool g_selemFound = true;
+long g_volMin = 0;
+long g_volMax = 100;
+long g_lastVolumeSet = -1;
+int g_mixerOpenCount = 0;
+int g_mixerCloseCount = 0;
+
 int g_lastRate = 0;
 int g_lastChannels = 0;
 int g_lastFormat = 0;
@@ -76,7 +88,25 @@ void reset()
     g_drainCount = g_dropCount = g_writeiCount = g_framesWritten = 0;
     g_lastRate = g_lastChannels = g_lastFormat = 0;
     g_chunks.clear();
+    g_writeEagainFirst = 0;
+    g_mixerOpenFail = false;
+    g_selemFound = true;
+    g_volMin = 0;
+    g_volMax = 100;
+    g_lastVolumeSet = -1;
+    g_mixerOpenCount = g_mixerCloseCount = 0;
 }
+
+void setWriteEagainFirst(int n) { QMutexLocker l(&g_mutex); g_writeEagainFirst = n; }
+void setMixerOpenFail(bool fail) { QMutexLocker l(&g_mutex); g_mixerOpenFail = fail; }
+void setSelemFound(bool found) { QMutexLocker l(&g_mutex); g_selemFound = found; }
+void setVolumeRange(long minv, long maxv)
+{
+    QMutexLocker l(&g_mutex);
+    g_volMin = minv;
+    g_volMax = maxv;
+}
+long lastVolumeSet() { QMutexLocker l(&g_mutex); return g_lastVolumeSet; }
 
 void setOpenFail(bool fail) { QMutexLocker l(&g_mutex); g_openFail = fail; }
 void setEpipeFirst(int n) { QMutexLocker l(&g_mutex); g_epipeFirst = n; }
@@ -201,6 +231,10 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t* pcm, const void* buffer,
             --g_epipeFirst;
             return -32; // -EPIPE
         }
+        if (g_writeEagainFirst > 0) {
+            --g_writeEagainFirst;
+            return -11; // -EAGAIN
+        }
         if (g_fatal) {
             return -5; // -EIO
         }
@@ -277,6 +311,78 @@ const char* snd_strerror(int errnum)
 {
     (void)errnum;
     return "fake-alsa-error";
+}
+
+/* ---- Mixer：setVolume() 走的就是这条路径 ----
+ * 这些符号只在测试里被调用，签名同样由 devstubs 的桩头编译期校验。 */
+
+int snd_mixer_open(snd_mixer_t** mixer, int mode)
+{
+    (void)mode;
+    QMutexLocker l(&g_mutex);
+    if (g_mixerOpenFail) {
+        return -2; // -ENOENT
+    }
+    ++g_mixerOpenCount;
+    static int dummy = 0;
+    *mixer = reinterpret_cast<snd_mixer_t*>(&dummy);
+    return 0;
+}
+
+int snd_mixer_close(snd_mixer_t* mixer)
+{
+    (void)mixer;
+    QMutexLocker l(&g_mutex);
+    ++g_mixerCloseCount;
+    return 0;
+}
+
+int snd_mixer_attach(snd_mixer_t* mixer, const char* name)
+{ (void)mixer; (void)name; return 0; }
+
+int snd_mixer_selem_register(snd_mixer_t* mixer,
+                             struct snd_mixer_selem_regopt* options,
+                             snd_pcm_t** playbackp)
+{ (void)mixer; (void)options; (void)playbackp; return 0; }
+
+int snd_mixer_load(snd_mixer_t* mixer) { (void)mixer; return 0; }
+
+snd_mixer_elem_t* snd_mixer_find_selem(snd_mixer_t* mixer,
+                                       const snd_mixer_selem_id_t* id)
+{
+    (void)mixer; (void)id;
+    QMutexLocker l(&g_mutex);
+    if (!g_selemFound) {
+        return nullptr;
+    }
+    static int elem = 0;
+    return reinterpret_cast<snd_mixer_elem_t*>(&elem);
+}
+
+size_t snd_mixer_selem_id_sizeof(void) { return 64; }
+
+void snd_mixer_selem_id_set_index(snd_mixer_selem_id_t* obj, unsigned int val)
+{ (void)obj; (void)val; }
+
+void snd_mixer_selem_id_set_name(snd_mixer_selem_id_t* obj, const char* val)
+{ (void)obj; (void)val; }
+
+int snd_mixer_selem_get_playback_volume_range(snd_mixer_elem_t* elem,
+                                              long* min, long* max)
+{
+    (void)elem;
+    QMutexLocker l(&g_mutex);
+    if (min) *min = g_volMin;
+    if (max) *max = g_volMax;
+    return 0;
+}
+
+int snd_mixer_selem_set_playback_volume_all(snd_mixer_elem_t* elem, long value)
+{
+    (void)elem;
+    QMutexLocker l(&g_mutex);
+    g_lastVolumeSet = value;
+    return 0;
 }
 
 } // extern "C"

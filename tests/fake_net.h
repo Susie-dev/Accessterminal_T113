@@ -37,6 +37,27 @@ std::vector<Datagram> sent();
 
 int sendtoCount();
 
+// ---- 接收方向（AudioReceiverThread 用）----
+
+/// 投递一个待接收的数据报（内容即为 UDP 载荷）。
+void pushIncoming(const std::vector<char>& payload);
+
+/// 投递 n 个由 seed 递增填充的载荷，每个长度 len。
+void pushIncomingFilled(int n, int len, int seed);
+
+/// 令接下来 n 次 recvfrom 失败，并把 errno 设为 errnoValue。
+/// errnoValue 用 11=EAGAIN / 4=EINTR / 5=EIO 等。
+void setRecvFailFirst(int n, int errnoValue);
+
+/// 清空待收队列。
+void clearIncoming();
+
+/// 已被 recvfrom 取走的数据报。
+std::vector<Datagram> received();
+
+int recvfromCount();
+int selectCount();
+
 } // namespace fakenet
 
 #endif // ACCESSTERMINAL_TESTS_FAKE_NET_H

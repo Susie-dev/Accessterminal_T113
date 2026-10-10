@@ -15,7 +15,9 @@
 
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <sys/select.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 
@@ -24,6 +26,14 @@ QMutex g_mutex;
 bool g_sendFail = false;
 int g_sendtoCount = 0;
 std::vector<fakenet::Datagram> g_sent;
+
+// 接收方向
+std::vector<std::vector<char> > g_incoming;   // 待收队列（FIFO）
+std::vector<fakenet::Datagram> g_received;    // 已被取走
+int g_recvfromCount = 0;
+int g_selectCount = 0;
+int g_recvFailFirst = 0;
+int g_recvFailErrno = 0;
 
 /// 把 a.b.c.d 打包成网络序。注意 devstubs 里 in_addr 是 sockaddr_in 的
 /// 嵌套类型，不能单独取名。
@@ -45,7 +55,49 @@ void reset()
     g_sendFail = false;
     g_sendtoCount = 0;
     g_sent.clear();
+    g_incoming.clear();
+    g_received.clear();
+    g_recvfromCount = 0;
+    g_selectCount = 0;
+    g_recvFailFirst = 0;
+    g_recvFailErrno = 0;
 }
+
+void pushIncoming(const std::vector<char>& payload)
+{
+    QMutexLocker l(&g_mutex);
+    g_incoming.push_back(payload);
+}
+
+void pushIncomingFilled(int n, int len, int seed)
+{
+    QMutexLocker l(&g_mutex);
+    for (int k = 0; k < n; ++k) {
+        std::vector<char> v(static_cast<size_t>(len));
+        for (int i = 0; i < len; ++i) {
+            v[static_cast<size_t>(i)] = static_cast<char>((seed + k + (i % 7)) & 0xFF);
+        }
+        g_incoming.push_back(v);
+    }
+}
+
+void setRecvFailFirst(int n, int errnoValue)
+{
+    QMutexLocker l(&g_mutex);
+    g_recvFailFirst = n;
+    g_recvFailErrno = errnoValue;
+}
+
+void clearIncoming() { QMutexLocker l(&g_mutex); g_incoming.clear(); }
+
+std::vector<Datagram> received()
+{
+    QMutexLocker l(&g_mutex);
+    return g_received;
+}
+
+int recvfromCount() { QMutexLocker l(&g_mutex); return g_recvfromCount; }
+int selectCount() { QMutexLocker l(&g_mutex); return g_selectCount; }
 
 void setSendFail(bool fail) { QMutexLocker l(&g_mutex); g_sendFail = fail; }
 
@@ -124,6 +176,75 @@ ssize_t sendto(int sockfd, const void* buf, size_t len, int flags,
     d.payload.assign(bytes, bytes + len);
     g_sent.push_back(d);
     return static_cast<ssize_t>(len);
+}
+
+ssize_t recvfrom(int sockfd, void* buf, size_t len, int flags,
+                 struct sockaddr* src_addr, socklen_t* addrlen)
+{
+    (void)flags; (void)src_addr; (void)addrlen;
+    QMutexLocker l(&g_mutex);
+    ++g_recvfromCount;
+
+    if (g_recvFailFirst > 0) {
+        --g_recvFailFirst;
+        errno = g_recvFailErrno;
+        return -1;
+    }
+    if (g_incoming.empty()) {
+        // 真实非阻塞 socket 的语义：暂时无数据。
+        errno = EAGAIN;
+        return -1;
+    }
+    std::vector<char> payload = g_incoming.front();
+    g_incoming.erase(g_incoming.begin());
+
+    fakenet::Datagram d;
+    d.fd = sockfd;
+    d.destPort = 0;
+    d.destAddr = 0;
+    d.payload = payload;
+    g_received.push_back(d);
+
+    const size_t n = payload.size() < len ? payload.size() : len;
+    if (buf && n > 0) {
+        std::memcpy(buf, &payload[0], n);
+    }
+    return static_cast<ssize_t>(n);
+}
+
+/**
+ * 假 select()：只在"队列里有待收数据"时报告可读，否则超时返回 0。
+ *
+ * 这正是让 AudioReceiverThread 的两段循环都能真正跑起来的关键 ——
+ * devstubs 的 select() 恒返回 0，于是两个循环体一次都不执行。
+ */
+int select(int nfds, fd_set* readfds, fd_set* writefds, fd_set* exceptfds,
+           struct timeval* timeout)
+{
+    (void)nfds; (void)writefds; (void)exceptfds; (void)timeout;
+    QMutexLocker l(&g_mutex);
+    ++g_selectCount;
+    if (g_incoming.empty()) {
+        if (readfds) {
+            FD_ZERO(readfds);
+        }
+        return 0; // 超时
+    }
+    if (readfds) {
+        FD_ZERO(readfds);
+        for (int fd = 0; fd < nfds; ++fd) {
+            FD_SET(fd, readfds);
+        }
+    }
+    return 1;
+}
+
+int fcntl(int fd, int cmd, ...)
+{
+    (void)fd; (void)cmd;
+    // 接收线程用 F_GETFL 取标志、F_SETFL 置 O_NONBLOCK。
+    // 假的 fd 无需真正改状态，返回 0 即可。
+    return 0;
 }
 
 } // extern "C"

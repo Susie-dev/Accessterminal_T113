@@ -14,6 +14,9 @@
 #include <alsa/asoundlib.h>
 //引入系统或第三方头文件 <fcntl.h>。
 #include <fcntl.h>
+// errno / EAGAIN / EINTR：收包与写 PCM 都要靠它区分“暂时不可用”和“真错误”。
+// glibc 可能经其它头间接引入，但依赖间接引入不可靠，故显式包含。
+#include <errno.h>
 // select()/fd_set/FD_ZERO 由 POSIX 规定在 <sys/select.h> 中声明。
 // glibc 通常经其它头间接引入，但依赖间接引入不可靠（在更严格的
 // libc 或开启 _POSIX_C_SOURCE 时可能不可见），故显式包含。
@@ -48,6 +51,11 @@ const char* pcmDeviceName()
 #define CHANNELS kAudioChannels
 #define BUFFER_FRAMES kAudioFramesPerPacket
 #define LOCAL_PORT kAudioPort
+
+namespace {
+/// -EINTR 重试同一包的上限，避免信号风暴导致死循环。
+const int kWriteMaxRetries = 3;
+} // namespace
 
 //定义类 AudioReceiverThread 的成员函数 AudioReceiverThread。
 AudioReceiverThread::AudioReceiverThread(int sockfd, QObject *parent)
@@ -235,6 +243,9 @@ void AudioReceiverThread::run() {
                     qWarning() << "[AudioReceiverThread] recvfrom失败, errno=" << errno;
                     emit errorMsg("recvfrom失败");
                     emit connectionLost();
+                    // 同 write 错误：必须结束整个循环，否则 connectionLost
+                    // 会被每个 select 周期重复发射，导致反复挂断。
+                    running = false;
                     goto receive_done;
                 }
                 if (bytes == 0) {
@@ -246,13 +257,42 @@ void AudioReceiverThread::run() {
                 // 最多 320 帧，不存在溢出风险。
                 const int framesExpected =
                     static_cast<int>(bytes / (CHANNELS * sizeof(int16_t)));
-                int rcw = snd_pcm_writei(pcm_handle, buffer, framesExpected);
+
+                // 设备以 SND_PCM_NONBLOCK 打开（见上面的 snd_pcm_open），
+                // 因此 -EAGAIN / -EINTR 是**可达的**，且都不是"设备坏了"。
+                // 只对 -EINTR 做有界重试（被信号打断时重写同一包），
+                // -EPIPE 与 baseline 一致：prepare 后丢弃本包继续收下一包。
+                int rcw = 0;
+                for (int attempt = 0; attempt < kWriteMaxRetries; ++attempt) {
+                    rcw = snd_pcm_writei(pcm_handle, buffer, framesExpected);
+                    if (rcw == -EPIPE) {
+                        // XRUN：prepare 后本包丢弃，与 baseline 行为一致。
+                        snd_pcm_prepare(pcm_handle);
+                        break;
+                    }
+                    if (rcw != -EINTR) {
+                        break;
+                    }
+                }
                 if (rcw == -EPIPE) {
-                    snd_pcm_prepare(pcm_handle);
+                    continue;
+                }
+                if (rcw == -EAGAIN || rcw == -EWOULDBLOCK) {
+                    // 播放缓冲区满。实时音频的正确做法是**丢弃这一包**：
+                    // 若按一般错误终止线程，表现就是通话中途突然单向无声；
+                    // 而阻塞重试又会让端到端延迟越堆越大。
+                    qWarning() << "[AudioReceiverThread] 播放缓冲满，丢弃一包音频";
                     continue;
                 }
                 if (rcw < 0) {
                     emit errorMsg(QString("write错误: %1").arg(snd_strerror(rcw)));
+                    // 必须**结束整个采集循环**。这里若只跳出内层收包循环
+                    // （重构早期版本的 `goto receive_done`），外层 while(running)
+                    // 会立刻再次 select/recvfrom，把同一个持久性错误无限重复：
+                    // 每一轮都重新 emit errorMsg，而收包错误还会反复 emit
+                    // connectionLost → 反复触发 Widget::hangUpCall。
+                    // baseline 是 `break` 出 while(running)，语义即"线程结束"。
+                    running = false;
                     goto receive_done;
                 }
                 if (rcw != framesExpected) {

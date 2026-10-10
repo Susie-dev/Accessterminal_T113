@@ -168,3 +168,38 @@ target_link_libraries(t113_test_audio_sender PRIVATE
 )
 
 add_test(NAME t113_audio_sender COMMAND t113_test_audio_sender)
+
+# ---------------------------------------------------------------------------
+# AudioReceiverThread：UDP 12345 下行音频播放
+#
+# 同一类问题：devstubs 的 select() 恒返回 0、recvfrom() 恒返回 -1，所以
+# run() 里两个循环体**一次都没执行过**。这里用可投递数据报 / 可注入 errno 的
+# fake_net，加上带 mixer 与 write 错误注入的 fake_alsa，把播放通路跑起来。
+# ---------------------------------------------------------------------------
+add_executable(t113_test_audio_receiver
+    test_audio_receiver.cpp
+    fake_alsa.cpp
+    fake_net.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/core/media/audio_receiver_thread.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/config/app_config.cpp
+)
+
+target_include_directories(t113_test_audio_receiver PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_LIST_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/../tools/devstubs
+)
+
+# audio_receiver_thread.cpp 用到 fcntl/F_GETFL/F_SETFL/O_NONBLOCK —— 这些由
+# tools/devstubs/host_compat.h 在主机端补齐（MinGW 没有 fcntl）。正式的
+# check_host_compile.sh / check_host_link.sh 也是用 -include 注入同一文件。
+target_compile_options(t113_test_audio_receiver PRIVATE
+    -include ${CMAKE_CURRENT_LIST_DIR}/../tools/devstubs/host_compat.h
+)
+
+target_link_libraries(t113_test_audio_receiver PRIVATE
+    Qt5::Core
+    Qt5::Test
+)
+
+add_test(NAME t113_audio_receiver COMMAND t113_test_audio_receiver)
