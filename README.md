@@ -266,6 +266,48 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ---
 
+## 生命周期约定（由自动化检查强制）
+
+以下三条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+`tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
+
+### 1. 音视频线程仅在收到 `accept` 后创建
+
+`CameraPushThread` / `AudioSenderThread` / `AudioReceiverThread` 的
+`new` 必须全部位于 `Widget::startCallSession()` 内，且该函数只能在
+`Signal::Accept` 分支被调用。这是“待机零占用”的依据。
+
+由 `check_accept_gated_threads` 强制。若有人把线程创建挪到构造函数
+“预建”，功能上可能仍然正常，但空闲功耗与资源占用立刻退化。
+
+### 2. 延时任务必须检查会话有效性
+
+音频播放线程是**延迟 400ms** 创建的（错开声卡争用）。若这 400ms 内通话
+被挂断，已排队的 lambda 会拿到已经被 `close()` 并置为 `-1` 的
+`m_audioSocketFd`，线程进入 `run()` 后对 `fd = -1` 执行 `fcntl`/`FD_SET`，
+属于未定义行为。
+
+因此所有引用通话期资源（`m_audioSocketFd` / `m_audioSenderThread` /
+`m_audioReceiverThread` / `m_cameraPushThread`）的延时任务，都必须检查
+`m_callActive` 或 `m_callGeneration`。
+
+用代次令牌而不只检查 `m_callActive` 的原因：若通话在 400ms 内挂断后
+**立刻又接通新的一次**，`m_callActive` 已重新为 true，仅凭它无法区分
+“上一代遗留的延时任务”，旧任务会误在新通话上再建一个播放线程。
+
+由 `check_deferred_session_guard` 强制。
+
+### 3. 异步任务不得在对象析构后访问它
+
+`QtConcurrent::run` 起的任务若捕获裸 `this`，在对象析构后仍可能运行。
+`AudioManager::~AudioManager()` 会先 `stop()` 再 `waitForFinished()`；
+人脸检测任务改用 `QPointer` 观察 `this` 并在提交时按值拷贝分类器。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述三条请以
+`verify.py` 的结果为准。
+
+---
+
 ## 开发约定
 
 - **标准**：C++11（不可使用 C++17 的 inline 变量等特性）
