@@ -268,7 +268,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下五条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下六条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -338,7 +338,44 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 像 `FingerprintManager` 这种随程序存活的 QObject，其常驻轮询是设计意图，
 不算缺陷。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述五条请以
+### 6. 收 UDP 包必须检查 `readDatagram()` / `recvfrom()` 的返回值
+
+先 `resize(pendingDatagramSize())` 再 `readDatagram(...)` 的写法里，**返回值不能丢**：
+
+```cpp
+QByteArray datagram;
+datagram.resize(socket->pendingDatagramSize());
+socket->readDatagram(datagram.data(), datagram.size(), &sender, &senderPort);
+```
+
+两个后果：
+
+1. `QByteArray::resize()` **不清零**新分配的字节。若实际读到的字节数少于
+   `pendingDatagramSize()`，尾部就是未初始化内存（或上一轮循环的残留字节）。
+   音频路径下它会被 append 后直接喂给声卡（噪声）；视频路径下会交给
+   `loadFromData()` 解码（垃圾数据，甚至解码器崩溃）。
+2. 返回 `-1` 表示读取失败，此时 `readDatagram` **不会填充** `sender`/`senderPort`
+   出参。音频路径若不判就赋值，会把“回传目标地址”改成未初始化（或上一次的）
+   地址，导致后续上行语音全部发错地方。
+
+注意 `pendingDatagramSize()` 返回 `qint64` 而非 `int`。
+
+正确写法（`camera_preview_server.cpp` 采用）：
+
+```cpp
+const qint64 bytesRead = udpSocket->readDatagram(
+    datagram.data(), datagram.size(), &sender, &senderPort);
+if (bytesRead < 0) {
+    continue;                 // 失败：丢弃该数据报，不要污染出参
+}
+if (bytesRead < datagram.size()) {
+    datagram.resize(static_cast<int>(bytesRead));
+}
+```
+
+由 `check_datagram_read_returns` 强制（覆盖 `readDatagram` 与 `recvfrom`）。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述六条请以
 `verify.py` 的结果为准。
 
 ---
