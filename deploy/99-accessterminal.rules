@@ -1,0 +1,29 @@
+# Accessterminal 设备权限规则
+#
+# 安装：
+#   sudo cp deploy/99-accessterminal.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#
+# 目的：让普通用户（或指定的 accessterminal 组）无需 root 即可访问
+# 灯控串口、摄像头与 GPIO，避免程序必须以 root 运行。
+
+# ---- 灯控串口（当前实现使用 QSerialPort）----
+# 常见 USB 转串口芯片：CH340 / CP210x / FTDI / PL2303
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", MODE="0660", GROUP="dialout", SYMLINK+="accessterminal_light"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", MODE="0660", GROUP="dialout", SYMLINK+="accessterminal_light"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", MODE="0660", GROUP="dialout", SYMLINK+="accessterminal_light"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="067b", MODE="0660", GROUP="dialout", SYMLINK+="accessterminal_light"
+
+# 板载串口（T113 指纹模块常用 ttyS4）
+KERNEL=="ttyS4", MODE="0660", GROUP="dialout", SYMLINK+="accessterminal_finger"
+
+# ---- 摄像头（V4L2）----
+KERNEL=="video[0-9]*", MODE="0660", GROUP="video"
+
+# ---- GPIO（T113 通过 libgpiod 访问 /dev/gpiochip*）----
+SUBSYSTEM=="gpio", KERNEL=="gpiochip*", MODE="0660", GROUP="gpio"
+
+# ---- ALSA 声卡 ----
+SUBSYSTEM=="sound", KERNEL=="controlC[0-9]*", MODE="0660", GROUP="audio"
+SUBSYSTEM=="sound", KERNEL=="pcmC[0-9]*D[0-9]*[cp]", MODE="0660", GROUP="audio"

@@ -1,0 +1,83 @@
+#!/bin/sh
+#
+# Accessterminal T113 启动脚本（SysV init 风格，适配 Tina Linux / OpenWrt）
+#
+# 安装：
+#   cp deploy/accessterminal.init /etc/init.d/accessterminal
+#   chmod 755 /etc/init.d/accessterminal
+#   /etc/init.d/accessterminal enable   # 若系统支持
+#
+### BEGIN INIT INFO
+# Provides:          accessterminal
+# Required-Start:    $network $local_fs
+# Required-Stop:     $network
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: 别墅门禁可视化对讲系统 — T113 门口机
+### END INIT INFO
+
+DAEMON=/opt/smartpro/bin/smartpro
+CONFIG=/etc/accessterminal/appconfig.json
+PIDFILE=/var/run/accessterminal.pid
+
+# 嵌入式设备通常没有 systemd，直接使用 Qt 的 eglfs 后端全屏渲染。
+export QT_QPA_PLATFORM=eglfs
+export QT_QPA_EGLFS_ALWAYS_SET_MODE=1
+# 触摸屏输入设备（无触摸屏时可注释掉）
+export QT_QPA_EGLFS_KMS_CONFIG=/etc/accessterminal/kms.json
+
+start() {
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        echo "accessterminal 已在运行"
+        return 0
+    fi
+    if [ ! -x "$DAEMON" ]; then
+        echo "错误: 找不到可执行文件 $DAEMON" >&2
+        return 1
+    fi
+    echo "启动 accessterminal..."
+    if [ -f "$CONFIG" ]; then
+        "$DAEMON" "$CONFIG" &
+    else
+        "$DAEMON" &
+    fi
+    echo $! > "$PIDFILE"
+    return 0
+}
+
+stop() {
+    if [ -f "$PIDFILE" ]; then
+        PID="$(cat "$PIDFILE")"
+        if kill -0 "$PID" 2>/dev/null; then
+            echo "停止 accessterminal (pid $PID)..."
+            kill "$PID"
+            # 给它 3 秒优雅退出（释放音频设备与 GPIO）
+            for _ in 1 2 3; do
+                kill -0 "$PID" 2>/dev/null || break
+                sleep 1
+            done
+            kill -0 "$PID" 2>/dev/null && kill -9 "$PID"
+        fi
+        rm -f "$PIDFILE"
+    fi
+    return 0
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; sleep 1; start ;;
+    status)
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "accessterminal 正在运行 (pid $(cat "$PIDFILE"))"
+        else
+            echo "accessterminal 未运行"
+        fi
+        ;;
+    *)
+        echo "用法: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+
+exit 0

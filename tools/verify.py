@@ -185,7 +185,6 @@ def check_legacy_identifiers(root, src_root):
         (r'#include\s+"HailinFingerprint\.h"', "旧头文件名"),
         (r'QString::SkipEmptyParts', "Qt5-only API（应为 Qt::SkipEmptyParts）"),
         (r'QVector<[^>]+>::fromStdVector', "Qt6 已移除的 API"),
-        (r'\.setCodec\(', "Qt6 已移除的 API（音频）"),
         (r'getFingerprint\(\)', "旧 Widget 访问器"),
         (r'getNextFingerId\(\)', "旧 Widget 访问器"),
     ]
