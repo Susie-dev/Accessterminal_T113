@@ -1,90 +1,123 @@
-QT       += core gui
-QT       += network
-QT       += serialport
-QT       += concurrent
+# ============================================================================
+# Accessterminal_T113 — 门口机（全志 T113-S3 / Tina Linux）
+#
+# 说明：本文件为兼容 Qt Creator / qmake 工作流的构建脚本。
+#       新增的 CMakeLists.txt 是推荐入口，两者源文件集合保持一致。
+#
+# 重要：所有第三方库路径均改为“可覆盖变量 + 合理默认”，
+#       不再写死开发者本机的 /home/meetyoo/... 绝对路径。
+#       交叉编译时可在 qmake 命令行传入，例如：
+#         qmake T113_SYSROOT=/path/to/staging_dir/target \
+#               OPENCV_ROOT=/path/to/_install \
+#               GPIO_ROOT=/path/to/libgpiod/_install
+# ============================================================================
+
+QT += core gui network serialport concurrent
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
 CONFIG += c++11
-
-# The following define makes your compiler emit warnings if you use
-# any Qt feature that has been marked deprecated (the exact warnings
-# depend on your compiler). Please consult the documentation of the
-# deprecated API in order to know how to port your code away from it.
-DEFINES += QT_DEPRECATED_WARNINGS
-
-# You can also make your code fail to compile if it uses deprecated APIs.
-# In order to do so, uncomment the following line.
-# You can also select to disable deprecated APIs only up to a certain version of Qt.
-#DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
-
-SOURCES += \
-    HailinFingerprint.cpp \
-    audioreceiverthread.cpp \
-    audiosenderthread.cpp \
-    camera/camera_udp_server.cpp \
-    camera/v4l2camera.cpp \
-    camera_push_thread.cpp \
-    form_call.cpp \
-    form_finger.cpp \
-    form_passwd.cpp \
-    main.cpp \
-    managers/audio_manager.cpp \
-    managers/face_manager.cpp \
-    managers/fingerprint_manager.cpp \
-    managers/password_manager.cpp \
-    widget.cpp
-
-HEADERS += \
-    HailinFingerprint.h \
-    appconfig.h \
-    audioreceiverthread.h \
-    audiosenderthread.h \
-    camera/camera_udp_server.h \
-    camera/v4l2camera.h \
-    camera_push_thread.h \
-    form_call.h \
-    form_finger.h \
-    form_passwd.h \
-    managers/audio_manager.h \
-    managers/face_manager.h \
-    managers/fingerprint_manager.h \
-    managers/password_manager.h \
-    widget.h
-
-FORMS += \
-    form_call.ui \
-    form_finger.ui \
-    form_passwd.ui \
-    widget.ui
-
-INCLUDEPATH += -I /home/meetyoo/t113/Tina-Linux/out/t113-bingpi_m2/staging_dir/target/usr/include/
-LIBS +=  -L /home/meetyoo/t113/Tina-Linux/out/t113-bingpi_m2/staging_dir/target/usr/lib/ -lasound
-
-
-
-
-INCLUDEPATH += /home/meetyoo/opencv_arm_build/_install/include/opencv4
-#/usr/local/include/opencv4
-
-# 添加OpenCV
-LIBS += -L/home/meetyoo/opencv_arm_build/_install/lib  -lopencv_videoio -lopencv_video -lopencv_core -lopencv_calib3d -lopencv_flann  \
-                -lopencv_features2d -lopencv_highgui -lopencv_face -lopencv_imgproc \
-                -lopencv_dnn -lopencv_imgcodecs   -lopencv_objdetect -lopencv_photo
-
-
-INCLUDEPATH += /home/meetyoo/gpio/libgpiod/_install/include/
-LIBS += /home/meetyoo/gpio/libgpiod/_install/lib/libgpiod.a
+CONFIG += warn_on
 
 TARGET = smartpro
+TEMPLATE = app
 
-# Default rules for deployment.
+# 使源码内 #include "core/net/protocol.h" 等以 src/ 为根
+INCLUDEPATH += $$PWD/src
+
+# ============================================================================
+# 第三方库路径（全部可通过 qmake 变量覆盖）
+# ============================================================================
+
+# ---- ALSA ----
+isEmpty(T113_SYSROOT) {
+    # 本机（桌面）构建：直接使用系统 ALSA
+    LIBS += -lasound
+} else {
+    INCLUDEPATH += $$T113_SYSROOT/usr/include
+    LIBS += -L$$T113_SYSROOT/usr/lib -lasound
+}
+
+# ---- OpenCV ----
+isEmpty(OPENCV_ROOT) {
+    # 本机构建：使用系统 OpenCV
+    CONFIG += link_pkgconfig
+    PKGCONFIG += opencv4
+} else {
+    INCLUDEPATH += $$OPENCV_ROOT/include/opencv4
+    LIBS += -L$$OPENCV_ROOT/lib \
+        -lopencv_videoio -lopencv_video -lopencv_core -lopencv_calib3d \
+        -lopencv_flann -lopencv_features2d -lopencv_highgui -lopencv_face \
+        -lopencv_imgproc -lopencv_dnn -lopencv_imgcodecs -lopencv_objdetect \
+        -lopencv_photo
+}
+
+# ---- libgpiod ----
+isEmpty(GPIO_ROOT) {
+    LIBS += -lgpiod
+} else {
+    INCLUDEPATH += $$GPIO_ROOT/include
+    # 目标平台常只提供静态库
+    LIBS += $$GPIO_ROOT/lib/libgpiod.a
+}
+
+LIBS += -lpthread
+
+# ============================================================================
+# 源文件
+# ============================================================================
+
+SOURCES += \
+    src/main.cpp \
+    src/config/app_config.cpp \
+    src/core/net/signaling_client.cpp \
+    src/core/media/audio_receiver_thread.cpp \
+    src/core/media/audio_sender_thread.cpp \
+    src/core/media/camera_preview_server.cpp \
+    src/core/media/video_push_thread.cpp \
+    src/core/vision/v4l2_camera.cpp \
+    src/hal/fingerprint_hailin.cpp \
+    src/hal/gpio.cpp \
+    src/managers/audio_manager.cpp \
+    src/managers/face_manager.cpp \
+    src/managers/fingerprint_manager.cpp \
+    src/managers/password_manager.cpp \
+    src/ui/widget.cpp \
+    src/ui/form_call.cpp \
+    src/ui/form_finger.cpp \
+    src/ui/form_passwd.cpp
+
+HEADERS += \
+    src/config/app_config.h \
+    src/core/net/protocol.h \
+    src/core/net/signaling_client.h \
+    src/core/media/audio_receiver_thread.h \
+    src/core/media/audio_sender_thread.h \
+    src/core/media/camera_preview_server.h \
+    src/core/media/video_push_thread.h \
+    src/core/vision/v4l2_camera.h \
+    src/hal/fingerprint_hailin.h \
+    src/hal/gpio.h \
+    src/managers/audio_manager.h \
+    src/managers/face_manager.h \
+    src/managers/fingerprint_manager.h \
+    src/managers/password_manager.h \
+    src/ui/widget.h \
+    src/ui/form_call.h \
+    src/ui/form_finger.h \
+    src/ui/form_passwd.h
+
+FORMS += \
+    src/ui/widget.ui \
+    src/ui/form_call.ui \
+    src/ui/form_finger.ui \
+    src/ui/form_passwd.ui
+
+RESOURCES += \
+    src/resources/res.qrc
+
+# ============================================================================
+# 部署规则
+# ============================================================================
 qnx: target.path = /tmp/$${TARGET}/bin
 else: unix:!android: target.path = /opt/$${TARGET}/bin
 !isEmpty(target.path): INSTALLS += target
-
-LIBS += -lasound -lpthread
-
-RESOURCES += \
-    res.qrc
-
-QT += serialport

@@ -1,0 +1,145 @@
+/**
+ * @file signaling_client.cpp
+ * @brief SignalingClient 实现。
+ */
+#include "core/net/signaling_client.h"
+
+#include <QDebug>
+#include <QTcpSocket>
+#include <QTimer>
+
+namespace accessterminal {
+
+namespace {
+/// 断线重连间隔，沿用重构前的 3 秒。
+constexpr int kReconnectDelayMs = 3000;
+} // namespace
+
+SignalingClient::SignalingClient(QObject* parent)
+    : QObject(parent)
+{
+    m_socket = new QTcpSocket(this);
+    m_reconnectTimer = new QTimer(this);
+    m_reconnectTimer->setSingleShot(true);
+
+    connect(m_socket, &QTcpSocket::connected, this, &SignalingClient::onConnected);
+    connect(m_socket, &QTcpSocket::disconnected, this, &SignalingClient::onDisconnected);
+    connect(m_socket, &QTcpSocket::readyRead, this, &SignalingClient::onReadyRead);
+    // Qt5.15 起 error() 已弃用，errorOccurred 在 Qt5.15+/Qt6 均可用。
+    connect(m_socket, &QAbstractSocket::errorOccurred, this, &SignalingClient::onSocketError);
+    connect(m_reconnectTimer, &QTimer::timeout, this, [this]() {
+        if (m_running) {
+            qDebug() << "[信令] 正在重连" << m_serverIp << m_port;
+            m_socket->connectToHost(m_serverIp, m_port);
+        }
+    });
+}
+
+SignalingClient::~SignalingClient()
+{
+    // 避免析构期间回调重连。
+    m_running = false;
+}
+
+void SignalingClient::start(const QString& serverIp, quint16 port)
+{
+    m_serverIp = serverIp;
+    m_port = port;
+    m_running = true;
+    qDebug() << "[信令] 连接室内机" << m_serverIp << m_port;
+    m_socket->connectToHost(m_serverIp, m_port);
+}
+
+void SignalingClient::stop()
+{
+    m_running = false;
+    m_reconnectTimer->stop();
+    if (m_socket->state() != QAbstractSocket::UnconnectedState) {
+        m_socket->disconnectFromHost();
+    }
+}
+
+bool SignalingClient::isConnected() const
+{
+    return m_socket->state() == QAbstractSocket::ConnectedState;
+}
+
+bool SignalingClient::send(protocol::Signal signal)
+{
+    const QByteArray payload = protocol::frame(signal);
+    if (payload.isEmpty()) {
+        qWarning() << "[信令] 尝试发送未知信令，已忽略";
+        return false;
+    }
+    if (!isConnected()) {
+        qWarning() << "[信令] 未连接，发送失败:" << payload.trimmed();
+        return false;
+    }
+    const qint64 written = m_socket->write(payload);
+    m_socket->flush();
+    return written == payload.size();
+}
+
+void SignalingClient::onConnected()
+{
+    qDebug() << "[信令] 已连接:" << m_socket->peerAddress().toString() << m_socket->peerPort();
+    if (!m_wasConnected) {
+        m_wasConnected = true;
+        emit connectedChanged(true);
+    }
+}
+
+void SignalingClient::onDisconnected()
+{
+    qDebug() << "[信令] 连接断开";
+    if (m_wasConnected) {
+        m_wasConnected = false;
+        emit connectedChanged(false);
+    }
+    scheduleReconnect();
+}
+
+void SignalingClient::onSocketError()
+{
+    // 不弹窗、不中断：重连由 disconnected/scheduleReconnect 处理。
+    const QString msg = m_socket->errorString();
+    qWarning() << "[信令] socket 错误:" << msg << "目标:" << m_serverIp << m_port;
+    emit errorOccurred(msg);
+    // 连接被拒绝时不会触发 disconnected，此处主动安排重连。
+    if (m_socket->state() == QAbstractSocket::UnconnectedState) {
+        scheduleReconnect();
+    }
+}
+
+void SignalingClient::scheduleReconnect()
+{
+    if (!m_running) {
+        return;
+    }
+    if (!m_reconnectTimer->isActive()) {
+        m_reconnectTimer->start(kReconnectDelayMs);
+    }
+}
+
+void SignalingClient::onReadyRead()
+{
+    const QByteArray data = m_socket->readAll();
+    // TCP 是字节流，一条 readAll 可能包含多条以 '\n' 分隔的信令。
+    // Qt6 移除了 QString::SkipEmptyParts 的旧拼写，使用 Qt::SkipEmptyParts 兼容 Qt5.14+/Qt6。
+    const QList<QByteArray> lines = data.split(protocol::kSignalTerminator);
+    for (const QByteArray& line : lines) {
+        const QByteArray trimmed = line.trimmed();
+        if (trimmed.isEmpty()) {
+            continue;
+        }
+        const protocol::Signal sig = protocol::fromWire(trimmed);
+        if (sig == protocol::Signal::Unknown) {
+            qWarning() << "[信令] 收到未知信令，已忽略:" << trimmed;
+            continue;
+        }
+        qDebug() << "[信令] 收到:" << trimmed;
+        emit signalReceived(sig);
+    }
+}
+
+} // namespace accessterminal

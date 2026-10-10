@@ -1,0 +1,37 @@
+{
+  "_comment": "Accessterminal T113 门口机配置。部署路径 /etc/accessterminal/appconfig.json。所有字段可用环境变量覆盖，详见 src/config/app_config.h。",
+
+  "network": {
+    "_comment": "server_ip = 室内机(服务端)地址；self_ip = 本机(门口机)地址，用于日志与绑定",
+    "server_ip": "192.168.1.4",
+    "self_ip": "192.168.1.8"
+  },
+
+  "hardware": {
+    "_comment": "door_gpio_line：开锁继电器与补光灯共用 PE5，对应 gpiochip0 第 133 线",
+    "camera_device": "/dev/video0",
+    "fingerprint_port": "/dev/ttyS4",
+    "audio_device": "hw:audiocodec",
+    "door_gpio_line": 133
+  },
+
+  "resources": {
+    "_comment": "pcm_dir 下放置提示音 .pcm 文件；face_cascade 为 Haar 人脸检测分类器",
+    "face_cascade": "/root/haarcascade_frontalface_default.xml",
+    "pcm_dir": "/tmp/pcm"
+  },
+
+  "behavior": {
+    "_comment": "frame_interval_ms=50 约 20fps 采集；face_detect_interval 每 N 帧检测一次人脸；face_confidence_threshold 为 LBPH 距离阈值(越小越严格)",
+    "frame_interval_ms": 50,
+    "face_detect_interval": 10,
+    "face_recognize_interval_ms": 2000,
+    "face_confidence_threshold": 90.0,
+    "fingerprint_id_start": 1
+  },
+
+  "security": {
+    "_comment": "门禁密码。生产环境请修改默认值，或用环境变量 ACCESSTERMINAL_SECURITY_DOOR_PASSWORD 覆盖。",
+    "door_password": "5788"
+  }
+}

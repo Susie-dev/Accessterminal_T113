@@ -1,0 +1,835 @@
+/**
+ * @file widget.cpp
+ * @brief 门口机主窗口实现：UI 装配与模块编排。
+ *
+ * 行为契约（相对重构前保持不变，务必遵守）：
+ *   1. 音视频线程只在收到室内机 "accept" 之后才创建，待机时零占用。
+ *   2. 未连接信令服务器时点击呼叫只提示错误，不进入通话。
+ *   3. 挂断（本地按钮或远端 recstop）统一走 hangUpCall()，
+ *      必须停止并销毁全部音视频线程、关闭 UDP socket 与通话窗口。
+ *   4. 指纹识别在启动后自动循环，识别完成 500ms 后重新开始。
+ *   5. 人脸识别仅在检测到人体（PE4 高电平）时才进行。
+ */
+#include "ui/widget.h"
+#include "ui_widget.h"
+
+#include "config/app_config.h"
+#include "core/media/audio_receiver_thread.h"
+#include "core/media/audio_sender_thread.h"
+#include "core/media/camera_preview_server.h"
+#include "core/media/video_push_thread.h"
+#include "core/net/protocol.h"
+#include "core/net/signaling_client.h"
+#include "core/vision/v4l2_camera.h"
+#include "hal/fingerprint_hailin.h"
+#include "hal/gpio.h"
+#include "managers/audio_manager.h"
+#include "managers/face_manager.h"
+#include "managers/fingerprint_manager.h"
+#include "managers/password_manager.h"
+#include "ui/form_call.h"
+#include "ui/form_finger.h"
+#include "ui/form_passwd.h"
+
+#include <QBuffer>
+#include <QDateTime>
+#include <QDebug>
+#include <QElapsedTimer>
+#include <QMessageBox>
+#include <QPainter>
+#include <QPen>
+#include <QPushButton>
+#include <QResizeEvent>
+#include <QTimer>
+#include <QtConcurrent/QtConcurrent>
+
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstring>
+#include <errno.h>
+
+using accessterminal::AppConfig;
+using accessterminal::protocol::Signal;
+
+namespace {
+
+/// 摄像头画面在界面上的固定显示尺寸。
+constexpr int kPreviewWidth = 430;
+constexpr int kPreviewHeight = 475;
+
+/// 人脸注册所需样本数。
+constexpr int kFaceSampleTarget = 3;
+
+/// 异步人脸检测时缩小的尺寸，降低 Haar 计算量。
+constexpr int kDetectWidth = 320;
+constexpr int kDetectHeight = 240;
+
+/// 线程等待退出的最长时间。
+constexpr int kThreadStopTimeoutMs = 3000;
+
+} // namespace
+
+// ============================================================================
+// GpioPe4MonitorThread：人体红外轮询
+// ============================================================================
+
+void GpioPe4MonitorThread::run()
+{
+    // PE4 为人体/红外检测输入。使用统一封装，避免散落的 gpiod 调用。
+    accessterminal::GpioLine line;
+    if (!line.openInput(QStringLiteral("gpiochip0"), 132, QStringLiteral("pe4_monitor"))) {
+        qWarning() << "[红外] PE4 初始化失败，人体检测不可用";
+        return;
+    }
+
+    while (m_running) {
+        if (m_paused) {
+            msleep(100); // 暂停时短暂休眠，避免 CPU 空转
+            continue;
+        }
+        const int value = line.value();
+        if (value < 0) {
+            qWarning() << "[红外] PE4 读取失败，停止监测";
+            break;
+        }
+        if (value == 1) {
+            emit pe4High();
+        } else {
+            emit pe4Low();
+        }
+        msleep(400); // 约 400ms 轮询一次，降低抖动与 CPU 占用
+    }
+}
+
+// ============================================================================
+// Widget：构造与析构
+// ============================================================================
+
+Widget::Widget(QWidget* parent)
+    : QWidget(parent)
+    , ui(new Ui::Widget)
+{
+    ui->setupUi(this);
+
+    // 触摸屏场景下移除按钮焦点框，避免点击后留下虚线。
+    const QList<QPushButton*> buttons = {
+        ui->btnadd, ui->btncall, ui->btnface,
+        ui->btnpower, ui->btnpsswd, ui->btnfinger_step
+    };
+    for (QPushButton* btn : buttons) {
+        btn->setFocusPolicy(Qt::NoFocus);
+    }
+    setStyleSheet(QStringLiteral("QPushButton:focus { outline: none; }"));
+
+    // 隐藏鼠标指针（嵌入式触摸屏无鼠标）。
+    setCursor(Qt::BlankCursor);
+
+    // 摄像头显示区域：透明背景 + 圆角。
+    ui->labelcam->setAttribute(Qt::WA_TranslucentBackground, true);
+    if (ui->labelcam->parentWidget()) {
+        ui->labelcam->parentWidget()->setAttribute(Qt::WA_TranslucentBackground, true);
+    }
+    ui->labelcam->setStyleSheet(QStringLiteral(
+        "background-color: rgb(85, 87, 83); border: none;"));
+
+    // ---- 日期时间显示：每秒刷新 ----
+    auto* dateTimeTimer = new QTimer(this);
+    connect(dateTimeTimer, &QTimer::timeout, this, [this]() {
+        const QDateTime now = QDateTime::currentDateTime();
+        ui->labelDate->setText(now.date().toString(QStringLiteral("yyyy-MM-dd")));
+        ui->labelTime->setText(now.time().toString(QStringLiteral("HH:mm:ss")));
+    });
+    dateTimeTimer->start(1000);
+
+    const QDateTime now = QDateTime::currentDateTime();
+    ui->labelDate->setText(now.date().toString(QStringLiteral("yyyy-MM-dd")));
+    ui->labelTime->setText(now.time().toString(QStringLiteral("HH:mm:ss")));
+
+    qInfo() << "[启动] 智能门禁系统初始化";
+
+    setupGpio();
+    setupModules();
+
+    qInfo() << "[完成] 系统初始化完成，等待用户操作";
+}
+
+Widget::~Widget()
+{
+    // 顺序很重要：先停线程，再销毁其依赖的 socket 与硬件。
+
+    if (m_cameraPushThread) {
+        m_cameraPushThread->stop();
+        m_cameraPushThread->wait(kThreadStopTimeoutMs);
+        delete m_cameraPushThread;
+        m_cameraPushThread = nullptr;
+    }
+    if (m_audioSenderThread) {
+        m_audioSenderThread->stop();
+        m_audioSenderThread->wait(kThreadStopTimeoutMs);
+        delete m_audioSenderThread;
+        m_audioSenderThread = nullptr;
+    }
+    if (m_audioReceiverThread) {
+        m_audioReceiverThread->stop();
+        m_audioReceiverThread->wait(kThreadStopTimeoutMs);
+        delete m_audioReceiverThread;
+        m_audioReceiverThread = nullptr;
+    }
+    if (m_audioSocketFd >= 0) {
+        ::close(m_audioSocketFd);
+        m_audioSocketFd = -1;
+    }
+    if (m_frameTimer) {
+        m_frameTimer->stop();
+        delete m_frameTimer;
+        m_frameTimer = nullptr;
+    }
+    if (m_pe4Thread) {
+        m_pe4Thread->stop();
+        m_pe4Thread->wait(kThreadStopTimeoutMs);
+        delete m_pe4Thread;
+        m_pe4Thread = nullptr;
+    }
+    if (m_fingerprint) {
+        m_fingerprint->close();
+        delete m_fingerprint;
+        m_fingerprint = nullptr;
+    }
+    if (m_camera) {
+        m_camera->close();
+        delete m_camera;
+        m_camera = nullptr;
+    }
+    // GPIO 线由 GpioLine 析构自动释放（开锁与补光共用同一条线）。
+    delete m_auxLine;
+    m_auxLine = nullptr;
+
+    delete ui;
+}
+
+// ============================================================================
+// 装配
+// ============================================================================
+
+void Widget::setupGpio()
+{
+    const AppConfig& cfg = AppConfig::instance();
+
+    // 开锁继电器与补光灯在硬件上共用 PE5（线号默认 133）。
+    // 重构前的 line5 就是同一条线的单一句柄；这里必须同样只请求一次。
+    m_auxLine = new accessterminal::GpioLine();
+    if (!m_auxLine->openOutput(QStringLiteral("gpiochip0"),
+                               static_cast<unsigned int>(cfg.doorGpioLine()),
+                               QStringLiteral("accessterminal"), 0)) {
+        qWarning() << "[GPIO] PE5 初始化失败，开锁与补光均不可用";
+        delete m_auxLine;
+        m_auxLine = nullptr;
+    }
+}
+
+void Widget::setupModules()
+{
+    const AppConfig& cfg = AppConfig::instance();
+
+    // ---- 提示音 ----
+    m_audioManager = new AudioManager(this);
+    m_connAudioManager = new AudioManager(this); // 独立实例，conn.pcm 可被单独打断
+
+    // ---- 指纹：串口设备来自配置 ----
+    m_fingerprint = new HailinFingerprint(cfg.fingerprintPort(), this);
+    if (m_fingerprint->open()) {
+        qInfo() << "[指纹] 模块串口打开成功:" << cfg.fingerprintPort();
+    } else {
+        qWarning() << "[指纹] 模块串口打开失败:" << cfg.fingerprintPort();
+    }
+
+    m_fingerprintManager = new FingerprintManager(this);
+    m_fingerprintManager->setDevice(m_fingerprint);
+    m_nextFingerId = cfg.fingerprintIdStart();
+
+    // 指纹识别结果 -> 提示音，并循环重启识别。
+    connect(m_fingerprintManager, &FingerprintManager::identifyResult, this,
+            [this](bool success, int /*id*/, int /*score*/, const QString& msg) {
+                if (msg == QStringLiteral("请按下指纹进行识别")) {
+                    return; // 采集提示不播报，避免持续噪音
+                }
+                m_audioManager->playAsync(
+                    cfg.pcmFile(success ? QStringLiteral("fingerdoor.pcm")
+                                        : QStringLiteral("fingererr.pcm")));
+                // 识别完成后延时重新开始，实现常驻循环。
+                QTimer::singleShot(500, this, [this]() {
+                    m_fingerprintManager->startIdentify();
+                });
+            });
+
+    // 指纹注册结果 -> 分步提示音。
+    connect(m_fingerprintManager, &FingerprintManager::enrollResult, this,
+            [this](bool success, int /*id*/, const QString& msg) {
+                const AppConfig& c = AppConfig::instance();
+                if (msg.contains(QStringLiteral("请按下手指进行"))) {
+                    m_audioManager->playAsync(c.pcmFile(QStringLiteral("caijifinger.pcm")));
+                    return;
+                }
+                if (msg.contains(QStringLiteral("采集成功"))) {
+                    m_audioManager->playAsync(c.pcmFile(QStringLiteral("fingerone.pcm")));
+                    return;
+                }
+                if (success && msg == QStringLiteral("注册成功")) {
+                    m_audioManager->playAsync(c.pcmFile(QStringLiteral("opendoor.pcm")));
+                } else if (!success) {
+                    m_audioManager->playAsync(c.pcmFile(QStringLiteral("fingererr.pcm")));
+                }
+            });
+
+    // 程序启动即开始指纹识别。
+    QTimer::singleShot(0, this, [this]() { m_fingerprintManager->startIdentify(); });
+
+    // ---- 人脸 ----
+    m_faceManager = new FaceManager(this);
+
+    const bool cascadeLoaded = loadFaceCascade(cfg.faceCascadePath());
+    qInfo() << "[人脸检测] 分类器加载" << (cascadeLoaded ? "成功" : "失败")
+            << cfg.faceCascadePath();
+
+    connect(m_faceManager, &FaceManager::faceSampled, this,
+            [this](int current, int /*total*/) {
+                const AppConfig& c = AppConfig::instance();
+                // 采集中打开补光，第 1 张开、第 3 张关（保留原行为）。
+                if (current == 1) {
+                    m_audioManager->playAsync(c.pcmFile(QStringLiteral("faceone.pcm")));
+                    if (m_auxLine) m_auxLine->setValue(1);
+                } else if (current == 2) {
+                    m_audioManager->playAsync(c.pcmFile(QStringLiteral("facetwo.pcm")));
+                } else if (current == 3) {
+                    m_audioManager->playAsync(c.pcmFile(QStringLiteral("facethree.pcm")));
+                    if (m_auxLine) m_auxLine->setValue(0);
+                }
+            });
+
+    connect(m_faceManager, &FaceManager::trainFinished, this, [](bool success) {
+        qInfo() << "[人脸] 训练" << (success ? "完成" : "失败，样本不足");
+    });
+
+    connect(m_faceManager, &FaceManager::recognizeResult, this,
+            [this](bool success, double confidence) {
+                qInfo() << "[人脸识别] 结果:" << (success ? "成功" : "失败")
+                        << "confidence=" << confidence;
+                if (m_auxLine) m_auxLine->setValue(0);
+                const AppConfig& c = AppConfig::instance();
+                m_audioManager->playAsync(
+                    c.pcmFile(success ? QStringLiteral("opendoor.pcm")
+                                      : QStringLiteral("faceerr.pcm")));
+            });
+
+    // ---- 密码 ----
+    m_passwordManager = new PasswordManager(this);
+    connect(m_passwordManager, &PasswordManager::passwordChecked, this,
+            [this](bool success) {
+                const AppConfig& c = AppConfig::instance();
+                if (success) {
+                    m_audioManager->playAsync(c.pcmFile(QStringLiteral("opendoor.pcm")));
+                    if (m_passwdForm) {
+                        m_passwdForm->close();
+                        m_passwdForm = nullptr;
+                    }
+                } else {
+                    m_audioManager->playAsync(c.pcmFile(QStringLiteral("passwderr.pcm")));
+                }
+            });
+
+    // ---- 摄像头与远程监看 ----
+    m_camera = new V4L2Camera(cfg.cameraDevice());
+    if (!m_camera->open()) {
+        qWarning() << "[摄像头] 无法打开设备:" << cfg.cameraDevice();
+        QMessageBox::critical(this, QStringLiteral("错误"),
+                              QStringLiteral("无法打开摄像头"));
+    } else {
+        qInfo() << "[摄像头] 设备打开成功:" << cfg.cameraDevice();
+    }
+    m_previewServer = new CameraPreviewServer(
+        m_camera, accessterminal::protocol::kPreviewPort, this);
+
+    // 采集+显示定时器。
+    m_frameTimer = new QTimer(this);
+    connect(m_frameTimer, &QTimer::timeout, this, &Widget::updateFrame);
+    m_frameTimer->start(cfg.frameIntervalMs());
+
+    // ---- 人体红外 ----
+    m_pe4Thread = new GpioPe4MonitorThread(this);
+    connect(m_pe4Thread, &GpioPe4MonitorThread::pe4Low, this, [this]() {
+        m_hasPerson = false;
+    });
+    connect(m_pe4Thread, &GpioPe4MonitorThread::pe4High, this, [this]() {
+        m_hasPerson = true;
+    });
+    m_pe4Thread->start();
+
+    // ---- 信令 ----
+    m_signaling = new accessterminal::SignalingClient(this);
+    connect(m_signaling, &accessterminal::SignalingClient::signalReceived,
+            this, &Widget::onSignalReceived);
+    connect(m_signaling, &accessterminal::SignalingClient::connectedChanged,
+            this, [](bool connected) {
+                qInfo() << "[信令] 连接状态:" << (connected ? "已连接" : "已断开");
+            });
+
+    qInfo() << "[网络配置] 本机:" << cfg.selfIp() << "服务器:" << cfg.serverIp();
+    m_signaling->start(cfg.serverIp(), accessterminal::protocol::kSignalingPort);
+}
+
+bool Widget::loadFaceCascade(const QString& path)
+{
+    return m_faceCascade.load(path.toStdString());
+}
+
+// ============================================================================
+// 通话会话
+// ============================================================================
+
+void Widget::startCallSession()
+{
+    // 只打断 conn.pcm，不影响主提示音播放器。
+    if (m_connAudioManager) {
+        m_connAudioManager->stop();
+    }
+    qInfo() << "[信令] 收到 accept，创建音视频线程";
+
+    const AppConfig& cfg = AppConfig::instance();
+
+    // ---- 1. 创建并绑定音频 UDP socket（音视频共用）----
+    if (m_audioSocketFd < 0) {
+        m_audioSocketFd = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (m_audioSocketFd < 0) {
+            qWarning() << "[音频] 创建 UDP socket 失败, errno=" << errno;
+        } else {
+            struct sockaddr_in localAddr;
+            std::memset(&localAddr, 0, sizeof(localAddr));
+            localAddr.sin_family = AF_INET;
+            localAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+            localAddr.sin_port = htons(accessterminal::protocol::kAudioPort);
+            if (::bind(m_audioSocketFd,
+                       reinterpret_cast<struct sockaddr*>(&localAddr),
+                       sizeof(localAddr)) < 0) {
+                qWarning() << "[音频] 绑定端口"
+                           << accessterminal::protocol::kAudioPort
+                           << "失败, errno=" << errno;
+                ::close(m_audioSocketFd);
+                m_audioSocketFd = -1;
+            } else {
+                qInfo() << "[音频] 已绑定端口" << accessterminal::protocol::kAudioPort;
+            }
+        }
+    }
+
+    if (m_audioSocketFd < 0) {
+        qWarning() << "[音频] 无法创建/绑定 socket，音视频线程不启动";
+        return;
+    }
+
+    // ---- 2. 视频推流线程 ----
+    if (m_cameraPushThread) {
+        m_cameraPushThread->stop();
+        m_cameraPushThread->wait(kThreadStopTimeoutMs);
+        delete m_cameraPushThread;
+        m_cameraPushThread = nullptr;
+    }
+    m_cameraPushThread = new VideoPushThread(m_camera, cfg.serverIp(),
+                                             accessterminal::protocol::kVideoPort, this);
+    m_cameraPushThread->start();
+
+    // ---- 3. 音频采集线程 ----
+    if (m_audioSenderThread) {
+        m_audioSenderThread->stop();
+        m_audioSenderThread->wait(kThreadStopTimeoutMs);
+        delete m_audioSenderThread;
+        m_audioSenderThread = nullptr;
+    }
+    m_audioSenderThread = new AudioSenderThread(m_audioSocketFd, cfg.serverIp(),
+                                                accessterminal::protocol::kAudioPort, this);
+    connect(m_audioSenderThread, &AudioSenderThread::errorMsg, this,
+            [](const QString& msg) { qWarning() << "[音频发送]" << msg; });
+    m_audioSenderThread->start();
+    // 采集线程报告连接丢失时立即挂断，避免通话卡死。
+    connect(m_audioSenderThread, &AudioSenderThread::connectionLost,
+            this, &Widget::hangUpCall);
+
+    // ---- 4. 音频播放线程：延迟 400ms 启动，避免与采集争用声卡 ----
+    QTimer::singleShot(400, this, [this]() {
+        if (m_audioReceiverThread) {
+            m_audioReceiverThread->stop();
+            m_audioReceiverThread->wait(kThreadStopTimeoutMs);
+            delete m_audioReceiverThread;
+            m_audioReceiverThread = nullptr;
+        }
+        m_audioReceiverThread = new AudioReceiverThread(m_audioSocketFd, this);
+        m_audioReceiverThread->setVolume(30); // 默认 30% 音量
+        connect(m_audioReceiverThread, &AudioReceiverThread::errorMsg, this,
+                [](const QString& msg) { qWarning() << "[音频接收]" << msg; });
+        m_audioReceiverThread->start();
+        // 播放线程报告连接丢失时立即挂断（保留重构前行为）。
+        connect(m_audioReceiverThread, &AudioReceiverThread::connectionLost,
+                this, &Widget::hangUpCall);
+    });
+
+    // ---- 5. 通话计时 ----
+    if (m_callForm) {
+        m_callForm->startCallTimer();
+    }
+    qInfo() << "[完成] 音视频线程全部启动";
+}
+
+void Widget::hangUpCall()
+{
+    if (m_connAudioManager) {
+        m_connAudioManager->stop();
+    }
+
+    // 1. 关闭通话窗口。
+    if (m_callForm) {
+        m_callForm->stopCallTimer();
+        m_callForm->close();
+    }
+
+    // 2. 停止并销毁音视频线程（每个线程都带超时，避免主线程卡死）。
+    if (m_cameraPushThread) {
+        m_cameraPushThread->stop();
+        if (!m_cameraPushThread->wait(kThreadStopTimeoutMs)) {
+            qWarning() << "[挂断] 视频线程退出超时";
+        }
+        delete m_cameraPushThread;
+        m_cameraPushThread = nullptr;
+    }
+    if (m_audioSenderThread) {
+        m_audioSenderThread->stop();
+        if (!m_audioSenderThread->wait(kThreadStopTimeoutMs)) {
+            qWarning() << "[挂断] 音频采集线程退出超时";
+        }
+        delete m_audioSenderThread;
+        m_audioSenderThread = nullptr;
+    }
+    if (m_audioReceiverThread) {
+        m_audioReceiverThread->stop();
+        if (!m_audioReceiverThread->wait(kThreadStopTimeoutMs)) {
+            qWarning() << "[挂断] 音频播放线程退出超时";
+        }
+        delete m_audioReceiverThread;
+        m_audioReceiverThread = nullptr;
+    }
+
+    // 3. 释放通话窗口对象。
+    if (m_callForm) {
+        delete m_callForm;
+        m_callForm = nullptr;
+    }
+
+    // 4. 关闭音频 socket。
+    if (m_audioSocketFd >= 0) {
+        ::close(m_audioSocketFd);
+        m_audioSocketFd = -1;
+    }
+
+    // 5. 恢复人体检测。
+    if (m_pe4Thread) {
+        m_pe4Thread->resume();
+    }
+}
+
+void Widget::onSignalReceived(Signal signal)
+{
+    switch (signal) {
+    case Signal::Accept:
+        startCallSession();
+        break;
+    case Signal::RecStop:
+        qInfo() << "[信令] 收到 recstop，自动挂断";
+        hangUpCall();
+        break;
+    case Signal::Unlock:
+        qInfo() << "[信令] 收到 unlock，播放开门音";
+        if (m_audioManager) {
+            m_audioManager->playAsync(
+                AppConfig::instance().pcmFile(QStringLiteral("opendoor.pcm")));
+        }
+        break;
+    default:
+        // 门口机不处理 call/getframe/stop/stopsend，忽略即可。
+        break;
+    }
+}
+
+// ============================================================================
+// 按钮响应
+// ============================================================================
+
+void Widget::on_btncall_clicked()
+{
+    // 先播放呼叫音，结束后接等待音 conn.pcm（独立播放器，可被 accept 打断）。
+    m_audioManager->playAsync(
+        AppConfig::instance().pcmFile(QStringLiteral("calling.pcm")));
+
+    auto* conn = new QMetaObject::Connection;
+    *conn = connect(m_audioManager, &AudioManager::playbackFinished, this,
+                    [this, conn](const QString& file) {
+                        const QString calling =
+                            AppConfig::instance().pcmFile(QStringLiteral("calling.pcm"));
+                        if (file == calling) {
+                            m_connAudioManager->playAsync(
+                                AppConfig::instance().pcmFile(QStringLiteral("conn.pcm")));
+                            QObject::disconnect(*conn);
+                            delete conn;
+                        }
+                    });
+
+    // 重建通话窗口，并与 widget_3 左上角对齐。
+    if (m_callForm) {
+        m_callForm->close();
+        delete m_callForm;
+        m_callForm = nullptr;
+    }
+    m_callForm = new Form_CALL(this);
+    m_callForm->move(ui->widget_3->mapToGlobal(QPoint(0, 0)));
+    m_callForm->setStatusText(QStringLiteral("正在呼叫..."));
+    m_callForm->show();
+    m_callForm->raise();
+
+    connect(m_callForm, &Form_CALL::hangupRequested, this, [this]() {
+        if (m_audioManager) m_audioManager->stop();
+        if (m_connAudioManager) m_connAudioManager->stop();
+        hangUpCall();
+    });
+
+    if (!m_signaling->send(Signal::Call)) {
+        QMessageBox::warning(this, QStringLiteral("错误"),
+                             QStringLiteral("信令服务器未连接"));
+        return;
+    }
+
+    qInfo() << "[完成] 信令已发送，等待服务器 accept";
+    if (m_pe4Thread) {
+        m_pe4Thread->pause(); // 通话期间暂停人体检测，避免误触发
+    }
+}
+
+void Widget::on_btnadd_clicked()
+{
+    m_audioManager->playAsync(
+        AppConfig::instance().pcmFile(QStringLiteral("regnew.pcm")));
+
+    if (!m_fingerForm) {
+        m_fingerForm = new Form_finger(this);
+        connect(m_fingerForm, &Form_finger::addFaceRequested,
+                this, &Widget::onAddFaceFromFingerForm);
+        connect(m_fingerForm, &Form_finger::addFingerRequested,
+                this, &Widget::onAddFingerFromFingerForm);
+    }
+    m_fingerForm->move(ui->widget_3->mapToGlobal(QPoint(0, 0)));
+    m_fingerForm->show();
+    m_fingerForm->raise();
+}
+
+void Widget::on_btnpsswd_clicked()
+{
+    auto* passwdForm = new Form_passwd(this);
+    passwdForm->setAttribute(Qt::WA_DeleteOnClose); // 关闭时自动销毁
+    connect(passwdForm, &Form_passwd::passwordEntered,
+            m_passwordManager, &PasswordManager::checkPassword);
+    passwdForm->move(ui->widget_3->mapToGlobal(QPoint(0, 0)));
+    passwdForm->show();
+    passwdForm->raise();
+    m_passwdForm = passwdForm;
+
+    m_audioManager->playAsync(
+        AppConfig::instance().pcmFile(QStringLiteral("inputpasswd.pcm")));
+}
+
+void Widget::on_btnpower_clicked()
+{
+    // 熄灭补光灯（保留原语义：重构前此处为 gpiod_line_set_value(line5, 0)）。
+    if (m_auxLine) {
+        m_auxLine->setValue(0);
+    }
+}
+
+// ============================================================================
+// 指纹与人脸回调
+// ============================================================================
+
+void Widget::onFingerprintIdentify(bool success, int id, int score, const QString& msg)
+{
+    if (success) {
+        QMessageBox::information(
+            this, QStringLiteral("指纹识别"),
+            QStringLiteral("识别成功，ID=%1，score=%2").arg(id).arg(score));
+    } else {
+        qDebug() << "[指纹] 识别失败, msg=" << msg;
+        // 识别失败不弹窗，避免频繁打扰。
+    }
+}
+
+void Widget::onFingerprintEnroll(bool success, int id, const QString& msg)
+{
+    if (success) {
+        ++m_nextFingerId;
+        QMessageBox::information(this, QStringLiteral("指纹注册"),
+                                 QStringLiteral("注册成功，ID=%1").arg(id));
+    } else {
+        qDebug() << "[指纹] 注册失败, ID=" << id << ", msg=" << msg;
+        QMessageBox::warning(this, QStringLiteral("指纹注册"),
+                             QStringLiteral("注册失败，ID=%1\n原因：%2").arg(id).arg(msg));
+    }
+}
+
+void Widget::onAddFingerFromFingerForm()
+{
+    qDebug() << "[分步注册] 开始分步注册, ID=" << m_nextFingerId;
+    QMessageBox::information(
+        this, QStringLiteral("分步注册"),
+        QStringLiteral("请将手指按在指纹模块上，按提示操作，每次采集后抬手再按。"));
+    QtConcurrent::run(m_fingerprint, &HailinFingerprint::stepRegister, m_nextFingerId, 3);
+}
+
+void Widget::onAddFaceFromFingerForm()
+{
+    if (m_faces.empty()) {
+        return;
+    }
+    const auto maxFace = std::max_element(
+        m_faces.begin(), m_faces.end(),
+        [](const cv::Rect& a, const cv::Rect& b) { return a.area() < b.area(); });
+    if (maxFace == m_faces.end()) {
+        return;
+    }
+    const QImage frame = m_camera->getFrame();
+    if (frame.isNull()) {
+        return;
+    }
+    const QRect faceRect(maxFace->x, maxFace->y, maxFace->width, maxFace->height);
+    const QImage faceImage = frame.copy(faceRect).scaled(100, 100, Qt::KeepAspectRatio);
+    m_faceManager->addFaceSample(faceImage);
+    if (m_faceManager->sampleCount() == kFaceSampleTarget) {
+        m_faceManager->train();
+    }
+}
+
+// ============================================================================
+// 画面刷新、人脸检测与识别
+// ============================================================================
+
+void Widget::updateFrame()
+{
+    static int detectCounter = 0;
+    static QElapsedTimer recognizeCooldown;
+
+    const AppConfig& cfg = AppConfig::instance();
+
+    QImage frame = m_camera->getFrame();
+    if (frame.isNull()) {
+        return;
+    }
+
+    // 在画面上叠加人脸框与采集计数。
+    {
+        QPainter painter(&frame);
+        painter.setPen(QPen(Qt::red, 3));
+        QFont font = painter.font();
+        font.setPointSize(18);
+        painter.setFont(font);
+        for (const auto& face : m_faces) {
+            painter.drawRect(face.x, face.y, face.width, face.height);
+            const QString text = QString::number(m_collectCount);
+            painter.setPen(QPen(Qt::black, 5)); // 黑色描边提升可读性
+            painter.drawText(face.x + 6, face.y + 28, text);
+            painter.setPen(QPen(Qt::white, 1));
+            painter.drawText(face.x + 6, face.y + 28, text);
+            painter.setPen(QPen(Qt::red, 3));
+        }
+        painter.end();
+    }
+
+    // 按固定尺寸裁剪显示，保持画面比例。
+    const QSize labelSize(kPreviewWidth, kPreviewHeight);
+    const QImage scaled = frame.scaled(labelSize, Qt::KeepAspectRatioByExpanding,
+                                       Qt::FastTransformation);
+    const QRect cropRect((scaled.width() - labelSize.width()) / 2,
+                         (scaled.height() - labelSize.height()) / 2,
+                         labelSize.width(), labelSize.height());
+    ui->labelcam->setPixmap(QPixmap::fromImage(scaled.copy(cropRect)));
+
+    // ---- 异步人脸检测：每 N 帧一次，缩小尺寸降低计算量 ----
+    if (++detectCounter % cfg.faceDetectInterval() == 0 && !m_faceCascade.empty()) {
+        const QImage small = frame.scaled(kDetectWidth, kDetectHeight, Qt::KeepAspectRatio);
+        QtConcurrent::run([this, small]() {
+            const cv::Mat mat(small.height(), small.width(), CV_8UC4,
+                              const_cast<uchar*>(small.bits()), small.bytesPerLine());
+            cv::Mat gray;
+            cv::cvtColor(mat, gray, cv::COLOR_BGRA2GRAY);
+            std::vector<cv::Rect> rects;
+            m_faceCascade.detectMultiScale(gray, rects, 1.1, 3, 0, cv::Size(30, 30));
+            // 结果投递回 UI 线程处理（跨线程直接访问 m_faces 不安全）。
+            QVector<cv::Rect> qrects;
+            qrects.reserve(static_cast<int>(rects.size()));
+            for (const cv::Rect& r : rects) {
+                qrects.append(r);
+            }
+            const int w = small.width();
+            const int h = small.height();
+            QMetaObject::invokeMethod(this, [this, qrects, w, h]() {
+                onFaceDetectResult(qrects, w, h);
+            }, Qt::QueuedConnection);
+        });
+    }
+
+    // ---- 人脸识别：仅在检测到人时进行，且受冷却时间限制 ----
+    if (!m_hasPerson) {
+        return; // 无人时不识别也不播报
+    }
+    const bool cooldownElapsed =
+        !recognizeCooldown.isValid()
+        || recognizeCooldown.elapsed() > cfg.faceRecognizeIntervalMs();
+    if (cooldownElapsed) {
+        if (!m_faces.empty()) {
+            const auto maxFace = std::max_element(
+                m_faces.begin(), m_faces.end(),
+                [](const cv::Rect& a, const cv::Rect& b) { return a.area() < b.area(); });
+            if (maxFace != m_faces.end()) {
+                const QRect faceRect(maxFace->x, maxFace->y, maxFace->width, maxFace->height);
+                const QImage faceImage =
+                    frame.copy(faceRect).scaled(100, 100, Qt::KeepAspectRatio);
+                m_faceManager->recognize(faceImage);
+                recognizeCooldown.restart();
+            }
+        } else {
+            // 有人但未检出人脸：提示调整位置并打开补光。
+            m_audioManager->playAsync(cfg.pcmFile(QStringLiteral("oncam.pcm")));
+            recognizeCooldown.restart();
+            if (m_auxLine) m_auxLine->setValue(1);
+        }
+    }
+}
+
+void Widget::onFaceDetectResult(const QVector<cv::Rect>& detected, int imgW, int imgH)
+{
+    const QImage frame = m_camera->getFrame();
+    if (frame.isNull() || imgW <= 0 || imgH <= 0) {
+        return;
+    }
+    // 检测在缩小图上进行，需把坐标还原到原始分辨率。
+    const double scaleX = static_cast<double>(frame.width()) / imgW;
+    const double scaleY = static_cast<double>(frame.height()) / imgH;
+    m_faces.clear();
+    m_faces.reserve(detected.size());
+    for (const auto& face : detected) {
+        m_faces.append(cv::Rect(static_cast<int>(face.x * scaleX),
+                                static_cast<int>(face.y * scaleY),
+                                static_cast<int>(face.width * scaleX),
+                                static_cast<int>(face.height * scaleY)));
+    }
+}
+
+void Widget::resizeEvent(QResizeEvent* event)
+{
+    QWidget::resizeEvent(event);
+}
