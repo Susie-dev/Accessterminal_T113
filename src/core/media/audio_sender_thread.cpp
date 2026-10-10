@@ -76,6 +76,10 @@ void AudioSenderThread::run() {
         qWarning() << "[AudioSenderThread] inet_pton失败，serverIp=" << serverIp;
         // 发出 Qt 信号 errorMsg 通知其他对象。
         emit errorMsg("inet_pton失败");
+        // 采集通道根本建立不起来：通话不可能有声音，必须报告“连接丢失”
+        // 让 Widget 挂断，否则界面会一直停在一个没有任何音频的通话上。
+        // 详见文件末尾 sendto 失败处的说明。
+        emit connectionLost();
         // 返回当前函数的执行结果或结束函数。
         return;
     // 结束当前代码块作用域。
@@ -90,6 +94,8 @@ void AudioSenderThread::run() {
         qWarning() << "[AudioSenderThread] 无法打开pcm设备:" << PCM_DEVICE << snd_strerror(rc);
         // 发出 Qt 信号 errorMsg 通知其他对象。
         emit errorMsg(QString("无法打开pcm设备: %1").arg(snd_strerror(rc)));
+        // 麦克风/声卡打不开，同样属于“采集通道不可用”，必须挂断。
+        emit connectionLost();
         // 返回当前函数的执行结果或结束函数。
         return;
     // 结束当前代码块作用域。
@@ -142,6 +148,9 @@ void AudioSenderThread::run() {
             qWarning() << "[AudioSenderThread] 采集read错误:" << snd_strerror(rc);
             // 发出 Qt 信号 errorMsg 通知其他对象。
             emit errorMsg(QString("read错误: %1").arg(snd_strerror(rc)));
+            // 声卡读取出现不可恢复错误（非 EPIPE/EAGAIN，两者已在上面处理），
+            // 采集循环即将 break，通话已无上行音频 → 报告连接丢失。
+            emit connectionLost();
             // 跳出当前循环或 switch 分支。
             break;
         // 结束当前代码块作用域。
@@ -165,6 +174,18 @@ void AudioSenderThread::run() {
             qWarning() << "[AudioSenderThread] sendto失败, sent=" << sent << ", bytes=" << bytes << ", errno=" << errno;
             // 发出 Qt 信号 errorMsg 通知其他对象。
             emit errorMsg("sendto失败");
+            // 这里的 connectionLost() 是**关键**：采集循环即将 break，
+            // 线程随即结束——此后再没有任何帧被发往室内机，通话已经单向
+            // 静音。而 sockfd 是发送用的 UDP socket，sendto 失败（对端
+            // 不可达 / 网络断开 / fd 已被关闭）不会产生任何其它可观测迹象，
+            // 界面依旧显示“通话中”。
+            //
+            // Widget 已把本信号接到 hangUpCall()，其注释写明用途正是
+            // “采集线程报告连接丢失时立即挂断，避免通话卡死”。但重构前
+            // 本信号只被声明、从未发射（基线 audiosenderthread.cpp 同样
+            // 只 emit errorMsg/finishedMsg），于是这条兜底路径实际是死的：
+            // 现场表现为通话不挂断、双方无声，直到用户手动按挂断。
+            emit connectionLost();
             // 跳出当前循环或 switch 分支。
             break;
         // 结束当前代码块作用域。

@@ -268,7 +268,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下十二条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下十四条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -614,7 +614,73 @@ void CameraPushThread::run() { /* 不再写 running = true */ ... }
 `tools/verify_stop_flag.py`（6/6 用例，含「重置的是非停止标志」与
 「非 QThread 类」两个反例）。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述十二条请以
+### 13. `signals:` 里声明的信号必须真的会被发射
+
+一个只声明、从不发射的信号是**死信号**：任何 connect 到它的槽永远不会被
+调用，而编译、链接、静态检查全都不会报错。
+
+本工程的实例是 `AudioSenderThread::connectionLost()`。它被声明、被连接，
+connect 的注释还明确写着用途——
+
+```cpp
+// 采集线程报告连接丢失时立即挂断，避免通话卡死。
+connect(m_audioSenderThread, &AudioSenderThread::connectionLost,
+        this, &Widget::hangUpCall);
+```
+
+——但全工程从未 `emit` 过它（基线的 `audiosenderthread.cpp` 同样只 emit
+`errorMsg`/`finishedMsg`）。于是 `sendto` 失败后采集循环 `break`、线程结束，
+再无任何帧发往室内机，通话已单向静音，界面却依旧显示“通话中”，用户只能
+手动挂断。这条“避免卡死”的兜底实际是死的。修法是在四个真实的失败出口
+（`inet_pton` 失败、`snd_pcm_open` 失败、非 EPIPE/EAGAIN 的读错误、
+`sendto` 失败）都补上 `emit connectionLost();`。
+
+判定一个信号“真的会触发”只有两种途径：
+
+1. 被显式发射：`emit S(...)` 或直接调用 `S(...)`；
+2. 作为 connect 的**第 4 个实参**出现（信号→信号链式连接，
+   `connect(btn, &QPushButton::clicked, this, &Cls::S)`）——源信号触发时
+   Qt 会自动发射 S。
+
+第 2 条不能漏：漏掉就会把 `Form_finger::addFaceRequested` 这种链式目标
+误判为死信号。反过来也要注意，`connect(this, &Cls::src, this, &Cls::dst)`
+里的 `src` 是**源**，它自己必须另有 emit 出口，否则整条链依然永不触发。
+
+由 `check_declared_signal_is_emitted` 强制，自检见
+`tools/verify_dead_signal.py`（10/10 用例，含“链式连接的源信号本身是死的”
+这一真阳性）。
+
+### 14. connect 实参必须能正确切分（`->` 陷阱）
+
+第 7 条（`connect` 第二实参必须是信号）依赖“按顶层逗号切分实参”。而本工程
+最常见的写法首实参就含 `->`：
+
+```cpp
+connect(ui->addface, &QPushButton::clicked, this, &Form_finger::addFaceRequested);
+```
+
+若切分器把 `>` 也当作需要配对的括号（`if ch in "(<[" / elif ch in ")>]"`），
+每遇到一个 `->` 深度就偏负一次，**顶层逗号再也分不出来**，整条实参列表被当成
+1 个实参；检查随后因 `len(args) < 2` 直接 `continue`，**静默跳过这条
+connect**——既不报错也不提示。
+
+实测本工程因此漏检了 6 条本应检查的 connect（33/39），且漏掉的恰好都是
+`ui->控件` 开头的常见形式：
+
+```
+form_call.cpp:27    ui->btnstop, ...
+form_finger.cpp:37  ui->addface, ...
+form_finger.cpp:39  ui->addfinger, ...
+form_finger.cpp:41  ui->addquit, ...
+form_passwd.cpp:46  ui->btnbck, ...
+form_passwd.cpp:48  ui->btnok, ...
+```
+
+现在切分只让 `()`/`[]`/`{}` 参与配对，`->` 与 `>>` 不计数。由
+`tools/verify_connect_signal.py`（5/5 用例，含“首实参含 `->` 且第二实参是槽”
+的真阳性）锁定，确保第 7 条不再被悄悄绕过。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述十四条请以
 `verify.py` 的结果为准。
 
 ---
@@ -640,12 +706,15 @@ python3 tools/verify.py .
 python3 tools/check_signatures.py .
 
 # 2b. 校验器自检：对 check_config_value_sanity / check_config_knobs_are_used /
-#     check_no_running_reset_in_run / check_no_secret_in_logs 做故障注入。
-#     静态规则写错会静默失效，必须证明它真能区分好坏代码。
+#     check_no_running_reset_in_run / check_no_secret_in_logs /
+#     check_declared_signal_is_emitted / check_connect_signal_is_signal
+#     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
 python3 tools/verify_stop_flag.py .
 python3 tools/verify_secret_logs.py .
+python3 tools/verify_dead_signal.py .
+python3 tools/verify_connect_signal.py .
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
 #     含「原实现对照」与随机模糊测试；无需编译即可验证定帧逻辑）

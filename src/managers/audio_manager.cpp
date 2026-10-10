@@ -13,6 +13,11 @@
 // 引入系统或第三方头文件 <QMutex>。
 #include <QMutex>
 
+namespace {
+/// writei 遇到 XRUN 后重写同一包的最大次数（每次重写前用 snd_pcm_prepare 复位）。
+constexpr int kWriteRetries = 3;
+} // namespace
+
 // 定义类 AudioManager 的成员函数 AudioManager。
 AudioManager::AudioManager(QObject* parent)
     // 继续当前代码块的参数、表达式或结构定义。
@@ -153,7 +158,33 @@ void AudioManager::playPcmFile(const QString& pcmFilePath, std::atomic<bool>* in
         // 执行本行语句完成对应变量、对象或业务状态处理。
         int frames = data.size() / 2;
         // 执行本行语句完成对应变量、对象或业务状态处理。
-        int rcw = snd_pcm_writei(pcm_handle, data.constData(), frames);
+        //
+        // XRUN（-EPIPE）后必须 snd_pcm_prepare 复位再重写。
+        //
+        // ALSA 的写接口在缓冲欠载/过载后进入 XRUN 状态，此后**每一次**
+        // writei 都会立刻返回 -EPIPE，直到调用方 prepare 复位。重构前的
+        // 代码只打印一条 qWarning 就继续循环：
+        //
+        //     int rcw = snd_pcm_writei(...);
+        //     if (rcw < 0) qWarning() << "...错误:" << snd_strerror(rcw);
+        //
+        // 于是一旦发生一次 XRUN，本段提示音**剩余的全部数据都会被静默丢掉**，
+        // 而且因为每次 writei 都立即失败、不阻塞，循环会瞬间跑完 —— 现场
+        // 表现为「这条提示音没响/只响了一个开头」，且只有一行警告，极难定位。
+        //
+        // 同工程的播放线程 AudioReceiverThread 早已处理了这一点
+        // （`if (rcw == -EPIPE) { snd_pcm_prepare(...); continue; }`），
+        // 本处与之对齐：EPIPE 时 prepare 并重写同一包，其它错误仍只告警。
+        int rcw = 0;
+        for (int attempt = 0; attempt < kWriteRetries; ++attempt) {
+            rcw = snd_pcm_writei(pcm_handle, data.constData(), frames);
+            if (rcw == -EPIPE) {
+                // 缓冲被清空，设备需要重新 prepare 才能接受下一包。
+                snd_pcm_prepare(pcm_handle);
+                continue; // 重写同一包
+            }
+            break;
+        }
         // 根据条件判断是否执行该分支。
         if (rcw < 0) {
             // 输出警告日志。
