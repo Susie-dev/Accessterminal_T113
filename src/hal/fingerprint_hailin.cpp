@@ -243,6 +243,24 @@ bool HailinFingerprint::autoEnroll(quint16 id, quint8 enrollTimes, quint8 param,
             return false;
         // 结束当前代码块作用域。
         }
+        // 长度校验：下面要读 resp[9]/resp[10]/resp[11]，至少需要 12 字节。
+        // 解析器只保证「长度字段自洽」，最短合法帧是 9 + 2(校验和) = 11 字节，
+        // 此时 resp[11] 越界。stepRegister()/stepIdentify() 早已用
+        // `resp.size() < 12` 做同样校验，此处原本漏掉了，保持一致补上。
+        // 注意 QByteArray::operator[] 越界是未定义行为（非 QString 那种
+        // 返回空引用），必须显式判断。
+        // 根据条件判断是否执行该分支。
+        if (resp.size() < 12) {
+            // 执行本行语句完成对应变量、对象或业务状态处理。
+            debug("[指纹] 注册应答过短，忽略");
+            // 必须推进 elapsed：下面的 continue 会跳过循环末尾的
+            // elapsed += 2000，若模块持续吐短帧，超时判断就永远不会成立。
+            // 执行本行语句完成对应变量、对象或业务状态处理。
+            elapsed += 2000;
+            // 跳过本轮循环剩余逻辑并进入下一轮。
+            continue;
+        // 结束当前代码块作用域。
+        }
         // 执行本行语句完成对应变量、对象或业务状态处理。
         quint8 confirm = (quint8)resp[9];
         // 执行本行语句完成对应变量、对象或业务状态处理。
