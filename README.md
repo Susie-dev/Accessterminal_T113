@@ -115,6 +115,24 @@ pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-qt5-base \
 
 已验证：全部 18 个 `.cpp` 通过（GCC 16.2.0 + Qt 5.15.19）。
 
+### 主机端链接检查（进一步验证符号完整性）
+
+在语法检查之上，还可以用 `tools/devstubs/stub_impl.c` 提供的 ALSA /
+libgpiod / POSIX 桩实现把整个工程**真的链接**起来：
+
+```sh
+bash tools/check_host_link.sh
+```
+
+它能发现 `-fsyntax-only` 覆盖不到的缺陷：
+
+- `undefined reference`——声明了却没有定义；
+- `multiple definition`——重复定义；
+- 库顺序错误、漏链某个 Qt 模块。
+
+> 产物**不可运行**（桩函数不做真实 I/O），仅用于验证链接完整性。
+> 已验证：整个工程（18 个 .cpp + Qt MOC/UIC/RCC）链接成功。
+
 也保留了 qmake 工作流（Qt Creator 可直接打开 `smartpro.pro`）：
 
 ```sh
@@ -253,13 +271,16 @@ python3 tools/check_protocol_sync.py
 
 # 4. 真实编译验证（本机类型检查；静态检查无法发现类型不匹配等问题）
 bash tools/check_host_compile.sh
+
+# 5. 链接完整性检查（发现 undefined reference / 重复定义）
+bash tools/check_host_link.sh
 ```
 
-四个脚本在 CI 中也可直接使用，退出码非 0 即表示失败。
+五个脚本在 CI 中也可直接使用，退出码非 0 即表示失败。
 
-第 1~3 步是静态检查，速度快但覆盖有限；**第 4 步不能省**——
+第 1~3 步是静态检查，速度快但覆盖有限；**第 4、5 步不能省**——
 像“前置声明了不存在的类名”“把 ALSA 枚举存成 int 再传回枚举形参”
-这类缺陷只有编译器能发现。
+这类缺陷只有编译器能发现，“漏定义某个符号”只有链接器能发现。
 
 ---
 
