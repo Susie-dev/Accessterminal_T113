@@ -518,6 +518,85 @@ UTF8   设定 == 取回 ? false     （13 码元 -> 16 码元）
 固定长度：只查 `left(4)` 会漏掉 `left(2)`、`mid(0,n)`、`.at(0)` 等其它脱敏
 写法，而前缀脱敏对短密码等于全泄。
 
+### 人脸门禁：决定门开不开的那个比较，终于被测到了
+
+`FaceManager` 决定**门开不开** —— `widget.cpp:889` 检出人脸后调用
+`recognize()`，由 `recognizeResult` 决定是否开门。它此前从未被链接进任何测试
+目标。好在本机 OpenCV 带 face 模块（`libopencv_face.dll.a`），所以第 29 轮
+**链接真实的 `face_manager.cpp` 并用真实 LBPH 跑**（20 个用例），而不是写个
+替身自我验证。
+
+#### 先做探针，再写断言 —— 这次推翻了我自己的假设
+
+动手前写了三个临时探针（未入库），量到三条决定性事实：
+
+**事实 1：模型未训练时 `predict()` 抛 `cv::Exception`。**
+
+```
+OpenCV(5.0.0) ... lbph_faces.cpp:406: error: (-5:Bad argument)
+This LBPH model is not computed yet. Did you call the train method?
+```
+
+而 `recognize()` 的守卫是 `registeredFaces.size() < collectTarget` —— 数的是
+**样本数**，不是"模型已训练"。两者在"样本填满但跳过 `train()`"时不相等。
+
+**事实 2：单 label 时 `predictedLabel == 1` 恒为真。**
+
+训练时 `labels` 全是 1（单用户门禁），LBPH 只有一个类别。于是判据
+`predictedLabel == 1 && confidence < threshold` 里**前半永远成立**，
+**阈值是唯一的门**。
+
+**事实 3（推翻我的假设）：我怀疑的崩溃链不成立。**
+
+我原本推断"人脸框越界 -> `QImage::copy()` 返回空图 -> 存进空样本 ->
+`train()`/`predict()` 抛异常 -> UI 线程崩溃"。探针实测：
+
+```
+QImage::copy(越界矩形) isNull=0 size=100x100     <- 不返回空图！
+空图也能正常转 cv::Mat、正常 train/predict
+```
+
+**`QImage::copy()` 传越界矩形返回的是"指定尺寸、内容未初始化"的图。**
+这条猜测是错的，因此**没有**写成断言 —— 探针的价值有一半在于否掉错误假设。
+
+#### 由事实 2 决定的断言取向：不硬编码 confidence
+
+既然阈值是唯一的门，那么"硬编码某个 confidence 数值"是没有意义的（换
+OpenCV 版本或输入就会变）。所以阈值断言一律**用被测代码自己吐出的
+confidence 当基准**：
+
+| 阈值设置 | 期望 | 证明了什么 |
+| --- | --- | --- |
+| `conf + 1` | 接受 | 比较方向正确 |
+| `conf` | **拒绝** | 比较是严格 `<` 而不是 `<=` |
+| `-1` | 拒绝 | 边界收得住 |
+
+再配一条阳性对照（同图案距离必须**小于**异图案距离），防止两张图 conf 恰好
+都是 0 时整组断言变成恒真。
+
+#### 一个"钉住隐患、但不改代码"的决定
+
+事实 1 描述的是**隐患**而非已爆的缺陷：唯一调用点 `widget.cpp:767-768` 在
+`sampleCount() == sampleTarget()` 时**立即**调用 `train()`，所以"样本数到 3"
+与"模型已训练"是同一件事，该路径当前不可达。baseline 的守卫完全相同
+（`face_manager.cpp:76`），属**继承**行为。
+
+但它一旦被别的新路径触发（界面预加载样本、把 `train()` 改成异步……），异常会
+从 UI 线程的槽里逃出事件循环，**直接终止进程**。所以第 29 轮用一条用例
+（`samplesWithoutTrainingMakeRecognizeThrow_documentedHazard`）把**现状显式
+钉住**：若将来有人把守卫改成检查模型训练状态，该用例会失败，从而迫使"是否
+收敛"成为一个**显式决定**，而不是随手的改动。
+
+#### 还发现：门禁的唯一判据没有任何范围约束
+
+探针证实门禁安全**完全取决于** `behavior.face_confidence_threshold`，而它
+只被读取、**没有任何范围约束**（`app_config.cpp` 里 `qBound`/`clamp` 调用
+总数为 0）。配置成 `1e9` 会让任何陌生人像都判"通过"，门锁形同虚设；误写成
+`900`（多写一个 0）同样静默失守。
+
+这不是崩溃类缺陷，且加约束属**行为变化**，因此第 29 轮只**告警**
+（`[face-gate]`），交由单独决定。
+
 ### 物理门锁那条线：GpioLine 终于有了可注入失败的测试
 
 `GpioLine` 管的是门口机**物理门锁/补光**那条线（T113 的 PE5 = 线号 133，开锁
@@ -834,7 +913,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下四十七条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下五十一条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -1654,7 +1733,7 @@ python3 tools/verify.py . ../Accessterminal_desktop
 > **已加载的模块**后才真正生效。这正是必须做故障注入的理由——**自检脚本自己
 > 也会骗人**。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述四十七条请以
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述五十一条请以
 `verify.py` 的结果为准。
 
 ---
@@ -2074,6 +2153,73 @@ CMakeLists"因此没触发 —— 测试文件存在但没人编译它时，规�
 
 **列"必须存在的引用"时，逐个文件核对，别只挑印象最深的两个。**
 
+### 48. 探针的一半价值在于**否掉错误假设**
+
+第 29 轮为 `FaceManager` 写测试前先跑了三个临时探针。除了量到"未训练的
+LBPH `predict()` 抛 `cv::Exception`"与"单 label 时 `predictedLabel == 1`
+恒真"这两条有用事实，还**推翻了我自己的推断**：
+
+> 我原以为"人脸框越界 -> `QImage::copy()` 返回空图 -> 存进空样本 ->
+> `train()` 抛异常 -> UI 线程崩溃"。实测 `QImage::copy()` 传越界矩形返回的是
+> **指定尺寸、内容未初始化**的图，`isNull() == false`，根本不是空图。
+
+若不做探针，我会把这条**错误**的因果链写进注释与断言里 —— 而错误断言比没有
+断言更糟：它会把一个不存在的行为固定成"契约"。**记录"我否掉了什么假设"和
+记录"我发现了什么"同样重要。**
+
+### 49. 安全参数如果只有一个判据，就要把它写成断言
+
+探针证实：单 label 的 LBPH 模型里 `predictedLabel == 1` **恒为真**，因此
+`confidence < threshold` 是**门禁唯一的门**。这意味着门禁安全**完全**系于
+一个数字。
+
+由此产生两条做法：
+1. 专门写一条用例把"阈值是唯一判据"这一事实钉住（松阈值 -> 陌生人也能开门；
+   紧阈值 -> 必须拒绝）。丢了它，就没人守这条唯一的门。
+2. 阈值相关的断言**不硬编码 confidence 数值**，而用被测代码自己吐出的
+   confidence 当基准（`阈值 = conf` 必须拒绝，`conf + 1` 必须接受）——
+   既精确钉住比较语义（严格 `<` 而非 `<=`），又与 OpenCV 版本无关。
+
+### 50. "没有判别力"的断言要当作没有断言
+
+`addFaceSample` 应当把彩色图转灰度再存。我第一版用例只断言"彩色注册后
+`train()` 成功"，理由是"不转换的话 LBPH 会抛异常"。**故障注入证明这条断言
+毫无判别力**：
+
+> LBPH 接受任何 `CV_8UC1` 的 Mat，即使那个 Mat 其实是 RGB32 缓冲的前 1/4
+> 字节（`stride` 400 而 `width` 100），`train()` 照样成功。
+
+改做第二个探针量出真正的判别力在**像素数据**上：
+
+| 注册 | 用灰度同图案预测 | conf | 结果 |
+| --- | --- | --- | --- |
+| 真转换 | kind=0 | 0.00 | 接受 |
+| 不转换 | kind=0 | 256.00 | 拒绝 |
+| 不转换 | kind=1 | 153.60 | 拒绝 |
+| 不转换 | kind=2 | **33.26** | **接受（无判别力）** |
+
+于是改为"彩色注册 -> 用**灰度**同图案预测 -> 必须接受"，并**固定选 kind=0**
+—— 因为 kind=2 那个图案即使错了也会通过（33.26 < 90）。
+
+**结论：断言必须落在能区分正确/错误实现的输出上。** 一条"跑了没出错"的
+断言，在故障注入下常常什么也抓不到；而且**不是所有输入都有判别力**，
+要挑出真的能区分的那一个。
+
+### 51. 规则匹配用词元边界，不要用子串
+
+第 29 轮的 `[face-gate]` 规则用子串检查测试函数是否存在，结果故障注入抓到：
+把 `thresholdIsTheOnlyGateWithSingleLabel` 改名成
+`thresholdIsTheOnlyGateWithSingleLabel_removed()` 后，规则**仍然通过** ——
+因为原名是改后名的**前缀**。
+
+修法：要求严结尾，即检查 `"thresholdIsTheOnlyGateWithSingleLabel("`
+（紧跟左括号）或使用**完整符号名**。这与第 43 条（守卫条件不能引用被守卫
+内容里会出现的字符串）是同一类问题的两个面：**匹配一个符号时必须考虑它的
+边界**。
+
+同时删掉了我自己写的一条**不成立的用例**（"去掉隐患的说明文字"）：
+注释文字并非必要条件，规则用符号名做锚点是对的 —— 是那条用例过强。
+
 ## 开发约定
 
 - **标准**：C++11（不可使用 C++17 的 inline 变量等特性）
@@ -2131,6 +2277,8 @@ python3 tools/verify_password_log_test.py .
 python3 tools/verify_password_log_rule.py .
 python3 tools/verify_gpio_test.py .
 python3 tools/verify_gpio_rule.py .
+python3 tools/verify_face_manager_test.py .
+python3 tools/verify_face_gate_rule.py .
 # 自检脚本必须在**不带 PYTHONIOENCODING** 的 GBK 控制台下也安全
 # （第 25 轮的教训：带 utf-8 测会掩盖真因，绿色是假的）
 env -u PYTHONIOENCODING python3 tools/verify_signaling_client_test.py .
@@ -2140,6 +2288,8 @@ env -u PYTHONIOENCODING python3 tools/verify_password_log_test.py .
 env -u PYTHONIOENCODING python3 tools/verify_password_log_rule.py .
 env -u PYTHONIOENCODING python3 tools/verify_gpio_test.py .
 env -u PYTHONIOENCODING python3 tools/verify_gpio_rule.py .
+env -u PYTHONIOENCODING python3 tools/verify_face_manager_test.py .
+env -u PYTHONIOENCODING python3 tools/verify_face_gate_rule.py .
 bash tools/run_coverage.sh
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，

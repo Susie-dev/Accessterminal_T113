@@ -451,3 +451,53 @@ target_link_libraries(t113_test_gpio PRIVATE
 )
 
 add_test(NAME t113_gpio COMMAND t113_test_gpio)
+
+# ---------------------------------------------------------------------------
+# FaceManager：人脸门禁的注册 / 训练 / 识别（第 29 轮补）
+#
+# FaceManager 决定**门开不开**：widget.cpp:889 检出人脸后调用 recognize()，
+# 由 recognizeResult 决定是否开门。它此前从未被链接进任何测试目标。
+#
+# 本机构建带 OpenCV face 模块（libopencv_face.dll.a），因此这里**链接真实的
+# face_manager.cpp 并用真实 LBPH 跑** —— 不写替身，避免"替身自我验证"。
+#
+# 写断言前先做了临时探针，量到三条决定性事实：
+#   1. 模型未训练时 predict() 抛 cv::Exception，所以"样本不足"守卫一旦失效
+#      会抛出异常、逃出 UI 事件循环即终止进程；
+#   2. **单 label 时 `predictedLabel == 1` 恒为真**（训练 labels 全是 1），
+#      因此阈值 `confidence < threshold` 是**唯一的门**；
+#   3. 我原本怀疑的"越界裁剪 -> 空样本 -> train 抛异常"链**不成立**：
+#      QImage::copy() 传越界矩形不返回空图。该猜测已被推翻，未写成断言。
+#
+# 由此阈值相关断言一律用**被测代码自己吐出的 confidence 当基准**
+# （阈值 = conf 必须拒绝；conf + 1 必须接受），与 OpenCV 版本无关。
+#
+# OpenCV 是**可选依赖**：找不到 face 模块时跳过本目标（其余测试仍可独立构建，
+# 保持本文件头部"可脱离主工程独立构建"的承诺）。交叉编译到 Tina SDK 时若
+# 目标平台 OpenCV 不含 face 模块，也走同一分支。
+# ---------------------------------------------------------------------------
+find_package(OpenCV QUIET COMPONENTS core imgproc face)
+
+if(OpenCV_FOUND AND OpenCV_face_FOUND)
+    add_executable(t113_test_face_manager
+        test_face_manager.cpp
+        ${ACCESSTERMINAL_SRC_ROOT}/managers/face_manager.cpp
+    )
+
+    target_include_directories(t113_test_face_manager PRIVATE
+        ${ACCESSTERMINAL_SRC_ROOT}
+        ${OpenCV_INCLUDE_DIRS}
+    )
+
+    target_link_libraries(t113_test_face_manager PRIVATE
+        Qt5::Core
+        Qt5::Test
+        Qt5::Gui            # QImage
+        ${OpenCV_LIBS}
+    )
+
+    add_test(NAME t113_face_manager COMMAND t113_test_face_manager)
+else()
+    message(STATUS "未找到 OpenCV face 模块，跳过 t113_test_face_manager"
+                   "（人脸门禁测试需要真实 LBPH）")
+endif()
