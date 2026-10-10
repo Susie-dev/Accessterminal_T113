@@ -4,10 +4,15 @@
 用法：python tools/verify_gpio_test.py
 返回码 0 表示：每个危险退化都被抓到，且两个对照未误报。
 
-重要：多数变异是被**进程崩溃**（非零退出码）抓到的，不是干净的
-FAIL 行 —— 那些变异真的造成了 double-free / use-after-free。
-夹具因此必须同时检查 FAIL 行**与**退出码；只看 FAIL 行会漏报
-一半变异（本文件就是这么写的：crashed = returncode not in (0,1)）。
+**更正（第 30 轮实测）**：本文件原先声称"多数变异是被进程崩溃抓到的，
+不是干净的 FAIL 行 —— 那些变异真的造成了 double-free / use-after-free"。
+这是**错的**。实测 QtTest 的退出码**等于 FAIL 行数**：
+  - "请求输出失败时不释放线" -> rc=1，1 条 FAIL 行
+  - "析构不释放（RAII 完全失效）" -> rc=18，**18 条 FAIL 行**
+所以那句注释把"多个用例干净失败"误当成了"崩溃"。
+判据已改为：**真正的崩溃 = 非零退出码但一条 FAIL 行都没有**。
+（原判据 `returncode not in (0,1)` 还有一个更隐蔽的害处：真正的崩溃
+若恰好 rc=1，会被当成"未抓到（假绿）"。）
 
 要证明的核心命题
 ----------------
@@ -307,14 +312,18 @@ def main():
             rr = subprocess.run([EXE], capture_output=True, env=ENV, cwd=T)
             out = (rr.stdout + rr.stderr).decode('utf-8', 'replace')
             failed = re.findall(r'^FAIL!\s*:\s*\w+::(\w+)\(\)', out, re.M)
-            crashed = rr.returncode not in (0, 1)
+
+            # 第 52 条：QtTest 的退出码 == FAIL 行数（**实测**，不是推测）。
+            # 真正的崩溃 = 非零退出码但**一条 FAIL 行都没有**。
+            crashed = rr.returncode != 0 and not failed
 
             if t1 <= t0:
                 print('  [夹具错误] %-42s .obj 未重编' % name)
                 problems.append(name)
             elif expect_fail:
                 if failed or crashed:
-                    tag = '崩溃(%d)' % rr.returncode if crashed else str(failed[:2])
+                    tag = ('崩溃(rc=%d, 无 FAIL 行)' % rr.returncode
+                           if crashed else '%d 条 FAIL 行' % len(failed))
                     print('  %-42s 被抓到 ✓ %s' % (name, tag))
                 else:
                     print('  %-42s *** 未被抓到（假绿）rc=%d' % (name, rr.returncode))

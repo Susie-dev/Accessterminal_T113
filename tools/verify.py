@@ -16,6 +16,8 @@
 import os
 import re
 import sys
+import io
+import tokenize
 import xml.etree.ElementTree as ET
 
 FAIL = []
@@ -3192,6 +3194,241 @@ def check_face_gate_hazard_is_documented(root, src_root):
 
 
 
+
+def check_v4l2_camera_failure_paths_are_testable(root, src_root):
+    r"""
+    V4L2Camera 的**失败路径**必须可注入、可断言，且映射泄漏的修复不得回退。
+
+    背景（第 30 轮）
+    ---------------
+    V4L2Camera 是门口机整个视频链路的源头：UDP 23456 通话视频、UDP 50000
+    远程监看、人脸检测、人脸门禁全都取自它的 getFrame()。它此前从未被链接
+    进任何测试目标，而它的危险分支全在**系统调用失败**上（设备不存在 /
+    权限不足 / S_FMT / REQBUFS / QUERYBUF / mmap / QBUF / STREAMON / DQBUF /
+    JPEG 解码失败）。
+
+    探针实测到一条**真实缺陷**（基线同样如此，属继承缺陷，不是重构引入的
+    回归；对比脚本确认基线与重构的 open() 失败分支逐字节等价）：
+    在 mmap **成功之后**，`VIDIOC_QBUF` 与 `VIDIOC_STREAMON` 的失败分支
+    只 `::close(v4l2_fd)` 而**不 munmap**。而 close() 不会自动解除映射，
+    重试 open() 又会用新映射覆盖 v4l2_buffer —— 旧映射的指针就此丢失，
+    **永久无法回收**。实测数值：
+
+      B 场景（失败一次 -> 重试成功 -> close）: close() 后仍映射 1048576 字节
+      C 场景（连续 3 次失败 -> close）        : close() 后仍映射 2097152 字节
+
+    修复后两者均为 0。
+
+    为什么必须用 --wrap 而不是现有 stub
+    -----------------------------------
+    tools/devstubs/stub_impl.c 是**固定**桩（ioctl 恒 -1、mmap 恒 MAP_FAILED），
+    只能做链接检查 —— 走不到任何成功路径，也无法按需让某一环失败。
+    因此改用可编程假 syscall 层 + `-Wl,--wrap`。
+
+    本规则钉住：
+      - 测试存在、接进构建、且链接**真实的** v4l2_camera.cpp；
+      - 可编程假 syscall 层存在并接进构建；
+      - `-Wl,--wrap` 五件套齐全（否则假层根本不会被调用 —— 测试会"通过"
+        但什么都没测到）；
+      - "QBUF/STREAMON 失败仍须 munmap" 与 "解码失败仍须归还缓冲区"
+        两条关键断言存在；
+      - 故障注入夹具存在；
+      - **生产代码里两处失败分支的 munmap 不得被删掉**（修复回退即失败）。
+    """
+    impl = os.path.join(src_root, "core", "vision", "v4l2_camera.cpp")
+    if not os.path.exists(impl):
+        return          # 本仓库没有 V4L2Camera，规则不适用
+
+    tests_dir = os.path.join(root, "tests")
+    tf = os.path.join(tests_dir, "test_v4l2_camera.cpp")
+    fk = os.path.join(tests_dir, "fake_v4l2_io.cpp")
+    cm = os.path.join(tests_dir, "CMakeLists.txt")
+    fx = os.path.join(root, "tools", "verify_v4l2_test.py")
+
+    if not os.path.exists(tf):
+        fail("[v4l2] 缺少 tests/test_v4l2_camera.cpp。V4L2Camera 是全部视频"
+             "功能（通话视频 UDP 23456、远程监看 UDP 50000、人脸检测、人脸"
+             "门禁）的画面来源，却从未被链接进任何测试目标；其 mmap 之后的"
+             "失败分支会**永久泄漏映射**（实测 close() 后仍留 1048576 字节）。")
+        return
+
+    if not os.path.exists(fk):
+        fail("[v4l2] 缺少 tests/fake_v4l2_io.cpp。没有可编程假 syscall 层就"
+             "无法让 S_FMT/REQBUFS/QUERYBUF/mmap/QBUF/STREAMON/DQBUF 逐级"
+             "失败 —— 而危险恰恰全在这些失败分支上。")
+
+    if os.path.exists(cm):
+        # **只在目标块内部查**，不能在整文件里查子串：
+        # 本文件的注释里反复提到 "tests/fake_v4l2_io.cpp"、"v4l2_camera.cpp"
+        # 等文件名（解释为什么不用替身），因此整文件子串检查在
+        # "把 add_executable 里那一行删掉、注释仍在"时**抓不到** ——
+        # 故障注入实测确认了这个假绿（第 51 条的翻版）。
+        raw = read(cm)
+        # 去掉 CMake 注释行（# 起头或行尾），再看目标块。
+        no_comment = "\n".join(
+            (l.split('#')[0] if not l.lstrip().startswith('#') else '')
+            for l in raw.split("\n"))
+        blocks = {}
+        for tname in ("t113_test_v4l2_camera",):
+            m = re.search(r'add_executable\s*\(\s*' + re.escape(tname)
+                          + r'\b(.*?)\)', no_comment, re.S)
+            blocks['sources'] = m.group(1) if m else ''
+            m2 = re.search(r'target_link_options\s*\(\s*' + re.escape(tname)
+                           + r'\b(.*?)\)', no_comment, re.S)
+            blocks['opts'] = m2.group(1) if m2 else ''
+
+        # 冒号前的名字（去注释）中必须出现这些源文件。
+        for needle, why in (
+                ("test_v4l2_camera.cpp", "测试源文件未链接"),
+                ("fake_v4l2_io.cpp", "可编程假 syscall 层未链接"),
+                ("core/vision/v4l2_camera.cpp", "被测的生产实现未链接")):
+            if not blocks['sources']:
+                fail("[v4l2] tests/CMakeLists.txt 里找不到 "
+                     "add_executable(t113_test_v4l2_camera ...) 目标块，"
+                     "或它已被删除。V4L2Camera 的失败路径就没人测了。")
+                break
+            if needle not in blocks['sources']:
+                fail("[v4l2] t113_test_v4l2_camera 的源文件列表里缺少 "
+                     + needle + "（" + why + "）。注意本文件的**注释**里也"
+                     "提到这些文件名，因此只在整文件里查子串会漏掉这个缺失。")
+
+        if not blocks['opts']:
+            fail("[v4l2] t113_test_v4l2_camera 没有 target_link_options，"
+                 "即 --wrap 未启用 —— 假 syscall 层根本不会被调用，"
+                 "测试会『通过』但什么都没测到。")
+        else:
+            for needle in ("--wrap=open", "--wrap=close", "--wrap=ioctl",
+                           "--wrap=mmap", "--wrap=munmap"):
+                if needle not in blocks['opts']:
+                    fail("[v4l2] target_link_options 里缺少 " + needle
+                         + "。--wrap 不完整时对应系统调用会走真实实现"
+                         "（MinGW 上根本不存在），测试会『通过』但什么都没测到。")
+
+    t = read(tf)
+    # 词元边界而非子串（第 51 条）。
+    for sym, why in (
+            ("qbufFailureMustStillUnmap(",
+             "QBUF 失败后必须 munmap —— 这是第 30 轮修掉的真实泄漏"),
+            ("streamOnFailureMustStillUnmap(",
+             "STREAMON 失败后必须 munmap —— 同一处泄漏的另一条路径"),
+            ("undecodableFrameStillRequeuesBuffer(",
+             "解码失败也必须 QBUF 归还缓冲区：req.count = 1 时不归还，"
+             "下一次 DQBUF 永远失败，画面链路彻底停摆且无任何报错"),
+            ("failedOpenLeavesNoResidueForRetry(",
+             "失败后重试不得留下残留（重试会覆盖 v4l2_buffer，旧映射即永久丢失）")):
+        if sym not in t:
+            fail("[v4l2] 测试里缺少断言 " + sym + "（" + why + "）。")
+
+    if not os.path.exists(fx):
+        fail("[v4l2] 缺少 tools/verify_v4l2_test.py —— 没有故障注入就无法证明"
+             "这些断言**真的会失败**。不失败的回归测试没有价值。")
+
+    # 修复不得回退：两处失败分支的 munmap 必须还在。
+    s = read(impl)
+    n_unmap = s.count("munmap(v4l2_buffer, v4l2_buffer_length);")
+    if n_unmap < 3:
+        fail("[v4l2] v4l2_camera.cpp 里 munmap(v4l2_buffer, ...) 只剩 %d 处，"
+             "期望 3 处（close() + QBUF 失败分支 + STREAMON 失败分支）。"
+             "mmap 成功之后的失败分支若只 close() 不 munmap，映射会**永久"
+             "泄漏**（实测重试成功后 close() 仍留 1048576 字节）。"
+             % n_unmap)
+
+
+def check_fault_harnesses_classify_crashes_correctly(root, src_root):
+    r"""
+    故障注入夹具判断"崩溃"的方式必须是**实测**过的判据，不能靠猜。
+
+    背景（第 30 轮实测）
+    -------------------
+    此前多个夹具写成 `crashed = returncode not in (0, 1)`，并据此在注释里
+    声称"多数变异是被进程崩溃抓到的，那些变异真的造成了 double-free /
+    use-after-free"。第 30 轮实测推翻了这个说法：
+
+        "析构不释放（RAII 完全失效）" -> rc=18，**18 条 FAIL 行**
+        "请求输出失败时不释放线"       -> rc=1， 1 条 FAIL 行
+        "close() 不 munmap（只关 fd）" -> rc=22，**22 条 FAIL 行**
+
+    **QtTest 的退出码等于 FAIL 行数**，不是崩溃信号。于是
+    `returncode not in (0,1)` 把"多个用例干净失败"误标成了"崩溃"。
+
+    更危险的是它还有一个**假绿**方向：真正的崩溃若恰好 rc=1
+    （例如某些运行时错误的 1 号退出），会被判成"未抓到（假绿）"，
+    让一个有效的回归测试被误删。
+
+    正确判据：**真正的崩溃 = 非零退出码但一条 FAIL 行都没有**
+    （如 0xC0000005 访问违例）。此时退出码与 FAIL 计数的一致性
+    还可以作为交叉校验。
+
+    本规则钉住：tools/verify_*.py 里不得再出现猜测式的崩溃判据，
+    且凡是用到 `crashed` 的夹具都必须采用实测判据。
+
+    **只看可执行代码**：注释与 docstring 里出现该字符串是**允许且应当**的
+    （本规则自己就写在 verify.py 的 docstring 里，三个夹具也都在注释里解释
+    为什么弃用它）。第一版规则没做这个区分，把三个夹具连同自己一起报了
+    出来 —— 正是第 51 条"规则匹配别用子串"的翻版，也是第 43 条
+    "守卫条件不能引用被守卫内容里会出现的字符串"。
+    """
+    tools_dir = os.path.join(root, "tools")
+    if not os.path.isdir(tools_dir):
+        return
+
+    def code_only(path):
+        """只保留**可执行代码**：注释与字符串字面量一律挖空。
+
+        为什么必须连字符串字面量一起挖掉：本规则的模式（"returncode not
+        in (0,1)"）会**作为字符串字面量**出现在故障注入夹具里 —— 夹具正是
+        靠把它replace进去来制造变异的。只挖注释会把这些夹具本身误报出来
+        （第二版规则就报了 verify_v4l2_rule.py）。
+
+        用 tokenize 而不是正则去注释：正则分不清 `#` 是注释还是字符串里的
+        井号，也处理不了三引号 docstring。
+        """
+        text = read(path)
+        lines = text.split("\n")
+        blanks = []          # (行号, 该行要保留的代码前缀)
+        try:
+            toks = list(tokenize.generate_tokens(io.StringIO(text).readline))
+        except (tokenize.TokenError, IndentationError, SyntaxError):
+            return text      # 词法分析失败就退回全文（保守）
+        drop = set()
+        for tok in toks:
+            if tok.type in (tokenize.COMMENT, tokenize.STRING):
+                for ln in range(tok.start[0], tok.end[0] + 1):
+                    drop.add(ln)
+        del blanks
+        out = []
+        for i, line in enumerate(lines, 1):
+            out.append("" if i in drop else line)
+        return "\n".join(out)
+
+    bad = []
+    for name in sorted(os.listdir(tools_dir)):
+        if not (name.startswith("verify_") and name.endswith(".py")):
+            continue
+        p = os.path.join(tools_dir, name)
+        # **不吞异常**：这里原本写的是 `except Exception: continue`，
+        # 结果 `ast` 未 import 引发的 NameError 被静默吃掉，整个规则成了
+        # 空操作 —— 故障注入实测（变异 "returncode not in (0,1)" 未被抓到）
+        # 才暴露出来。宁可让规则响亮地失败，也不要它悄悄通过。
+        text = code_only(p)
+        if re.search(r"returncode\s+not\s+in\s*\(\s*0\s*,\s*1\s*\)", text):
+            bad.append(name)
+            continue
+        # 用了 crash 判据的夹具必须用实测形式。
+        if re.search(r"^\s*crashed\s*=", text, re.M) and \
+                "and not failed" not in text:
+            bad.append(name)
+
+    if bad:
+        fail("[harness-crash] 下列故障注入夹具用了**未经验证**的崩溃判据"
+             "（returncode not in (0,1) 之类）：" + "、".join(bad)
+             + "。实测 QtTest 的退出码**等于 FAIL 行数**"
+             "（析构不释放 -> rc=18 且 18 条 FAIL 行），因此那种判据会把"
+             "『多个用例干净失败』误标成『崩溃』；更糟的是真正的崩溃若恰好 "
+             "rc=1 会被判成『未抓到（假绿）』。正确判据是："
+             "crashed = returncode != 0 and not failed。")
+
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -3295,6 +3532,8 @@ def main():
     check_password_log_regression_is_enforced(root, src_root)
     check_gpio_failure_paths_are_testable(root, src_root)
     check_face_gate_hazard_is_documented(root, src_root)
+    check_v4l2_camera_failure_paths_are_testable(root, src_root)
+    check_fault_harnesses_classify_crashes_correctly(root, src_root)
     check_fake_fingerprint_builds_same_bytes(root, src_root)
     check_fingerprint_checksum_logic_is_not_duplicated(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)

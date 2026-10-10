@@ -166,6 +166,14 @@ bool V4L2Camera::open() {
     if (ioctl(v4l2_fd, VIDIOC_QBUF, &buf) < 0) {
         // 逐行注释：输出调试日志。
         qDebug() << "[V4L2Camera] 入队失败";
+        // 逐行注释：mmap 已经成功，失败退出前必须先解除映射。close() 不会
+        // 自动解除映射，而重试 open() 会用新映射覆盖 v4l2_buffer，旧映射
+        // 将永久无法回收。
+        munmap(v4l2_buffer, v4l2_buffer_length);
+        // 逐行注释：执行本行语句完成对应变量、对象或业务状态处理。
+        v4l2_buffer = nullptr;
+        // 逐行注释：执行本行语句完成对应变量、对象或业务状态处理。
+        v4l2_buffer_length = 0;
         // 逐行注释：关闭文件描述符或 socket。
         ::close(v4l2_fd);
         // 逐行注释：执行本行语句完成对应变量、对象或业务状态处理。
@@ -180,6 +188,12 @@ bool V4L2Camera::open() {
     if (ioctl(v4l2_fd, VIDIOC_STREAMON, &type) < 0) {
         // 逐行注释：输出调试日志。
         qDebug() << "[V4L2Camera] 启动采集失败";
+        // 逐行注释：mmap 已经成功，失败退出前必须先解除映射（理由同入队失败）。
+        munmap(v4l2_buffer, v4l2_buffer_length);
+        // 逐行注释：执行本行语句完成对应变量、对象或业务状态处理。
+        v4l2_buffer = nullptr;
+        // 逐行注释：执行本行语句完成对应变量、对象或业务状态处理。
+        v4l2_buffer_length = 0;
         // 逐行注释：关闭文件描述符或 socket。
         ::close(v4l2_fd);
         // 逐行注释：执行本行语句完成对应变量、对象或业务状态处理。

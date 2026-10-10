@@ -501,3 +501,58 @@ else()
     message(STATUS "未找到 OpenCV face 模块，跳过 t113_test_face_manager"
                    "（人脸门禁测试需要真实 LBPH）")
 endif()
+
+# ---------------------------------------------------------------------------
+# V4L2Camera：门口机的画面来源（第 30 轮补）
+#
+# V4L2Camera 是整个视频链路的源头：UDP 23456 通话视频、UDP 50000 远程监看、
+# 人脸检测、人脸门禁全都取自它的 getFrame()。它此前从未被链接进任何测试目标，
+# 而它的危险分支全在**系统调用失败**上（设备不存在/权限不足/S_FMT/REQBUFS/
+# QUERYBUF/mmap/QBUF/STREAMON/DQBUF/JPEG 解码失败）。
+#
+# 现有 tools/devstubs/stub_impl.c 是**固定**桩（ioctl 恒 -1、mmap 恒
+# MAP_FAILED），只能做链接检查 —— 走不到任何成功路径，也无法按需让某一环失败。
+# 因此本目标链接**可编程假 syscall 层** tests/fake_v4l2_io.cpp，并用
+# **-Wl,--wrap** 把它接到 ::open/::close/ioctl/mmap/munmap 上。
+#
+# 为什么必须用 --wrap 而不是直接定义同名符号：
+#   - open/close 在 MinGW 的 CRT 里已存在，直接定义会冲突；
+#   - ioctl/mmap/munmap 在 MinGW 上根本不存在。
+# 两个坑（探针实测，第一版就踩了）：
+#   1. --wrap 生成的是 **C 符号**引用（__wrap_open）。定义必须 extern "C"，
+#      否则被名字修饰掉，链接期报 undefined reference to '__wrap_open'。
+#   2. 夹具**只劫持 /dev/video\***，其余委托 __real_open —— 否则整个进程的
+#      文件 I/O 都被接管，测试会因无关原因失败。
+#
+# 链接真实的 v4l2_camera.cpp（不用替身），UI 定时器由测试直接调
+# captureLoop() 驱动。
+# ---------------------------------------------------------------------------
+add_executable(t113_test_v4l2_camera
+    test_v4l2_camera.cpp
+    fake_v4l2_io.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/core/vision/v4l2_camera.cpp
+)
+
+target_include_directories(t113_test_v4l2_camera PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_LIST_DIR}                     # fake_v4l2_io.h
+    ${CMAKE_CURRENT_LIST_DIR}/../tools/devstubs   # <linux/videodev2.h> 等
+)
+
+target_link_libraries(t113_test_v4l2_camera PRIVATE
+    Qt5::Core
+    Qt5::Test
+    Qt5::Gui          # QImage
+)
+
+# --wrap 只在链接本目标的这些对象时生效；Qt 自身的 open() 在 DLL 内部已绑定，
+# 不受影响。__real_open/__real_close 由链接器自动提供。
+target_link_options(t113_test_v4l2_camera PRIVATE
+    -Wl,--wrap=open
+    -Wl,--wrap=close
+    -Wl,--wrap=ioctl
+    -Wl,--wrap=mmap
+    -Wl,--wrap=munmap
+)
+
+add_test(NAME t113_v4l2_camera COMMAND t113_test_v4l2_camera)

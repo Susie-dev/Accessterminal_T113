@@ -187,14 +187,20 @@ def main():
             rr = subprocess.run([EXE], capture_output=True, env=ENV, cwd=T)
             out = (rr.stdout + rr.stderr).decode('utf-8', 'replace')
             failed = re.findall(r'^FAIL!\s*:\s*\w+::(\w+)\(\)', out, re.M)
-            crashed = rr.returncode not in (0, 1)
+
+            # 第 52 条：QtTest 的退出码 == FAIL 行数（**实测**，不是推测）。
+            # 所以 "returncode not in (0,1)" **不能**用来判断崩溃 ——
+            # 它会把"多个用例干净失败"误标成"崩溃"。真正的崩溃是
+            # **非零退出码但一条 FAIL 行都没有**（如 0xC0000005）。
+            crashed = rr.returncode != 0 and not failed
 
             if t1 <= t0:
                 print('  [夹具错误] %-40s 可执行未重链' % name)
                 problems.append(name)
             elif expect_fail:
                 if failed or crashed:
-                    tag = ('崩溃(%d)' % rr.returncode) if crashed else str(failed[:2])
+                    tag = ('崩溃(rc=%d, 无 FAIL 行)' % rr.returncode
+                           if crashed else '%d 条 FAIL 行' % len(failed))
                     print('  %-40s 被抓到 ✓ %s' % (name, tag))
                 else:
                     print('  %-40s *** 未被抓到（假绿）rc=%d'

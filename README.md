@@ -94,14 +94,19 @@ cmake --build /tmp/t113-tests
 ctest --test-dir /tmp/t113-tests --output-on-failure
 ```
 
-当前 11 个目标：`t113_protocol`（协议编解码）、`t113_fingerprint_parser`
+当前 15 个目标：`t113_protocol`（协议编解码）、`t113_fingerprint_parser`
 （指纹帧解析）、`t113_app_config`（配置读取与夹取）、`t113_audio_manager`
 （提示音播放，用假 ALSA 注入设备错误）、`t113_audio_sender`（UDP 12345
 上行音频）、`t113_audio_receiver`（UDP 12345 下行播放）、`t113_video_push`
 （UDP 23456 视频推流）、`t113_camera_preview`（UDP 50000 远程监看）、
 `t113_fingerprint_manager`（指纹串口互斥调度，用**链接期替身**）、
 `t113_signaling_client`（TCP 8887 发送失败与断线重连）、
-`t113_fingerprint_wire`（指纹报文构造，链接**真实**实现）。
+`t113_fingerprint_wire`（指纹报文构造，链接**真实**实现）、
+`t113_password_manager`（门禁密码校验不得进日志）、
+`t113_gpio`（物理门锁/补光那条线，用可编程假 libgpiod）、
+`t113_face_manager`（人脸门禁，链接真实 LBPH；**缺 OpenCV face 模块时
+自动跳过**）、`t113_v4l2_camera`（画面源头，用可编程假 syscall 层 +
+`-Wl,--wrap`）。
 
 注意最后两个目标的取向**相反**，这是刻意的：
 `t113_fingerprint_manager` 用替身替换 `fingerprint_hailin.cpp`，
@@ -210,7 +215,8 @@ timeout 不会再调用 lambda。**那句注释描述的 use-after-free 在当�
 补上 gcov 度量后，第一个数字是 **94.4%** —— 看着很好。实际是 **25.0%**。
 
 原因在于**分母**：那个 94.4% 只统计了**被链接进测试目标的 17 个文件**。
-另有 **19 个产线源文件（约 1972 行）从未被任何测试目标链接**，压根不出现在
+另有 **18 个产线源文件**从未被任何测试目标链接（第 30 轮把
+`v4l2_camera.cpp` 接了进来），压根不出现在
 gcov 数据里：
 
 | 从未被任何测试链接的产线文件 | 近似可执行行 |
@@ -218,7 +224,6 @@ gcov 数据里：
 | `src/ui/widget.cpp` | 678 |
 | `src/hal/fingerprint_hailin.cpp` | 332 |
 | `src/ui/form_finger.cpp` | 162 |
-| `src/core/vision/v4l2_camera.cpp` | 131 |
 | `src/hal/gpio.cpp` | 105 |
 | `src/managers/face_manager.cpp` | 52 |
 | `src/ui/form_call.cpp` | 46 |
@@ -231,8 +236,8 @@ gcov 数据里：
 `tools/run_coverage.sh` 一键产出：
 
 ```
-已测文件 969 行（覆盖 714）+ 未测文件约 1640 行 = 分母 2609
-近似总覆盖率 = 27.4%   （上表那个 73.7% 仅描述已测文件）
+已测文件 1069 行（覆盖 823）+ 未测文件约 1274 行 = 分母 2343
+近似总覆盖率 = 35.1%   （上表那个 77.0% 仅描述已测文件）
 ```
 
 （第 25 轮新增 `t113_test_fingerprint_wire` 后，把 332 行的
@@ -241,25 +246,39 @@ gcov 数据里：
 只覆盖了纯逻辑部分，硬件路径仍为空。分母从 2679 降到 2609，真实总覆盖率
 从 25.0% 升到 **27.4%**。
 
+第 30 轮把 `v4l2_camera.cpp`（63 行）接进 `t113_test_v4l2_camera` 后：
+分子 714 -> 823，已测文件百分比 73.7% -> 77.0%，分母 2609 -> 2343，
+真实总覆盖率 **27.4% -> 35.1%**。
+
 这正是"分母必须一起报"的价值：只报已测文件百分比的话，**做对了事数字反而
 变难看**，会诱导人不去补齐未测文件。）
 
 #### 已测文件的明细与未覆盖行
 
-被测到的文件覆盖度其实相当高（707 行中 671 行，94.9%）：
+被测到的文件覆盖度相当高（1069 行中 823 行，77.0%）：
 
 | 文件 | 可执行行 | 覆盖 | 覆盖率 |
 | --- | --- | --- | --- |
-| `src/config/app_config.cpp` | 89 | 89 | 100% |
-| `src/core/media/audio_sender_thread.cpp` | 51 | 51 | 100% |
-| `src/managers/audio_manager.cpp` | 69 | 68 | 98.6% |
-| `src/core/net/protocol.h` | 58 | 56 | 96.6% |
-| `src/hal/fingerprint_frame_parser.h` | 50 | 48 | 96.0% |
-| `src/core/media/audio_receiver_thread.cpp` | 93 | 89 | 95.7% |
-| `src/core/media/video_push_thread.cpp` | 31 | 29 | 93.5% |
-| `src/core/media/camera_preview_server.cpp` | 52 | 45 | 86.5% |
-| `src/core/net/signaling_client.cpp` | 61 | 45 | 73.8% |
-| `src/managers/fingerprint_manager.cpp` | 128 | 110 | 85.9% |
+| `src/config/app_config.cpp` | 88 | 88 | 100% |
+| `src/config/app_config.h` | 18 | 18 | 100% |
+| `src/core/media/audio_sender_thread.cpp` | 46 | 46 | 100% |
+| `src/core/net/signaling_client.cpp` | 58 | 58 | 100% |
+| `src/managers/face_manager.cpp` | 28 | 28 | 100% |
+| `src/managers/password_manager.cpp` | 10 | 10 | 100% |
+| `src/core/vision/v4l2_camera.cpp` | 63 | 62 | 98.4% |
+| `src/managers/audio_manager.cpp` | 64 | 63 | 98.4% |
+| `src/core/media/audio_receiver_thread.cpp` | 84 | 81 | 96.4% |
+| `src/core/net/protocol.h` | 54 | 52 | 96.3% |
+| `src/hal/fingerprint_frame_parser.h` | 41 | 39 | 95.1% |
+| `src/core/media/video_push_thread.cpp` | 30 | 28 | 93.3% |
+| `src/managers/fingerprint_manager.cpp` | 125 | 114 | 91.2% |
+| `src/hal/gpio.cpp` | 44 | 39 | 88.6% |
+| `src/core/media/camera_preview_server.cpp` | 50 | 44 | 88.0% |
+| `src/hal/fingerprint_hailin.cpp` | 256 | 43 | 16.8% |
+
+> `fingerprint_hailin.cpp` 的 16.8% 是**可解释的**：285 行里有 204 行位于
+> `autoIdentify`/`autoEnroll`/`cancel`/`stepRegister`/`stepIdentify` 这些
+> **零调用者**的方法内（baseline 同样如此，属继承死代码），不是"该测没测"。
 
 `coverage_report.py --json` 会给出每个文件的**未覆盖行号**，直接指出测试没碰到
 的分支 —— 这比百分比可行动得多。"94%"不指向任何缺口，"第 87-88、91-92、
@@ -517,6 +536,70 @@ UTF8   设定 == 取回 ? false     （13 码元 -> 16 码元）
 另外，前缀断言改成**逐一覆盖每个前缀**（`for n in 1..len`），而不是只查一个
 固定长度：只查 `left(4)` 会漏掉 `left(2)`、`mid(0,n)`、`.at(0)` 等其它脱敏
 写法，而前缀脱敏对短密码等于全泄。
+
+### V4L2Camera：画面源头，以及一条**修掉的真泄漏**
+
+`V4L2Camera` 是整个视频链路的源头 —— UDP 23456 通话视频、UDP 50000 远程监看、
+人脸检测、人脸门禁**全都取自它的 `getFrame()`**。它此前从未被链接进任何测试
+目标，而它的危险分支**全在系统调用失败上**（设备不存在、权限不足、`S_FMT`、
+`REQBUFS`、`QUERYBUF`、`mmap`、`QBUF`、`STREAMON`、`DQBUF`、JPEG 解不出来）。
+这些在现场（工业门口机）都是常态。
+
+现有 `tools/devstubs/stub_impl.c` 是**固定**桩（`ioctl` 恒 `-1`、`mmap` 恒
+`MAP_FAILED`），只能做链接检查 —— 走不到任何成功路径，也无法按需让某一环
+失败。所以第 30 轮写了**可编程假 syscall 层**（`tests/fake_v4l2_io.{h,cpp}`）
+并用 **`-Wl,--wrap`** 接上去（29 个用例，链接真实的 `v4l2_camera.cpp`）。
+
+#### `--wrap` 的两个坑（都是探针实测出来的）
+
+`open`/`close` 在 MinGW 的 CRT 里已存在（直接定义同名符号会冲突），
+`ioctl`/`mmap`/`munmap` 则根本不存在，因此必须用链接期 `--wrap`：
+
+1. **`--wrap` 生成的是 C 符号引用**（`__wrap_open`）。定义若写成普通 C++
+   函数就会被名字修饰掉，链接期报 `undefined reference to '__wrap_open'`。
+   → 所有 `__wrap_*` 必须 `extern "C"`。
+2. **必须只劫持目标路径**（`/dev/video*`），其余一律委托 `__real_open`。
+   否则整个进程的文件 I/O（Qt 的字体、图标、qrc）都被接管，测试会因无关
+   原因失败。
+
+#### 量出来的真实缺陷：`mmap` 成功后的失败分支**泄漏映射**
+
+`open()` 在 `mmap` **成功之后**，`VIDIOC_QBUF` 与 `VIDIOC_STREAMON` 的失败
+分支只 `::close(v4l2_fd)` 而**不 `munmap`**。而 `close()` **不会**自动解除
+映射；重试 `open()` 又会用新映射覆盖 `v4l2_buffer` —— 旧映射的指针就此丢失，
+**永久无法回收**。临时探针量到的数值：
+
+| 场景 | 修复前 `close()` 后仍映射 | 修复后 |
+| --- | --- | --- |
+| 单次失败后对象析构 | 0（析构回收了，属延迟释放） | 0 |
+| 失败一次 → 重试成功 → `close()` | **1048576 字节** | 0 |
+| 连续 3 次失败 → `close()` | **2097152 字节** | 0 |
+| `STREAMON` 失败 → 重试成功 → `close()` | **1048576 字节** | 0 |
+
+> 单次失败时析构能回收，所以**光测"一次失败"是抓不到的** —— 必须测
+> "失败之后重试"这条序列，这正是现场的真实情况（启动时设备未就绪，稍后重试）。
+
+**这是继承缺陷，不是重构引入的回归**：比对脚本确认 baseline 与重构的
+`open()` 失败分支**逐字节等价**（两者 `munmap` 计数都是 1、`STREAMOFF`
+都是 0）。修法是在两条失败分支里先把映射解除掉再 `close()`，
+`munmap` 计数因此从 1 变成 3。
+
+**行为兼容性**：该修复不改变任何线上字节、不改 UI、不改线程生命周期 ——
+只在"打开失败"这条**本来就没有画面**的路径上多释放一块内存。
+
+#### 另一条更隐蔽的：解码失败也必须**归还驱动缓冲区**
+
+`req.count = 1`（只有一个缓冲）。`DQBUF` 把缓冲从驱动取走，必须用 `QBUF`
+还回去；若解码失败就提前 `return` 而不归还，**下一次 `DQBUF` 会永远失败，
+整条画面链路彻底停摆**，现场表现是"画面刚出来一下就再也不动了"，且**没有任何
+报错**。测试用一条独立用例把"解码失败仍须 `QBUF`"钉住。
+
+#### 故意**不**测的一条
+
+我原本想写"`getFrame()` 返回内部引用（去掉 `.copy()`）"的变异，但
+**`QImage` 是写时复制（COW）的** —— 返回内部引用与返回副本在可观测行为上
+完全一致，任何断言都抓不到它。按第 50 条（"没有判别力的断言要当作没有断言"），
+这条**没有**写成用例，限制记在这里。
 
 ### 人脸门禁：决定门开不开的那个比较，终于被测到了
 
@@ -913,7 +996,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下五十一条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下五十四条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -2219,6 +2302,64 @@ LBPH `predict()` 抛 `cv::Exception`"与"单 label 时 `predictedLabel == 1`
 
 同时删掉了我自己写的一条**不成立的用例**（"去掉隐患的说明文字"）：
 注释文字并非必要条件，规则用符号名做锚点是对的 —— 是那条用例过强。
+
+### 52. QtTest 的退出码**等于 FAIL 行数**，不是崩溃信号
+
+第 30 轮实测（此前一直是**猜**的）：
+
+| 变异 | 退出码 | FAIL 行数 |
+|---|---|---|
+| 请求输出失败时不释放线 | 1 | 1 |
+| 析构不释放（RAII 完全失效） | 18 | **18** |
+| `close()` 不 munmap（只关 fd） | 22 | **22** |
+
+由此发现两件事：
+
+1. 我此前在 `verify_gpio_test.py` 的文档里写的"多数变异是被进程崩溃抓到的，
+   那些变异真的造成了 double-free / use-after-free"是**错的** —— 那些其实是
+   **干净的多用例失败**。判据 `returncode not in (0, 1)` 把"多失败"当成了
+   "崩溃"。
+2. 更危险的是它还有**假绿**方向：真正的崩溃若恰好 `rc=1`，会被判成
+   "未抓到（假绿）"，从而把一个**有效的回归测试**误删。这是最坏的一类错误 ——
+   它删掉的正是保护你的东西。
+
+正确判据：**真正的崩溃 = 非零退出码但一条 FAIL 行都没有**（如访问违例
+`0xC0000005`）。退出码与 FAIL 计数是否一致还可以作为交叉校验。
+
+新增规则 `check_fault_harnesses_classify_crashes_correctly` 钉住这一点。它
+**只看可执行代码**：该模式会作为**字符串字面量**出现在故障注入夹具里（夹具
+正是靠 replace 它来制造变异），只挖注释会把夹具本身误报出来。
+
+### 53. 规则里的 `except Exception: continue` 会把规则变成**空操作**
+
+第 30 轮写新规则时漏了 `import ast`，而循环体是：
+
+```python
+try:
+    text = code_only(p)
+except Exception:
+    continue          # <-- NameError（ast 未导入）被静默吃掉
+```
+
+于是**每个文件都被跳过**，规则恒真。故障注入的"变异未被抓到"是唯一线索 ——
+在它暴露之前，规则的输出与"全部合规"完全一样。
+
+教训：自检脚本里**不要吞异常**。宁可让规则响亮地失败，也不要它悄悄通过。
+（把 `except Exception: continue` 删掉后，`NameError` 立刻现形。）
+
+### 54. 挖注释不够，还要挖**字符串字面量**
+
+判断"某段代码是否还在"时，正则去 `#` 注释是不够的：
+
+- CMakeLists 的**注释**里会反复提到源文件名（解释为什么用假替身），
+  于是"把 `add_executable` 里那一行删掉"这个变异**抓不到** ——
+  整文件子串仍然匹配注释里的名字。
+- Python 夹具的**字符串字面量**里会出现被禁止的模式（它正是用来制造变异的），
+  于是夹具自己被误报。
+
+修法：用 `tokenize` 挖掉注释**与字符串**，只在真正的可执行代码上匹配；
+CMake 则先把目标块切出来（`add_executable(...)` / `target_link_options(...)`
+的括号内容），在块内查名字，而不是整文件查子串。
 
 ## 开发约定
 
