@@ -135,3 +135,36 @@ target_link_libraries(t113_test_audio_manager PRIVATE
 )
 
 add_test(NAME t113_audio_manager COMMAND t113_test_audio_manager)
+
+# ---------------------------------------------------------------------------
+# AudioSenderThread：UDP 12345 上行音频
+#
+# 这条通路的**字节格式是协议硬约束**（裸 PCM、S16_LE/16000/单声道、
+# 每包 320 帧 640 字节、无包头），但此前从未被真正验证过：devstubs 的
+# sendto() 只"返回 len"、不记录载荷，其 inet_pton() 还永远返回 0，导致
+# run() 在建连阶段就 return，**根本走不到发送代码**。
+#
+# 本目标改用可记录的 fake_net.cpp（记录每次 sendto 的目标与载荷）与
+# 可注入采集错误的 fake_alsa.cpp，从而能对**线上字节**做断言。
+# 因此它不能链接 devstubs/stub_impl.c（两者都定义 sendto/inet_pton）。
+# ---------------------------------------------------------------------------
+add_executable(t113_test_audio_sender
+    test_audio_sender.cpp
+    fake_alsa.cpp
+    fake_net.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/core/media/audio_sender_thread.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/config/app_config.cpp
+)
+
+target_include_directories(t113_test_audio_sender PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_LIST_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/../tools/devstubs
+)
+
+target_link_libraries(t113_test_audio_sender PRIVATE
+    Qt5::Core
+    Qt5::Test
+)
+
+add_test(NAME t113_audio_sender COMMAND t113_test_audio_sender)

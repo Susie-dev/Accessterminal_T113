@@ -85,14 +85,20 @@ ctest --test-dir build --output-on-failure
 ### 单元测试（无 ALSA 的开发机也能跑）
 
 主工程的根 `CMakeLists.txt` 需要 ALSA，而 ALSA 在 Windows/macOS 上装不了，
-因此上面那条命令在开发机上通常走不通。单元测试只依赖 `Qt5::Core`/`Qt5::Test`
-（纯协议编解码与指纹帧解析逻辑，不碰硬件），可以**独立构建**：
+因此上面那条命令在开发机上通常走不通。单元测试只依赖 `Qt5::Core`/`Qt5::Test`，
+**独立构建**即可：
 
 ```sh
 cmake -S tests -B /tmp/t113-tests -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build /tmp/t113-tests
 ctest --test-dir /tmp/t113-tests --output-on-failure
 ```
+
+当前 5 个目标：`t113_protocol`（协议编解码）、`t113_fingerprint_parser`
+（指纹帧解析）、`t113_app_config`（配置读取与夹取）、`t113_audio_manager`
+（提示音播放，用假 ALSA 注入设备错误）、`t113_audio_sender`（UDP 12345
+上行音频，用假 ALSA + 假套接字对**线上字节**做断言）。后两者不碰真实硬件，
+硬件错误按需注入——详见下面两节。
 
 跨工程信令互通测试同理，见 `tests/interop/run_interop.sh`（同样不依赖 ALSA）。
 
@@ -288,7 +294,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下二十一条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下二十二条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -788,6 +794,57 @@ return QByteArray::fromHex(compact.toLatin1());
 自检见 `tools/verify_hex_parse.py`（5/5）。室内机侧另有可执行断言
 （`tests/test_app_config.cpp`）用真实 Qt 跑出上表结果，把该语义钉死。
 
+### 上行音频（AudioSenderThread）的线上字节断言
+
+`AudioSenderThread` 把门口机的麦克风音频写进 UDP 12345。这条通路的
+**字节格式是协议硬约束**：裸 PCM、S16_LE、16000 Hz、单声道、每包 320 帧
+（**640 字节**）、**无包头**。室内机按包直接喂给 ALSA，所以包长或字节序
+错一点，现场只表现为"声音不对/有杂音"，**不报任何错误**。
+
+它此前从未被真正验证过，原因很具体：`tools/devstubs` 里的 `sendto()` 只是
+"返回 len"的桩，**既不记录载荷也不校验格式**；更要命的是它的 `inet_pton()`
+**永远返回 0**，于是 `run()` 在建连阶段就 `return`，**根本走不到发送代码**。
+也就是说，这条通路在主机端测试里一直是"看起来测过、其实一步没跑"。
+
+`tests/test_audio_sender.cpp` 因此改用两份可记录/可注入的假替身：
+
+- `tests/fake_net.cpp` —— 记录每次 `sendto()` 的 fd、目标地址、目标端口与
+  **完整载荷**，使断言可以针对"线上到底是什么"；
+- `tests/fake_alsa.cpp` —— 已支持采集方向（`readi`）的 `-EPIPE` / `-EAGAIN` /
+  不可恢复错误注入。
+
+该目标**不能**同时链接 `devstubs/stub_impl.c`（两边都定义 `sendto`/`inet_pton`），
+故 `tests/CMakeLists.txt` 里是一套独立源文件列表。
+
+| 用例 | 钉住的行为 |
+| --- | --- |
+| `uplinkPacketsMatchProtocolExactly` | 每个数据报正好 640 字节裸 PCM，无包头 |
+| `packetSizeIsFrozenConstant` | 16000 / 单声道 / 320 帧 / 端口 12345 冻结；ALSA 侧同为 S16_LE |
+| `sendsToConfiguredAddressAndPort` | 发往参数指定的 IP 与端口，且用**外部传入**的 fd |
+| `noPacketHasAHeader` | 载荷首字节必须是 PCM 本身，不是长度/魔数前缀 |
+| `underrunRecoversWithoutLosingAudio` | 采集 XRUN 后 `prepare` 并继续，不丢后续音频 |
+| `eagainDoesNotAbortCapture` | `-EAGAIN` 只是"暂时没数据"，必须重试而非结束 |
+| `fatalReadErrorEmitsConnectionLost` | **不可恢复读错误必须发 `connectionLost`**（第 11 轮回归） |
+| `openFailureEmitsConnectionLost` | 打不开设备 -> 挂断，且一个包都不发 |
+| `badIpEmitsConnectionLost` | `inet_pton` 失败 -> 挂断 |
+| `sendFailureEmitsConnectionLost` | `sendto` 失败 -> 挂断（这条兜底路径曾经是**死的**） |
+| `finishedSignalAlwaysFires` | 正常与出错两条路径都必须发 `finishedMsg` |
+| `stopEndsThreadPromptly` | `stop()` 后能及时退出，不卡在采集循环 |
+
+对照实验（还原修复后测试必须失败）确认了区分度：
+
+| 还原的修复 | 结果 |
+| --- | --- |
+| 删掉全部 `emit connectionLost();`（4 处） | 4 个 `*EmitsConnectionLost` 用例**全部失败** |
+| 去掉 underrun 后的 `snd_pcm_prepare()` | `underrunRecoversWithoutLosingAudio` **失败** |
+| 还原原文件 | 全部通过 |
+
+> 关于时序：线程启动 + `snd_pcm_open` + EAGAIN 路径的休眠叠加起来有几十毫秒
+> 抖动。用固定 `qWait(80)` 会写出**偶发失败**的测试——这里踩过一次：首个包
+> 实测在约 80 ms 才发出，断言恰好落在边界上。因此所有"应该有包发出"的用例
+> 一律用 `waitForPackets()` 等**性质**成立，而不是等固定时长。连续运行 5 次
+> 均稳定（14 passed）。
+
 ### 提示音播放（AudioManager）的可编程测试
 
 `AudioManager` 是本工程出过**两个真实缺陷**的类（第 11 轮 XRUN 静默丢数据、
@@ -892,7 +949,32 @@ python3 tools/verify.py . ../Accessterminal_desktop
 
 新增类似"设备出错才走到"的代码时，请同样用失败注入把它跑起来；只做静态
 分析会重复第 11 轮的教训。
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述二十一条请以
+### 22. 影响线上字节格式的通路必须有针对"线上字节"的断言
+
+`AudioSenderThread` 的教训是：**"有测试"和"测到了"是两件事**。该目标此前
+配套的头文件桩让 `inet_pton()` 恒返回 0、`sendto()` 恒成功且不留痕迹，于是
+测试即便"绿"着，发送代码一行都没执行过。判断一条通路是否真的被测到，要看
+**断言是否落在它的输出上**（这里是 UDP 载荷的字节），而不是看它有没有被链接、
+有没有被调用、有没有跑过而不报错。
+
+同理，凡是决定"线上/设备上到底是什么字节"的参数（采样率、声道、每包帧数、
+端口、有无包头），都应当有一条**冻结常量断言**，这样将来有人"顺手"改成加个
+包头或改小每包帧数时会立刻失败，而不是等到现场听出杂音。
+
+自检由 `tools/verify.py` 的 `check_wire_format_constants_are_pinned` 强制：
+`protocol.h` 里决定线上字节格式的常量（采样率、声道、每样本字节数、每包帧数、
+四个端口）必须出现在 `tests/` 的源码中。故障注入见
+`tools/verify_wire_format.py`（**7/7**），覆盖"测试里完全没有断言""只在注释里
+提及""新增线上常量却无人断言"三种真阳性，以及"新增常量且已断言""清单里列了
+但 `protocol.h` 中并不存在"两种真阴性。
+
+> 该自检本身也踩过一次坑：第 4 个用例原本通过**修改临时仓库里的 verify.py**
+> 来注入探针常量，但 `load()` 导入的是**原始** `VERIFY` 路径，探针根本没进
+> 清单，于是这一条"真阳性"实际上什么都没验证却报了 PASS。改成直接 patch
+> **已加载的模块**后才真正生效。这正是必须做故障注入的理由——**自检脚本自己
+> 也会骗人**。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述二十二条请以
 `verify.py` 的结果为准。
 
 ---
@@ -921,7 +1003,7 @@ python3 tools/check_signatures.py .
 #     check_no_running_reset_in_run / check_no_secret_in_logs /
 #     check_declared_signal_is_emitted / check_connect_signal_is_signal /
 #     check_abandoned_async_tasks / check_subproject_cmake_is_selfcontained /
-#     check_hex_parse_is_validated / check_load_state_reset /
+#     check_hex_parse_is_validated / check_load_state_reset / check_wire_format_constants_are_pinned /
 #     check_narrowing_cast_of_config
 #     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
@@ -935,6 +1017,7 @@ python3 tools/verify_subcmake.py .
 python3 tools/verify_hex_parse.py .
 python3 tools/verify_config_state.py .
 python3 tools/verify_cross_target.py .
+python3 tools/verify_wire_format.py .
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
 #     含「原实现对照」与随机模糊测试；无需编译即可验证定帧逻辑）

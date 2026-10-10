@@ -32,6 +32,14 @@ int g_epipeFirst = 0;
 int g_writeDelayMs = 0;
 bool g_fatal = false;
 
+// 采集方向（readi）
+int g_readEpipeFirst = 0;
+int g_readEagainFirst = 0;
+int g_readFatalAfter = -1; // -1 = 永不致命
+int g_readCount = 0;
+int g_readFill = 0;
+int g_framesRead = 0;
+
 int g_openCount = 0;
 int g_closeCount = 0;
 int g_prepareCount = 0;
@@ -58,6 +66,12 @@ void reset()
     g_epipeFirst = 0;
     g_writeDelayMs = 0;
     g_fatal = false;
+    g_readEpipeFirst = 0;
+    g_readEagainFirst = 0;
+    g_readFatalAfter = -1;
+    g_readCount = 0;
+    g_readFill = 0;
+    g_framesRead = 0;
     g_openCount = g_closeCount = g_prepareCount = 0;
     g_drainCount = g_dropCount = g_writeiCount = g_framesWritten = 0;
     g_lastRate = g_lastChannels = g_lastFormat = 0;
@@ -68,6 +82,13 @@ void setOpenFail(bool fail) { QMutexLocker l(&g_mutex); g_openFail = fail; }
 void setEpipeFirst(int n) { QMutexLocker l(&g_mutex); g_epipeFirst = n; }
 void setWriteDelayMs(int ms) { QMutexLocker l(&g_mutex); g_writeDelayMs = ms; }
 void setFatalError(bool fatal) { QMutexLocker l(&g_mutex); g_fatal = fatal; }
+void setReadEpipeFirst(int n) { QMutexLocker l(&g_mutex); g_readEpipeFirst = n; }
+void setReadEagainFirst(int n) { QMutexLocker l(&g_mutex); g_readEagainFirst = n; }
+void setReadFatalAfter(int n) { QMutexLocker l(&g_mutex); g_readFatalAfter = n; }
+void setReadFill(int fill) { QMutexLocker l(&g_mutex); g_readFill = fill; }
+
+int readiCount() { QMutexLocker l(&g_mutex); return g_readCount; }
+int framesRead() { QMutexLocker l(&g_mutex); return g_framesRead; }
 
 int openCount() { QMutexLocker l(&g_mutex); return g_openCount; }
 int closeCount() { QMutexLocker l(&g_mutex); return g_closeCount; }
@@ -200,8 +221,30 @@ snd_pcm_sframes_t snd_pcm_readi(snd_pcm_t* pcm, void* buffer,
                                 snd_pcm_uframes_t size)
 {
     (void)pcm;
+    int fill = 0;
+    {
+        QMutexLocker l(&g_mutex);
+        ++g_readCount;
+        if (g_readEpipeFirst > 0) {
+            --g_readEpipeFirst;
+            return -32; // -EPIPE
+        }
+        if (g_readEagainFirst > 0) {
+            --g_readEagainFirst;
+            return -11; // -EAGAIN
+        }
+        if (g_readFatalAfter >= 0 && g_readCount > g_readFatalAfter) {
+            return -5; // -EIO
+        }
+        fill = g_readFill++;
+        g_framesRead += static_cast<int>(size);
+    }
     if (buffer) {
-        std::memset(buffer, 0, static_cast<size_t>(size) * 2);
+        // 用 fill 填充，便于校验"每个包被独立发送、内容未错位"。
+        unsigned char* p = static_cast<unsigned char*>(buffer);
+        for (snd_pcm_uframes_t i = 0; i < size * 2; ++i) {
+            p[i] = static_cast<unsigned char>(fill + (i % 7));
+        }
     }
     return static_cast<snd_pcm_sframes_t>(size);
 }

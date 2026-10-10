@@ -1990,6 +1990,66 @@ def check_narrowing_cast_of_config(root, src_root):
                  .format(rel, line, text[m.start():j + 1][:90]))
 
 
+# 决定"线上/设备上到底是什么字节"的协议常量。它们一旦被改动，现场症状是
+# 声音/画面不对而不是报错，因此必须有**可执行测试**把取值钉住。
+WIRE_FORMAT_CONSTANTS = (
+    "kAudioSampleRate",
+    "kAudioChannels",
+    "kAudioBytesPerSample",
+    "kAudioFramesPerPacket",
+    "kSignalingPort",
+    "kAudioPort",
+    "kVideoPort",
+    "kPreviewPort",
+)
+
+
+def check_wire_format_constants_are_pinned(root, src_root):
+    """
+    影响线上字节格式的协议常量必须在 tests/ 里被断言。
+
+    背景（真实的测试盲区，本轮补上）：
+    AudioSenderThread 决定 UDP 12345 的**字节格式**（裸 PCM、S16_LE、
+    16000 Hz、单声道、每包 320 帧 = 640 字节、**无包头**），室内机按包直接
+    喂给 ALSA，所以包长或字节序错一点，现场只表现为"声音不对/有杂音"，
+    **不报任何错误**。
+
+    它此前从未被真正验证过：tools/devstubs 的 sendto() 只"返回 len"、不留
+    痕迹，其 inet_pton() 还**永远返回 0**，导致 run() 在建连阶段就 return，
+    根本走不到发送代码——测试即使"绿"着，发送逻辑一行都没执行。
+
+    所以本检查要求：这些常量名必须出现在 tests/ 的源码里。它不能证明断言
+    写得好，但能保证"改了这些值而测试毫无反应"这种情况不会悄悄发生。
+    """
+    proto = os.path.join(src_root, "core", "net", "protocol.h")
+    if not os.path.isfile(proto):
+        FAIL.append(f"[wire-format] 找不到 {proto}")
+        return
+
+    text = strip_comments_and_strings(read(proto))
+    declared = set()
+    for m in re.finditer(r"constexpr\s+[\w:]+\s+(k\w+)\s*=", text):
+        declared.add(m.group(1))
+
+    tests_root = os.path.join(root, "tests")
+    if not os.path.isdir(tests_root):
+        FAIL.append("[wire-format] 找不到 tests 目录，无法验证协议常量是否被钉住")
+        return
+
+    test_text = []
+    for path in find_files(tests_root, (".cpp", ".h", ".hpp", ".c")):
+        test_text.append(strip_comments_and_strings(read(path)))
+    blob = "\n".join(test_text)
+
+    missing = [c for c in WIRE_FORMAT_CONSTANTS if c in declared and c not in blob]
+    if missing:
+        FAIL.append(
+            "[wire-format] 下列协议常量决定了线上字节格式，却没有任何测试断言它们："
+            + ", ".join(missing)
+            + " —— 改动它们不会让任何测试失败（详见 README 第 22 条）"
+        )
+
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -2081,6 +2141,7 @@ def main():
     check_hex_parse_is_validated(root, src_root)
     check_load_state_reset(root, src_root)
     check_narrowing_cast_of_config(root, src_root)
+    check_wire_format_constants_are_pinned(root, src_root)
     check_cross_repo_test_targets_are_unique(
         root, sys.argv[2] if len(sys.argv) > 2 else None)
     check_no_secret_in_logs(root, src_root)

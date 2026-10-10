@@ -33,6 +33,21 @@ void setWriteDelayMs(int ms);
 /// snd_pcm_writei 返回 -EIO 而不是成功（模拟不可恢复错误）。
 void setFatalError(bool fatal);
 
+// ---- 采集（readi）方向的控制，供 AudioSenderThread 测试使用 ----
+
+/// 让接下来 n 次 snd_pcm_readi 返回 -EPIPE（模拟采集 underrun/XRUN）。
+void setReadEpipeFirst(int n);
+
+/// 让接下来 n 次 snd_pcm_readi 返回 -EAGAIN（非阻塞设备暂无数据）。
+void setReadEagainFirst(int n);
+
+/// 前 n 次 readi 正常返回，之后返回 -EIO（模拟不可恢复的采集错误）。
+/// 传 -1 表示永不报错。
+void setReadFatalAfter(int n);
+
+/// 成功读到的数据填充值（每次 readi 递增 1，便于区分相邻包）。
+void setReadFill(int fill);
+
 int openCount();
 int closeCount();
 int prepareCount();
@@ -40,6 +55,8 @@ int drainCount();
 int dropCount();
 int writeiCount();      ///< writei 被调用次数（含失败）
 int framesWritten();    ///< 成功写入的总帧数
+int readiCount();       ///< readi 被调用次数（含失败）
+int framesRead();       ///< 成功读到的总帧数
 
 /// 最后一次协商到的硬件参数，用于校验音频格式与协议一致。
 int lastRate();
