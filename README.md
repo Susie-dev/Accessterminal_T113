@@ -294,7 +294,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下二十二条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下二十三条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -845,6 +845,70 @@ return QByteArray::fromHex(compact.toLatin1());
 > 一律用 `waitForPackets()` 等**性质**成立，而不是等固定时长。连续运行 5 次
 > 均稳定（14 passed）。
 
+### 下行音频（AudioReceiverThread）的播放行为断言
+
+接收线程决定 UDP 12345 下行的**播放行为**：裸 PCM、S16_LE / 16000 / 单声道、
+每包 320 帧 = 640 字节、**无包头**，且线程**只在 `accept` 之后才创建**。
+
+与发送线程同样的处境：它此前也**从未被真正执行过**。`tools/devstubs` 的
+`select()` 恒返回 0、`recvfrom()` 恒返回 -1，于是 `run()` 里两个循环体
+**一次都没跑过**。补上可执行测试后立刻暴露了两个真实缺陷（第 18 轮修复）：
+
+1. **`-EAGAIN` 被当成致命错误。** 设备以 `SND_PCM_NONBLOCK` 打开，所以
+   `snd_pcm_writei` 返回 `-EAGAIN`（播放缓冲满）是**必然可达**的正常情况。
+   原实现只特判 `-EPIPE`，其余负值一律 `emit errorMsg` 并结束线程——现场表现是
+   **通话中途突然单向无声**，而 `errorMsg` 只打日志，界面毫无察觉。
+2. **错误路径不再结束线程。** baseline 是 `break` 出 `while(running)`，
+   语义即"线程结束"；重构后的 `goto receive_done` 只退出**内层**循环，外层
+   立刻重新 `select`/`recvfrom`，把同一个持久性错误无限重复。
+
+`tests/test_audio_receiver.cpp` 用同一套假替身（`fake_alsa` 补齐 mixer 与
+写方向注入；`fake_net` 补齐 `recvfrom`/`select`/`fcntl` 与待收数据报注入）：
+
+| 用例 | 钉住的行为 |
+| --- | --- |
+| `playedPacketsMatchProtocolExactly` | 每包正好 640 字节，且内容逐字节不改动 |
+| `negotiatesProtocolPlaybackFormat` | 协商为 S16_LE / 16000 / 单声道 |
+| `playsOnlyAfterDataArrives` | 没数据时一个字节都不写 |
+| `zeroLengthDatagramIsIgnored` | 零长数据报被忽略，不产生空写 |
+| `startupDiscardsStaleBacklog` | **启动前堆积的包必须被丢弃**（见下方时序说明） |
+| `underrunRecoversAndKeepsPlaying` | XRUN 后 `prepare` 并继续播放 |
+| `eagainOnWriteIsNotFatal` | **`-EAGAIN` 必须继续播放**（第 18 轮回归） |
+| `fatalWriteErrorEmitsErrorAndStops` | 不可恢复写错误发 `errorMsg` **并结束线程** |
+| `recvErrorEmitsConnectionLost` | `recvfrom` 真错误发 `connectionLost` **并结束线程** |
+| `eagainOnRecvIsNotConnectionLost` | 收包 `-EAGAIN` 只是"暂时没数据"，不算断开 |
+| `eintrOnRecvRetries` | 收包 `-EINTR` 重试，不丢包 |
+| `openFailureEmitsErrorAndReturns` | 打不开设备 -> 报错返回 |
+| `stopEndsThreadPromptly` | `stop()` 后能及时退出 |
+| `volumeIsClampedAndApplied` | 音量按 [0,100] 夹取后写入 mixer |
+| `volumeMissingControlIsSafe` | mixer 里找不到 "Playback" 控件时安全返回 |
+| `volumeMixerOpenFailureIsSafe` | mixer 打不开时安全返回，不影响播放 |
+
+对照实验（还原修复后测试必须失败）确认了区分度：
+
+| 还原的修复 | 结果 |
+| --- | --- |
+| 去掉 `recvfrom` 错误处的 `running = false` | `recvErrorEmitsConnectionLost` **失败** |
+| 去掉 `writei` 错误处的 `running = false` | `fatalWriteErrorEmitsErrorAndStops` **失败** |
+| 去掉 `-EAGAIN` 分支（落进一般错误） | `eagainOnWriteIsNotFatal` **失败** |
+| 还原原文件 | 全部通过 |
+
+就"重复发 `connectionLost` 会反复挂断"这一点单独做了探针（600 ms 窗口）：
+
+| 状态 | `connectionLost` 次数 | 线程仍在运行 |
+| --- | --- | --- |
+| 修复在位 | **1** | 否 |
+| 还原修复 | **3410** | 是 |
+
+> 关于时序：`run()` 开头有一段**丢弃启动前堆积包**的循环。因此测试**不能**在
+> `start()` 之前投递数据——那些包会被丢弃阶段吃掉，症状是 `writeiCount` 恒为 0
+> （踩过一次）。所有用例统一走 `startFeedAndWait()`：`start()` -> `qWait(80)`
+> 越过丢弃阶段 -> 投递并等待性质成立。
+>
+> 另一个坑：QtTest 的 `QVERIFY` 失败会直接 `return`，若线程仍在运行，析构时
+> 会触发 `QThread: Destroyed while thread is still running` 并 abort，把真正的
+> 失败原因淹没。故用 RAII `ThreadGuard` 保证任何路径都 `stop()` + `wait()`。
+
 ### 提示音播放（AudioManager）的可编程测试
 
 `AudioManager` 是本工程出过**两个真实缺陷**的类（第 11 轮 XRUN 静默丢数据、
@@ -974,10 +1038,29 @@ python3 tools/verify.py . ../Accessterminal_desktop
 > **已加载的模块**后才真正生效。这正是必须做故障注入的理由——**自检脚本自己
 > 也会骗人**。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述二十二条请以
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述二十三条请以
 `verify.py` 的结果为准。
 
 ---
+
+### 23. 非阻塞打开的 PCM 句柄必须区分 `-EAGAIN` 与真错误
+
+`snd_pcm_open(..., SND_PCM_NONBLOCK)` 打开的句柄，在播放缓冲满（写方向）或
+采集缓冲空（读方向）时**必然**返回 `-EAGAIN`。这是**正常且可恢复**的状态，
+不是设备故障。
+
+把它当成一般错误处理的后果是**静默**的：`emit errorMsg` 只进日志，界面毫无
+反应，现场表现就是"通话中途突然单向无声"（下行）或"声音断断续续"（上行）。
+第 18 轮在 `AudioReceiverThread` 上就是这个问题：只特判了 `-EPIPE`，其余负值
+一律结束线程。
+
+正确做法：`-EAGAIN`/`-EWOULDBLOCK` 重试或丢弃本包后继续；`-EINTR` 有界重试；
+`-EPIPE` 用 `snd_pcm_prepare()` 恢复；**只有其它负值才是真错误**。
+
+`verify.py` 的 `check_nonblock_pcm_handles_eagain` 会挑出"以非阻塞方式打开，
+却在同一函数体内完全没有提及 `EAGAIN`/`EWOULDBLOCK`"的读写调用点。它按
+**函数体**判定（不是整个文件），自检见 `tools/verify_nonblock_pcm.py`（6/6）。
+桌面端当前没有 ALSA 代码，规则同为空转，但已同步过去以防将来加入播放逻辑。
 
 ## 开发约定
 
@@ -1004,7 +1087,7 @@ python3 tools/check_signatures.py .
 #     check_declared_signal_is_emitted / check_connect_signal_is_signal /
 #     check_abandoned_async_tasks / check_subproject_cmake_is_selfcontained /
 #     check_hex_parse_is_validated / check_load_state_reset / check_wire_format_constants_are_pinned /
-#     check_narrowing_cast_of_config
+#     check_nonblock_pcm_handles_eagain / check_narrowing_cast_of_config
 #     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
@@ -1018,6 +1101,7 @@ python3 tools/verify_hex_parse.py .
 python3 tools/verify_config_state.py .
 python3 tools/verify_cross_target.py .
 python3 tools/verify_wire_format.py .
+python3 tools/verify_nonblock_pcm.py .
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
 #     含「原实现对照」与随机模糊测试；无需编译即可验证定帧逻辑）

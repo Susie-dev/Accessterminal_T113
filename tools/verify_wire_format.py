@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""check_wire_format_constants_are_pinned 的故障注入自检。
+"""check_wire_format_constants_are_pinned 的故障注入自检（两仓库通用）。
 
 用法: verify_wire_format.py <verify.py> <本仓库根>
 
-验证的要点：规则必须能区分"真的断言了"与"只是名字出现过/只是改了清单"。
+自足设计：合成夹具在临时仓库里**新建**测试文件/协议常量，不依赖本仓库里
+恰好存在某个特定测试文件（原版硬编码 test_audio_sender.cpp，桌面端没有该文件，
+照搬过去会直接 FileNotFoundError）。
 """
 import importlib.util
 import os
@@ -24,20 +26,20 @@ def load():
     return m
 
 
-def run_case(name, expect_fail, build, patch_module=None):
-    """在临时仓库上施加 build(root) 变形，然后运行规则。
+def safe_copytree(src, dst):
+    def ig(_d, names):
+        return {n for n in names
+                if n in (".git", "build") or n.startswith("build-")}
+    shutil.copytree(src, dst, ignore=ig)
 
-    patch_module: 可选的 (module) -> None。用于直接修改**已加载的模块**
-    （例如往 WIRE_FORMAT_CONSTANTS 里加一条探针常量）。
-    注意不能靠改临时仓库里的 verify.py —— load() 导入的是原始 VERIFY 路径。
-    """
+
+def run_case(name, expect_fail, build, patch_module=None):
     global FAILED, TOTAL
     TOTAL += 1
     tmp = tempfile.mkdtemp(prefix="wire_")
     try:
         root = os.path.join(tmp, "repo")
-        shutil.copytree(REPO, root,
-                        ignore=shutil.ignore_patterns("build", "build-*", ".git"))
+        safe_copytree(REPO, root)
         build(root)
         m = load()
         if patch_module:
@@ -57,69 +59,106 @@ def run_case(name, expect_fail, build, patch_module=None):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-CONSTS = ("kAudioSampleRate", "kAudioChannels", "kAudioBytesPerSample",
-          "kAudioFramesPerPacket", "kSignalingPort", "kAudioPort",
-          "kVideoPort", "kPreviewPort")
+def consts_of(module):
+    return list(module.WIRE_FORMAT_CONSTANTS)
 
 
-def strip_all_from_tests(root):
+def strip_from_tests(root, consts):
     tests = os.path.join(root, "tests")
     for fn in os.listdir(tests):
-        if not fn.endswith((".cpp", ".h", ".hpp")):
+        if not fn.endswith((".cpp", ".h", ".hpp", ".c")):
             continue
         p = os.path.join(tests, fn)
-        s = open(p, encoding="utf-8").read()
-        for c in CONSTS:
+        with open(p, encoding="utf-8") as f:
+            s = f.read()
+        for c in consts:
             s = s.replace(c, "REMOVED_CONST")
-        open(p, "w", encoding="utf-8", newline="\n").write(s)
+        with open(p, "w", encoding="utf-8", newline="\n") as f:
+            f.write(s)
 
 
-def only_in_comments(root):
-    strip_all_from_tests(root)
-    p = os.path.join(root, "tests", "test_protocol.cpp")
-    s = open(p, encoding="utf-8").read()
-    s += "\n// 注释里提一下：" + " ".join(CONSTS) + "\n"
-    open(p, "w", encoding="utf-8", newline="\n").write(s)
+def add_probe_const(root, name):
+    """在 protocol.h 里新增一个线上常量（未在任何测试中断言）。
 
-
-def add_undeclared_assert(root):
-    """protocol.h 新增一个线上常量，测试不提及（探针由 patch_module 加进清单）。"""
+    注意插入点：不能用 `s.index("constexpr")` —— protocol.h 的文档注释里就
+    写着 "constexpr" 这个词，插进去会落在注释内，导致 `strip_comments_and_strings`
+    把它清掉、declared 集合里根本没有新常量，于是真阳性用例**静默漏报**
+    （夹具失效，不是规则失效）。必须锚定**行首**的真实声明。
+    """
     p = os.path.join(root, "src", "core", "net", "protocol.h")
-    s = open(p, encoding="utf-8").read()
-    i = s.find("kSignalTerminator")
-    s = s[:i] + "constexpr quint16 kPreviewFpsProbe = 20;\n" + s[i:]
-    open(p, "w", encoding="utf-8", newline="\n").write(s)
+    with open(p, encoding="utf-8") as f:
+        s = f.read()
+    lines = s.split("\n")
+    for idx, line in enumerate(lines):
+        if line.startswith("constexpr"):
+            lines.insert(idx, "constexpr quint16 %s = 20;" % name)
+            break
+    else:
+        raise AssertionError("protocol.h 里找不到行首 constexpr 声明")
+    with open(p, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines))
 
 
-def add_declared_assert(root):
-    p = os.path.join(root, "src", "core", "net", "protocol.h")
-    s = open(p, encoding="utf-8").read()
-    i = s.find("kSignalTerminator")
-    s = s[:i] + "constexpr quint16 kCoveredProbe = 42;\n" + s[i:]
-    open(p, "w", encoding="utf-8", newline="\n").write(s)
-    # 同时在测试里断言它
-    t = os.path.join(root, "tests", "test_audio_sender.cpp")
-    ts = open(t, encoding="utf-8").read()
-    ts += "\n// probe\nstatic const int kProbeCheck = protocol::kCoveredProbe;\n"
-    open(t, "w", encoding="utf-8", newline="\n").write(ts)
+def assert_probe_in_new_test(root, name):
+    """新增一个测试文件断言该常量。"""
+    tests = os.path.join(root, "tests")
+    p = os.path.join(tests, "zz_probe.cpp")
+    with open(p, "w", encoding="utf-8", newline="\n") as f:
+        f.write('#include "core/net/protocol.h"\n'
+                "static const int kProbe = protocol::%s;\n" % name)
 
 
 def add_to_list(module, name):
     module.WIRE_FORMAT_CONSTANTS = tuple(module.WIRE_FORMAT_CONSTANTS) + (name,)
 
 
+def make_strip_all(consts):
+    def f(root):
+        strip_from_tests(root, consts)
+    return f
+
+
+def strip_and_comment(root):
+    consts = consts_of(load())
+    strip_from_tests(root, consts)
+    p = os.path.join(root, "tests")
+    # 找一个已存在的测试文件追加注释（或新建）
+    target = None
+    for fn in sorted(os.listdir(p)):
+        if fn.endswith(".cpp"):
+            target = os.path.join(p, fn)
+            break
+    if target is None:
+        target = os.path.join(p, "zz_comment.cpp")
+    with open(target, "a", encoding="utf-8", newline="\n") as f:
+        f.write("\n// 注释里提一下：" + " ".join(consts) + "\n")
+
+
+PROBE_UNCOVERED = "kProbeUncovered"
+PROBE_COVERED = "kProbeCovered"
+
+
+def add_uncovered(root):
+    add_probe_const(root, PROBE_UNCOVERED)
+
+
+def add_covered(root):
+    add_probe_const(root, PROBE_COVERED)
+    assert_probe_in_new_test(root, PROBE_COVERED)
+
+
 print("== check_wire_format_constants_are_pinned 故障注入自检 ==")
 run_case("当前仓库(真阴性)", False, lambda r: None)
-run_case("测试里完全没有断言(真阳性)", True, strip_all_from_tests)
-run_case("只在注释里提及(真阳性)", True, only_in_comments)
-run_case("新增线上常量却无测试(真阳性)", True, add_undeclared_assert,
-         lambda m: add_to_list(m, "kPreviewFpsProbe"))
-run_case("新增常量且测试已断言(真阴性)", False, add_declared_assert,
-         lambda m: add_to_list(m, "kCoveredProbe"))
+run_case("测试里完全没有断言(真阳性)", True,
+         make_strip_all(consts_of(load())))
+run_case("只在注释里提及(真阳性)", True, strip_and_comment)
+run_case("新增线上常量却无测试(真阳性)", True, add_uncovered,
+         lambda m: add_to_list(m, PROBE_UNCOVERED))
+run_case("新增常量且测试已断言(真阴性)", False, add_covered,
+         lambda m: add_to_list(m, PROBE_COVERED))
 run_case("清单里的常量在 protocol.h 不存在(真阴性)",
          False, lambda r: None, lambda m: add_to_list(m, "kNotInProtocolAtAll"))
 
-# 真实仓库必须通过
 TOTAL += 1
 m = load()
 m.FAIL.clear()
@@ -128,6 +167,8 @@ ok = len(m.FAIL) == 0
 print("  [{}] 真实仓库实测  (fail={})".format("PASS" if ok else "FAIL", len(m.FAIL)))
 if not ok:
     FAILED += 1
+    for x in m.FAIL[:3]:
+        print("        -> " + x[:170])
 
 print("\n结果: {}/{} 通过".format(TOTAL - FAILED, TOTAL))
 sys.exit(1 if FAILED else 0)
