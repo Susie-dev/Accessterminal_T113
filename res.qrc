@@ -1,0 +1,30 @@
+<RCC>
+    <qresource prefix="/">
+        <file>pics/useradd02.png</file>
+        <file>pics/useradd01.png</file>
+        <file>pics/renlian02.png</file>
+        <file>pics/renlian01.png</file>
+        <file>pics/newzhiwen02.png</file>
+        <file>pics/newzhiwen01.png</file>
+        <file>pics/mybg002.png</file>
+        <file>pics/mima02.png</file>
+        <file>pics/mima01.png</file>
+        <file>pics/lockbg.jpg</file>
+        <file>pics/guanji02.png</file>
+        <file>pics/guanji01.png</file>
+        <file>pics/finger256.png</file>
+        <file>pics/face256.png</file>
+        <file>pics/dianhua02.png</file>
+        <file>pics/dianhua01.png</file>
+        <file>pics/bb.wav</file>
+        <file>pics/smartpg.png</file>
+        <file>pics/probg.png</file>
+        <file>pics/calloff.png</file>
+        <file>pics/add.png</file>
+        <file>pics/fingeradd.png</file>
+        <file>pics/faceadd.png</file>
+        <file>pics/quit.png</file>
+        <file>pics/deviceback.png</file>
+        <file>pics/newbg.png</file>
+    </qresource>
+</RCC>

@@ -1,0 +1,49 @@
+# ---- Qt Creator / IDE 私有文件（不应入库）----
+*.pro.user
+*.pro.user.*
+*.qmlc
+*.jsc
+*.autosave
+CMakeLists.txt.user*
+.vscode/
+.idea/
+*.swp
+
+# ---- 构建产物 ----
+build/
+build-*/
+cmake-build-*/
+Makefile
+Makefile.*
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+*.moc
+
+# ---- 可执行文件 ----
+Accessterminal_T113
+smartpro
+*.exe
+
+# ---- 大体积 / 第三方部署包 ----
+# 第三方依赖包体积大且可重新获取，不入库
+deploy/vendor/thd.tar
+deploy/vendor/*.zip
+# ONNX 模型当前未被代码使用（占位），单独按需引入
+deploy/vendor/*.onnx
+
+# ---- 日志与临时文件 ----
+*.log
+*.tmp
+*~
+
+# ---- 系统文件 ----
+Thumbs.db
+desktop.ini
+.DS_Store
