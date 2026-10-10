@@ -46,7 +46,7 @@ else()
                            "${CMAKE_CURRENT_LIST_DIR}/../src" ABSOLUTE)
 endif()
 
-find_package(Qt5 5.12 REQUIRED COMPONENTS Core Test Gui Network)
+find_package(Qt5 5.12 REQUIRED COMPONENTS Core Test Gui Network SerialPort)
 
 # ---------------------------------------------------------------------------
 # 协议契约测试
@@ -277,3 +277,40 @@ target_link_libraries(t113_test_camera_preview PRIVATE
 )
 
 add_test(NAME t113_camera_preview COMMAND t113_test_camera_preview)
+
+# ---------------------------------------------------------------------------
+# FingerprintManager：常驻识别与注册流程的**串口互斥**调度
+#
+# 门口机上只有一根指纹串口，两个使用者（常驻识别轮询、注册流程）都会
+# readPacket() 抢读同一串口的应答，互为对方之应答 —— setSuspended() 就是
+# 为此存在的互斥开关，此前**没有任何测试**。
+#
+# HailinFingerprint 的 buildPacket/sendPacket/readPacket 都不是 virtual，
+# 无法继承覆盖，故用**链接期替身** tests/fake_fingerprint_device.cpp，
+# 并**不链接** src/hal/fingerprint_hailin.cpp（否则成员重复定义）。
+# 替身里 buildPacket() 是真实算法的逐字节拷贝：报文字节唯一的契约不能换。
+#
+# 注意 AUTOMOC：本目标不含任何与 fingerprint_hailin.h 同名的源文件，若不明
+# 确把该头文件列进源文件列表，moc 不会生成，链接期报 undefined reference to
+# `HailinFingerprint::identifyResult(...)` 等信号。
+# ---------------------------------------------------------------------------
+add_executable(t113_test_fingerprint_manager
+    test_fingerprint_manager.cpp
+    fake_fingerprint_device.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/managers/fingerprint_manager.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/hal/fingerprint_hailin.h   # AUTOMOC，见上
+)
+
+target_include_directories(t113_test_fingerprint_manager PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_LIST_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/../tools/devstubs
+)
+
+target_link_libraries(t113_test_fingerprint_manager PRIVATE
+    Qt5::Core
+    Qt5::Test
+    Qt5::SerialPort
+)
+
+add_test(NAME t113_fingerprint_manager COMMAND t113_test_fingerprint_manager)

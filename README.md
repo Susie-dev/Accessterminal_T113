@@ -94,11 +94,12 @@ cmake --build /tmp/t113-tests
 ctest --test-dir /tmp/t113-tests --output-on-failure
 ```
 
-当前 8 个目标：`t113_protocol`（协议编解码）、`t113_fingerprint_parser`
+当前 9 个目标：`t113_protocol`（协议编解码）、`t113_fingerprint_parser`
 （指纹帧解析）、`t113_app_config`（配置读取与夹取）、`t113_audio_manager`
 （提示音播放，用假 ALSA 注入设备错误）、`t113_audio_sender`（UDP 12345
 上行音频）、`t113_audio_receiver`（UDP 12345 下行播放）、`t113_video_push`
-（UDP 23456 视频推流）、`t113_camera_preview`（UDP 50000 远程监看）。
+（UDP 23456 视频推流）、`t113_camera_preview`（UDP 50000 远程监看）、
+`t113_fingerprint_manager`（指纹串口互斥调度）。
 
 除前三个是纯逻辑外，其余都用**可注入的假替身**在真实接口边界上跑：
 假 ALSA（设备错误按需注入）、假套接字（记录/投递数据报）、假 V4L2 相机
@@ -116,6 +117,104 @@ ctest --test-dir /tmp/t113-tests --output-on-failure
 > 因为缺 `enable_testing()` 而"构建成功、`ctest` 一个用例都不跑"。这类
 > 失败**只看构建退出码会被误判为通过**，故已由 `check_subproject_cmake_is_selfcontained`
 > 强制（自检见 `tools/verify_subcmake.py`，8/8 用例）。
+
+### 指纹串口互斥（FingerprintManager）的行为断言
+
+门口机上只有**一根指纹串口**，却有两个使用者：
+
+- 常驻识别轮询（`startIdentify`，每 500 ms 下发 `CMD_GET_IMAGE`）；
+- 注册流程（`startEnroll`，每 500 ms 走一步 `GET_IMAGE`/`GEN_CHAR`/…）。
+
+两者都会 `readPacket()` 抢读**同一串口**的应答，互为对方之应答。
+`setSuspended()` 就是为此而存在的互斥开关——而它此前**没有任何测试**。
+
+测试方式：`HailinFingerprint` 的 `buildPacket/sendPacket/readPacket` 都不是
+virtual，无法继承覆盖，因此用**链接期替身** `tests/fake_fingerprint_device.cpp`，
+并**不链接** `src/hal/fingerprint_hailin.cpp`。替身里 `buildPacket()` 是
+**真实算法的逐字节拷贝**——报文字节是唯一需要守住的契约，若这里也换成
+"简化版"，测试就退化成"替身和自己比"。
+
+> AUTOMOC 陷阱同前：本目标不含与 `fingerprint_hailin.h` 同名的源文件，
+> 必须把该头文件显式列进 `add_executable`，否则链接期报
+> `undefined reference to 'HailinFingerprint::identifyResult(...)'`。
+
+| 用例 | 钉住的行为 |
+| --- | --- |
+| `identifyPollsWithGetImageCommand` | 轮询下发的帧结构（包头/地址/标识/大端长度/大端校验和）与 payload 恰为 `CMD_GET_IMAGE` |
+| `identifyKeepsPolling` | 以 500 ms 周期**持续**下发，不是只发一次 |
+| `identifySuccessEmitsResultAndStopsPolling` | 确认码 0x00 后停止轮询，并上报 `id`/`score` |
+| `identifyKeepsPollingWhenDeviceSilent` | 模块不应答时继续轮询，**不误报成功** |
+| `enrollSendsExactCommandSequence` | 注册的 8 帧命令序列、BufferID 递增 1/2/3、STORE_CHAR 的 id 大端、以及每步的超时参数 |
+| `suspendedStopsPollingImmediately` | 挂起后**立刻**停止下发 |
+| `identifyStaysSilentForWholeEnrollWindow` | 整个注册窗口内识别不得下发任何帧（跨 5 个轮询周期） |
+| `resumeRestartsIdentify` | 恢复后常驻识别自动重新开始 |
+| `startIdentify/startEnrollWhileSuspendedDoesNotAnnounce` | 挂起时连提示信号都不发（见下方说明） |
+| `repeatedStartIdentify/startEnrollDoesNotStackTimers` | 重复调用不叠加定时器（否则下发频率翻倍） |
+| `searchResponseByteLayoutIsPinned` | 应答布局 `[9]=confirm [10]=param [11..12]=id [13..14]=score` |
+| `commandFrameByteLayoutIsPinned` | 下发帧的包头/地址/标识/长度/校验和逐字节 |
+| `shortFramesDoNotCauseOutOfBoundsRead` | 11 字节"短但合法"的帧不得越界 |
+| `commandTagFrameIsNotAValidAck` | 包标识 0x01 的帧被当成成功（记录为**已知偏差**） |
+| `destructorStopsPolling` | 析构后整体安静（**不具区分度**，见下） |
+
+#### 对照实验：两道守卫与四类分层的诚实结论
+
+7 个对照项（6 个有区分度 + 1 个补测）全部符合预期。过程中发现并厘清了
+**四类不同性质**的代码，这个分层本身就是本轮的主要产出：
+
+**（一）真正有区分度、且发现了我自己测试缺陷的**
+
+| 对照 | 结果 | 结论 |
+| --- | --- | --- |
+| 去掉 `startIdentify` 入口守卫 | 首版**测不出来** | 见（二） |
+| STORE_CHAR 的 `id >> 8` 改成常量 0 | 首版**测不出来** | 我用了 `id=0x0005`，其高字节本就是 `0x00`，**断言没有区分度**。改用 `0x0105`（两字节都非零）后立即暴露 |
+| BufferID 不递增 / 超时 500→999 | 测出来 | 命令序列断言有效 |
+
+**（二）两道守卫互为遮蔽 —— 只测"不下发"是不够的**
+
+`startIdentify`/`startEnroll` 各有**两道**挂起守卫：入口处的
+`if (m_suspended) return;`，与轮询回调内的让路分支。我只断言"一帧都不发"时，
+**去掉入口守卫也照样通过**：新定时器第一次触发时会被回调内的守卫拦住。
+也就是说那道入口守卫当时是**未被验证**的。
+
+它的唯一可观测效果是**提示信号**——`startIdentify()` 在守卫之后、建定时器
+之前就 `emit identifyResult(..., "请按下指纹进行识别")`。补上
+`*DoesNotAnnounce` 两条用例（断言挂起时**连提示都不发**）后，对照实验立刻
+暴露了入口守卫的缺失。
+
+**（三）防御纵深，无法独立观测**
+
+- 轮询回调内的挂起让路：需要"`setSuspended` 到达时已有一个 timeout 事件
+  排在队列里"这一竞态才能触发，无法确定性复现。
+- `setSuspended(true)` 里的 `stopPoll()`：回调内的守卫会在 500 ms 内自行停表，
+  线上不可观测。
+
+两者都保留（防御纵深），但**不写"看似覆盖、实则空转"的断言**，而是明确记录。
+
+**（四）被我误判为缺陷的"非缺陷"**
+
+源码注释称 `~FingerprintManager()` 里的 `stopPoll()` 是为了防
+"use-after-free"。对照实验证实：删掉它测试**照样通过**——定时器以 `this`
+为 parent，随管理器一起被 QObject 析构销毁，销毁时连接断开，已排队的
+timeout 不会再调用 lambda。**那句注释描述的 use-after-free 在当前结构下
+无法发生**，该行属于防御性写法。已在测试里如实标注"不具区分度"。
+
+### 指纹应答的包标识校验缺口（已知偏差，已告警未修）
+
+同一个 `fingerprint_hailin.cpp` 里的解析路径判据**不一致**：
+
+- `autoIdentify()` 显式校验 `(quint8)resp[6] != PKT_ACK` 后才解析；
+- `stepRegister()` / `stepIdentify()` / `cancel()` 只判长度与 `resp[9]`；
+- `FingerprintManager` 的识别轮询回调同样只看 `resp.size() >= 12 && resp[9] == 0x00`。
+
+后果：串口上任何"`byte[9]==0x00` 但包标识不是 `0x07`"的字节流（噪声、
+命令回显、错位后重新同步出的伪帧）都会被误判为"手指已按下"，界面直接进入
+采集步骤，而实际上根本没有手指。
+
+**本轮未修**，原因：收紧判据会改变现场行为，而项目对协议的要求是
+"与 baseline 逐字节兼容"。这不是可单方面由静态检查决定的修复，需显式决策。
+当前行为已由 `commandTagFrameIsNotAValidAck` 钉住，避免被无意改动；
+静态检查则报 **WARNING**（`[fp-ack-tag]`，共 7 处），不报失败。
+自检见 `tools/verify_fp_ack_tag.py`（3/3）。
 
 ### 主机端编译验证（无 ALSA/libgpiod 的开发机可用）
 
@@ -303,7 +402,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下二十五条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下二十七条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -1123,7 +1222,7 @@ python3 tools/verify.py . ../Accessterminal_desktop
 > **已加载的模块**后才真正生效。这正是必须做故障注入的理由——**自检脚本自己
 > 也会骗人**。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述二十五条请以
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述二十七条请以
 `verify.py` 的结果为准。
 
 ---
@@ -1175,6 +1274,30 @@ python3 tools/verify.py . ../Accessterminal_desktop
 因此对"有开始/有停止"的通路，必须覆盖完整序列：
 **开始 -> 收到数据 -> 停止 -> 再次开始 -> 必须能再次收到数据**。
 本轮对照实验正是靠这一条找出了 `getFrameAfterStopResumesPushing` 这个缺口。
+### 26. 加了解析路径的"外层守卫"后，必须断言它**独有的**可观测效果
+
+一个流程里同一条件常出现**两次**（入口守卫 + 回调内让路）。只断言"最终没有
+产生副作用"时，**两道守卫互为遮蔽**：去掉入口守卫，回调内的守卫仍会在一轮
+之内兜住，"没有副作用"照样成立 —— 入口守卫于是成了**未被验证**的代码。
+
+正确做法是找到入口守卫**独有的**那个可观测效果。`startIdentify()` 里它在建
+定时器**之前**就发出"请按下指纹"的提示信号；回调内的守卫在 500 ms 后才触发，
+**无法**补救这次提示。因此要断言"挂起时连提示都不发"，而不只是"不下发帧"。
+
+第 21 轮的对照实验正是这样发现两道守卫互相遮蔽的（首版 7 个对照项里有 5 个
+"测不出来"，全部源于只断言了不下发）。
+
+### 27. 夹具里的取值必须让断言**可能失败**
+
+`STORE_CHAR` 的 id 高字节断言用 `id = 0x0005` 时，其高字节本来就是 `0x00`，
+把源码里的 `id >> 8` 改成常量 `0x00` 测试**照样通过** —— 断言形式正确，
+但取值让它没有区分度。改用 `0x0105`（两个字节都非零）后立即暴露。
+
+规则：凡是"大端拆分"或"逐字节比较"类的断言，**取值必须让被拆分的各个字节
+互不相同且非零**，否则应视为断言无效。同理，夹具里的函数名/宏名要**恰好**
+匹配被测规则的匹配模式（本轮另有 `startTimer()` 不匹配 `\bstart\s*\(`
+的实例，只因仓库里恰好存在真实文件才没暴露）。
+
 ## 开发约定
 
 - **标准**：C++11（不可使用 C++17 的 inline 变量等特性）
@@ -1201,7 +1324,8 @@ python3 tools/check_signatures.py .
 #     check_abandoned_async_tasks / check_subproject_cmake_is_selfcontained /
 #     check_hex_parse_is_validated / check_load_state_reset / check_wire_format_constants_are_pinned /
 #     check_nonblock_pcm_handles_eagain /
-#     check_gated_wire_paths_have_resume_test / check_narrowing_cast_of_config
+#     check_gated_wire_paths_have_resume_test /
+#     check_fingerprint_ack_tag_is_validated / check_narrowing_cast_of_config
 #     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
@@ -1217,6 +1341,7 @@ python3 tools/verify_cross_target.py .
 python3 tools/verify_wire_format.py .
 python3 tools/verify_nonblock_pcm.py .
 python3 tools/verify_gated_resume.py .
+python3 tools/verify_fp_ack_tag.py .
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
 #     含「原实现对照」与随机模糊测试；无需编译即可验证定帧逻辑）
