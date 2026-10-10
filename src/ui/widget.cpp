@@ -61,8 +61,8 @@ namespace {
 constexpr int kPreviewWidth = 430;
 constexpr int kPreviewHeight = 475;
 
-/// 人脸注册所需样本数。
-constexpr int kFaceSampleTarget = 3;
+/// 人脸注册所需样本数不再单独定义常量：改用
+/// FaceManager::sampleTarget()，避免两个 3 各改各的造成静默错位。
 
 /// 异步人脸检测时缩小的尺寸，降低 Haar 计算量。
 constexpr int kDetectWidth = 320;
@@ -290,6 +290,8 @@ void Widget::setupModules()
 
     // ---- 人脸 ----
     m_faceManager = new FaceManager(this);
+    // 判定阈值来自配置（重构前是 FaceManager 内硬编码的 90，同名配置项不生效）。
+    m_faceManager->setConfidenceThreshold(cfg.faceConfidenceThreshold());
 
     const bool cascadeLoaded = loadFaceCascade(cfg.faceCascadePath());
     qInfo() << "[人脸检测] 分类器加载" << (cascadeLoaded ? "成功" : "失败")
@@ -761,7 +763,8 @@ void Widget::onAddFaceFromFingerForm()
     const QRect faceRect(maxFace->x, maxFace->y, maxFace->width, maxFace->height);
     const QImage faceImage = frame.copy(faceRect).scaled(100, 100, Qt::KeepAspectRatio);
     m_faceManager->addFaceSample(faceImage);
-    if (m_faceManager->sampleCount() == kFaceSampleTarget) {
+    // 用 FaceManager 自己的门槛判断，而不是界面侧的副本常量。
+    if (m_faceManager->sampleCount() == m_faceManager->sampleTarget()) {
         m_faceManager->train();
     }
 }

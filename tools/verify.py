@@ -461,6 +461,159 @@ def check_config_value_sanity(root, src_root):
                      f"cfg.{getter}() 做除数，配置为 0 时会除零崩溃")
 
 
+def check_config_knobs_are_used(root, src_root):
+    """
+    配置里公开的每个开关都必须真的生效，否则它就是「假旋钮」。
+
+    背景（真实缺陷，重构引入）：
+    config/appconfig.json 提供了 behavior.face_confidence_threshold，
+    app_config.h 也提供了 faceConfidenceThreshold() 访问器，但
+    FaceManager::recognize() 里仍然是重构前的硬编码：
+
+        bool success = (predictedLabel == 1 && confidence < 90);
+
+    即：现场把该配置从 90 调到 60，行为毫无变化 —— 配置被读取、被文档化，
+    却从不生效。这类缺陷不会崩溃、不会告警，只会让「调参」永远无效，
+    是最难被发现的一类重构退化。
+
+    判据（要比「访问器有没有人调」更准确）：
+    配置值的流向是  JSON/环境变量 -> m_xxx -> 使用者。因此一个开关
+    「生效」的充要条件是：要么访问器 `xxx()` 在 app_config.* 之外被调用，
+    要么它背后的成员 `m_xxx` 在加载代码之外被**读取**过。
+
+    只看访问器调用点会误判：例如 pcmDir() 无人调用，但 pcmFile() 内部
+    直接读了 m_pcmDir，该配置其实完全有效。故本检查两者都算。
+
+    输出分两级：
+      - 成员从未被读取  -> fail（真·假旋钮，配置改了没用）
+      - 成员有读取但访问器无人调用 -> warn（冗余访问器，可清理）
+
+    例外：ALLOWED_DEAD 里放「故意不读」的项，必须写明理由。
+    """
+    # 故意不读的访问器及理由。新增条目必须附理由，否则就是遗漏。
+    ALLOWED_DEAD = {
+        # 仅用于日志/排查，main.cpp 输出一次后即完成使命（desktop 侧使用）。
+        "loadedFromFile",
+    }
+    # 生命周期/单例/工厂方法不是配置项，不参与本检查。
+    NOT_KNOBS = {"instance", "load", "configPath", "AppConfig", "operator"}
+
+    header = os.path.join(src_root, "config", "app_config.h")
+    impl = os.path.join(src_root, "config", "app_config.cpp")
+    if not os.path.isfile(header) or not os.path.isfile(impl):
+        fail("[config-knobs] 找不到 src/config/app_config.{h,cpp}")
+        return
+
+    htext = strip_comments_and_strings(read(header))
+    ctext = strip_comments_and_strings(read(impl))
+
+    # 无参 const 访问器及其函数体：  QString serverIp() const { return m_serverIp; }
+    getter_re = re.compile(
+        r'^\s*(?:const\s+)?[\w:<>]+(?:\s*[*&])?\s+(\w+)\s*\(\s*\)\s*const\s*'
+        r'([;{])', re.M)
+    knobs = []          # (accessor_name, member_name or None)
+    for m in getter_re.finditer(htext):
+        name, brace = m.group(1), m.group(2)
+        if name in NOT_KNOBS or name in ALLOWED_DEAD:
+            continue
+        member = None
+        if brace == "{":
+            # 取到匹配的右花括号，得到内联函数体
+            depth, i = 0, m.end() - 1
+            while i < len(htext):
+                if htext[i] == "{":
+                    depth += 1
+                elif htext[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            body = htext[m.end() - 1:i + 1]
+            found = re.findall(r'\b(m_\w+)\b', body)
+            if len(set(found)) == 1:
+                member = found[0]
+        knobs.append((name, member))
+
+    if not knobs:
+        fail("[config-knobs] 未在 app_config.h 中解析到任何无参访问器"
+             "（检查器已失效，请更新正则）")
+        return
+
+    # 收集 app_config.* 之外的访问器调用点
+    called = set()
+    for path in find_files(src_root, {".cpp", ".h"}):
+        if os.path.basename(path) in ("app_config.h", "app_config.cpp"):
+            continue
+        body = strip_comments_and_strings(read(path))
+        for name, _ in knobs:
+            if re.search(r'\b' + name + r'\s*\(\s*\)', body):
+                called.add(name)
+
+    def strip_loading_code(text):
+        """
+        去掉 app_config.cpp 中的「加载代码」，只留下真正的消费者。
+
+        为什么必须这么做：加载代码里也会**读**成员，但这些读并不代表配置
+        生效。最典型的是把当前值当作回退实参传给 jsonInt/jsonDouble：
+
+            m_faceConfidenceThreshold =
+                jsonDouble(behavior, "face_confidence_threshold",
+                           m_faceConfidenceThreshold);   // <- 这是读，但不是消费
+
+        若不剔除，faceConfidenceThreshold 这种「假旋钮」就会被误判为生效
+        （该缺陷最初就是这样漏掉的）。加载函数整体剔除后，剩下的
+        m_xxx 读取才是真正的派生使用（例如 pcmFile() 读 m_pcmDir）。
+        """
+        # 需要剔除的加载入口。函数体按花括号配对截取。
+        loading_fns = ("load", "applyDefaults", "applyEnvOverrides")
+        out = text
+        for fn in loading_fns:
+            # 匹配 `void AppConfig::load(...)` 或 `bool AppConfig::load(...)`
+            for m in re.finditer(
+                    r'\b[\w:<>]+\s+AppConfig::' + fn + r'\s*\([^;{]*\)\s*\{',
+                    out):
+                depth, i = 0, m.end() - 1
+                while i < len(out):
+                    if out[i] == "{":
+                        depth += 1
+                    elif out[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    i += 1
+                out = out[:m.start()] + "\n" * out[m.start():i + 1].count("\n") \
+                    + out[i + 1:]
+        return out
+
+    consumed_text = strip_loading_code(ctext)
+
+    def member_is_read(member):
+        """成员是否在 app_config.cpp 的**加载代码之外**被读取（真正的消费）。"""
+        t = consumed_text
+        # 赋值语句 m_xxx = ...（排除 ==）：写入不算消费
+        t = re.sub(r'\b' + member + r'\s*=(?!=)', '', t)
+        return re.search(r'\b' + member + r'\b', t) is not None
+
+    fake, redundant = [], []
+    for name, member in knobs:
+        if name in called:
+            continue
+        if member is not None and member_is_read(member):
+            redundant.append("%s()（配置经 %s 仍生效）" % (name, member))
+        else:
+            fake.append("%s()" % name if member is None
+                        else "%s()/%s" % (name, member))
+
+    if fake:
+        fail("[config-knobs] 这些配置开关从未被读取，属于「假旋钮」"
+             "（配置可读可调但永不生效）: " + ", ".join(sorted(fake))
+             + "；若确为有意保留，请加入 check_config_knobs_are_used 的 "
+               "ALLOWED_DEAD 并写明理由")
+    if redundant:
+        warn("[config-knobs] 访问器无人调用，但配置经成员变量仍然生效"
+             "（冗余访问器，可考虑清理）: " + ", ".join(sorted(redundant)))
+
+
 def check_deferred_session_guard(root, src_root):
     """
     延时任务必须保护“通话会话”有效性。
@@ -1163,6 +1316,7 @@ def main():
     check_connect_signal_is_signal(root, src_root)
     check_json_configs(root)
     check_config_value_sanity(root, src_root)
+    check_config_knobs_are_used(root, src_root)
 
     print(f"校验目录: {root}")
     print("=" * 70)

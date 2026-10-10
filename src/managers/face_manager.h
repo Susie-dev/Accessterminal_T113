@@ -40,6 +40,28 @@ public:
     // 定义或声明函数 sampleCount。
     int sampleCount() const;
 
+    /**
+     * @brief 注册所需的人脸样本数（训练/识别的前置门槛）。
+     *
+     * 界面在采集够样本后要触发 train()，因此这里必须与 widget.cpp 使用
+     * **同一个**数字。重构前 widget.cpp 另有一个 kFaceSampleTarget = 3 的
+     * 独立常量，与 collectTarget 各改各的就会静默错位（例如界面永远不触发
+     * 训练，或样本已满仍继续采集）。改为对外暴露 collectTarget，使全工程
+     * 只有一个事实来源。
+     */
+    int sampleTarget() const { return collectTarget; }
+
+    /**
+     * @brief 设置 LBPH 判定阈值（距离，越小越严格）。
+     *
+     * 对应配置项 behavior.face_confidence_threshold。重构前这里是硬编码的
+     * `confidence < 90`，而配置里却提供了可调的 face_confidence_threshold，
+     * 结果是**该配置项一直不生效**（改配置没有任何反应）。
+     *
+     * 默认值取 90.0，与重构前的硬编码常量一致，因此不配置时行为逐字节不变。
+     */
+    void setConfidenceThreshold(double threshold) { confidenceThreshold = threshold; }
+
 // 声明 Qt 信号槽成员区域。
 signals:
     // 定义或声明函数 faceSampled。
@@ -56,6 +78,9 @@ private:
     QVector<cv::Mat> registeredFaces;
     // 执行本行语句完成对应变量、对象或业务状态处理。
     int collectTarget = 3;
+    // LBPH 距离阈值。默认 90.0 与重构前的硬编码 `confidence < 90` 完全一致；
+    // 由 setConfidenceThreshold() 从配置覆盖。
+    double confidenceThreshold = 90.0;
     // 执行本行语句完成对应变量、对象或业务状态处理。
     cv::Ptr<cv::face::LBPHFaceRecognizer> faceRecognizer;
 // 结束当前代码块作用域。

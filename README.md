@@ -268,7 +268,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下九条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下十条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -502,7 +502,42 @@ int faceDetectInterval() const { return clampInt(m_faceDetectInterval, 1, 100000
 （`tools/verify_config_sanity.py`，6/6 用例）——静态规则写错会静默失效，
 必须证明它真的能区分好坏代码。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述九条请以
+### 10. 配置里公开的开关必须真的生效
+
+第 9 条管的是「配置值不合理会崩」，本条管的是「配置值根本没人用」。
+
+`config/appconfig.json` 提供了 `behavior.face_confidence_threshold`，
+`app_config.h` 也提供了对应访问器，但 `FaceManager::recognize()` 里仍然是
+重构前的硬编码：
+
+```cpp
+bool success = (predictedLabel == 1 && confidence < 90);   // 配置改了没用
+```
+
+现场把该阈值从 90 调到 60，行为**毫无变化**。这类「假旋钮」不崩溃、
+不告警，只让调参永远无效，是最难发现的一类重构退化。
+
+修法是把阈值真正接进 `FaceManager`，并把默认值定为 `90.0`，与重构前的
+硬编码常量完全一致 —— 因此不配置时行为逐字节不变：
+
+```cpp
+m_faceManager->setConfidenceThreshold(cfg.faceConfidenceThreshold());
+```
+
+同时消掉了一处会导致静默错位的重复常量：`widget.cpp` 原本另有
+`kFaceSampleTarget = 3`，与 `FaceManager::collectTarget = 3` 各改各的就会
+出现「界面永远不触发训练」或「样本已满仍继续采集」。现改用
+`FaceManager::sampleTarget()`，全工程只有一个事实来源。
+
+由 `check_config_knobs_are_used` 强制，自检见
+`tools/verify_config_knobs.py`（6/6 用例）。判据是「访问器在
+`app_config.*` 之外被调用，**或**其成员在加载代码之外被读取」——
+后一条是为了不误伤 `pcmDir()` 这种「访问器没人调、但 `pcmFile()` 内部
+直接读了 `m_pcmDir`」的有效配置。特别地，**加载代码里的读取不算消费**：
+`m_x = jsonInt(o, "x", m_x)` 只是回退实参，若把它算作消费，假旋钮就会被
+漏掉（本条规则第一版正是这样漏掉了 `faceConfidenceThreshold`）。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述十条请以
 `verify.py` 的结果为准。
 
 ---
@@ -527,9 +562,11 @@ python3 tools/verify.py .
 # 2. 签名一致性（.h 声明 vs .cpp 定义）
 python3 tools/check_signatures.py .
 
-# 2b. 校验器自检：对 check_config_value_sanity 做故障注入（6/6 用例）
-#     静态规则写错会静默失效，用故障注入证明它真的能区分好坏代码。
+# 2b. 校验器自检：对 check_config_value_sanity / check_config_knobs_are_used
+#     做故障注入（各 6/6 用例）。静态规则写错会静默失效，必须证明它真能
+#     区分好坏代码。
 python3 tools/verify_config_sanity.py .
+python3 tools/verify_config_knobs.py .
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
 #     含「原实现对照」与随机模糊测试；无需编译即可验证定帧逻辑）

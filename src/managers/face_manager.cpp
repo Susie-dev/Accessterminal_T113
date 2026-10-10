@@ -100,9 +100,10 @@ void FaceManager::recognize(const QImage& faceImg)
     double confidence = 0.0;
     // 执行本行语句完成对应变量、对象或业务状态处理。
     faceRecognizer->predict(testFace, predictedLabel, confidence);
-    // OpenCV LBPH 的 confidence 是距离，值越小相似度越高；90 是经验阈值，需要现场光照下标定。
-    // 执行本行语句完成对应变量、对象或业务状态处理。
-    bool success = (predictedLabel == 1 && confidence < 90);
+    // OpenCV LBPH 的 confidence 是距离，值越小相似度越高；默认 90 是经验阈值，
+    // 需要现场光照下标定，因此通过配置 behavior.face_confidence_threshold 暴露。
+    // 重构前这里硬编码 90，导致同名配置项被读取却从不生效。
+    bool success = (predictedLabel == 1 && confidence < confidenceThreshold);
     // 发出 Qt 信号 recognizeResult 通知其他对象。
     emit recognizeResult(success, confidence);
 // 结束当前代码块作用域。
