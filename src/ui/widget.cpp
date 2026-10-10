@@ -38,6 +38,7 @@
 #include <QMessageBox>
 #include <QPainter>
 #include <QPen>
+#include <QPointer>
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QTimer>
@@ -805,14 +806,27 @@ void Widget::updateFrame()
 
     // ---- 异步人脸检测：每 N 帧一次，缩小尺寸降低计算量 ----
     if (++detectCounter % cfg.faceDetectInterval() == 0 && !m_faceCascade.empty()) {
+        // 用 QPointer 观察 this：任务在后台线程运行时，Widget 可能已被析构
+        // （例如用户关机或界面销毁）。原来的实现直接捕获裸 this，既会在
+        // 已析构对象上读 m_faceCascade，又会把结果 invokeMethod 到一个
+        // 已不存在的对象——两者都是 use-after-free。
+        // QPointer 在对象销毁后自动变空，是最轻量的守卫。
+        //
+        // m_faceCascade 是生成检测器前就要用到的成员，因此在提交任务时就
+        // 把分类器按值拷贝进 lambda，避免任务体内再触碰 this 的成员。
+        QPointer<Widget> self(this);
+        const cv::CascadeClassifier cascade = m_faceCascade;
         const QImage small = frame.scaled(kDetectWidth, kDetectHeight, Qt::KeepAspectRatio);
-        QtConcurrent::run([this, small]() {
+        QtConcurrent::run([self, small, cascade]() {
+            if (self.isNull()) {
+                return; // Widget 已析构，直接放弃本次检测
+            }
             const cv::Mat mat(small.height(), small.width(), CV_8UC4,
                               const_cast<uchar*>(small.bits()), small.bytesPerLine());
             cv::Mat gray;
             cv::cvtColor(mat, gray, cv::COLOR_BGRA2GRAY);
             std::vector<cv::Rect> rects;
-            m_faceCascade.detectMultiScale(gray, rects, 1.1, 3, 0, cv::Size(30, 30));
+            cascade.detectMultiScale(gray, rects, 1.1, 3, 0, cv::Size(30, 30));
             // 结果投递回 UI 线程处理（跨线程直接访问 m_faces 不安全）。
             QVector<cv::Rect> qrects;
             qrects.reserve(static_cast<int>(rects.size()));
@@ -821,8 +835,18 @@ void Widget::updateFrame()
             }
             const int w = small.width();
             const int h = small.height();
-            QMetaObject::invokeMethod(this, [this, qrects, w, h]() {
-                onFaceDetectResult(qrects, w, h);
+            // 二次检查：从提交到现在又过了一段时间，对象可能刚被销毁。
+            // invokeMethod 的上下文对象若已析构，调用会被安全忽略；
+            // 这里显式判断是为了避免无谓地构造闭包。
+            // 用 self.data() 显式取裸指针，避免依赖 QPointer 的隐式转换。
+            if (self.isNull()) {
+                return;
+            }
+            Widget* ctx = self.data();
+            QMetaObject::invokeMethod(ctx, [self, qrects, w, h]() {
+                if (!self.isNull()) {
+                    self->onFaceDetectResult(qrects, w, h);
+                }
             }, Qt::QueuedConnection);
         });
     }

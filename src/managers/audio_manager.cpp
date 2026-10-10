@@ -23,7 +23,27 @@ AudioManager::AudioManager(QObject* parent)
 }
 
 // 定义类 AudioManager 的成员函数 ~AudioManager。
-AudioManager::~AudioManager() {}
+AudioManager::~AudioManager()
+{
+    // 关键：必须等异步播放任务真正结束后再析构。
+    //
+    // playAsync() 用 QtConcurrent::run 起了一个后台任务，该任务的 lambda
+    // 以 [=] 捕获了 this 并会调用成员函数 playPcmFile()、发射
+    // playbackStarted/playbackFinished 信号。原实现析构函数为空，
+    // 于是当 Widget 析构（连带删除 parent 为 this 的 AudioManager）时，
+    // 若后台任务恰好还在播放一段音频，就会出现：
+    //   - 在已析构对象上 emit 信号（Qt 会访问已释放的 QObject 内部状态）
+    //   - playPcmFile() 读取已释放的成员
+    // 即典型的 use-after-free。
+    //
+    // 顺序很重要：先置中断标志（让循环尽快 drop 并返回），再 waitForFinished
+    // 等它退出，最后才让成员被销毁。仅 waitForFinished 而不置标志的话，
+    // 一段较长的提示音会让析构阻塞到整段播完。
+    stop();
+    if (playFuture.isRunning()) {
+        playFuture.waitForFinished();
+    }
+}
 
 // 定义或声明函数 AudioManager::playAsync。
 void AudioManager::playAsync(const QString& pcmFilePath)
