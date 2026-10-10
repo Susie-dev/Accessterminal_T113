@@ -35,6 +35,10 @@ int g_selectCount = 0;
 int g_recvFailFirst = 0;
 int g_recvFailErrno = 0;
 
+// 视频推送方向（CameraPushThread 自己 socket()）
+int g_socketCount = 0;
+bool g_socketFail = false;
+
 /// 把 a.b.c.d 打包成网络序。注意 devstubs 里 in_addr 是 sockaddr_in 的
 /// 嵌套类型，不能单独取名。
 unsigned int parseIpv4(const char* dotted)
@@ -61,6 +65,8 @@ void reset()
     g_selectCount = 0;
     g_recvFailFirst = 0;
     g_recvFailErrno = 0;
+    g_socketCount = 0;
+    g_socketFail = false;
 }
 
 void pushIncoming(const std::vector<char>& payload)
@@ -100,6 +106,11 @@ int recvfromCount() { QMutexLocker l(&g_mutex); return g_recvfromCount; }
 int selectCount() { QMutexLocker l(&g_mutex); return g_selectCount; }
 
 void setSendFail(bool fail) { QMutexLocker l(&g_mutex); g_sendFail = fail; }
+
+// ---- 视频推送方向 ----
+
+void setSocketFail(bool fail) { QMutexLocker l(&g_mutex); g_socketFail = fail; }
+int socketCount() { QMutexLocker l(&g_mutex); return g_socketCount; }
 
 std::vector<Datagram> sent()
 {
@@ -245,6 +256,25 @@ int fcntl(int fd, int cmd, ...)
     // 接收线程用 F_GETFL 取标志、F_SETFL 置 O_NONBLOCK。
     // 假的 fd 无需真正改状态，返回 0 即可。
     return 0;
+}
+
+/**
+ * fake socket()：返回递增的假 fd。
+ *
+ * CameraPushThread（UDP 23456）自己创建 socket，而 MinGW 没有 socket()，
+ * 因此这里必须提供。用递增 fd 是为了让测试能断言"每个线程各用各的 fd"。
+ * 负值注入由 setSocketFail 控制，用于验证 socket 创建失败的兜底分支。
+ */
+int socket(int domain, int type, int protocol)
+{
+    (void)domain; (void)type; (void)protocol;
+    QMutexLocker l(&g_mutex);
+    ++g_socketCount;
+    if (g_socketFail) {
+        errno = EMFILE;
+        return -1;
+    }
+    return 100 + g_socketCount; // 避开 0/1/2，避免与 stdio 混淆
 }
 
 } // extern "C"

@@ -46,7 +46,7 @@ else()
                            "${CMAKE_CURRENT_LIST_DIR}/../src" ABSOLUTE)
 endif()
 
-find_package(Qt5 5.12 REQUIRED COMPONENTS Core Test)
+find_package(Qt5 5.12 REQUIRED COMPONENTS Core Test Gui Network)
 
 # ---------------------------------------------------------------------------
 # 协议契约测试
@@ -203,3 +203,77 @@ target_link_libraries(t113_test_audio_receiver PRIVATE
 )
 
 add_test(NAME t113_audio_receiver COMMAND t113_test_audio_receiver)
+
+# ---------------------------------------------------------------------------
+# CameraPushThread：UDP 23456 视频推流
+#
+# UDP 23456 是协议硬约束（每包一个完整 JPEG、不重组不重传、端口固定），但此前
+# 完全没有测试。与音频线程同类：真实 V4L2Camera 需要 /dev/video0，开发机上
+# 不存在。这里用 fake_v4l2_camera.cpp 作为**链接期替身**替换相机（生产代码
+# 不改一行），用可记录的 fake_net.cpp 断言线上字节。
+#
+# 注意：替换相机意味着**不能**同时链接 core/vision/v4l2_camera.cpp，
+# 否则 V4L2Camera 的成员会重复定义。
+# ---------------------------------------------------------------------------
+add_executable(t113_test_video_push
+    test_video_push.cpp
+    fake_net.cpp
+    fake_v4l2_camera.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/core/media/video_push_thread.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/config/app_config.cpp
+    # 必须把真实的 v4l2_camera.h 显式列为源文件，AUTOMOC 才会为它生成 moc。
+    # AUTOMOC 默认只为"与某个 .cpp 同名"的头文件生成 moc；本目标不含
+    # v4l2_camera.cpp（它被 fake_v4l2_camera.cpp 顶替），所以没有任何源文件
+    # 与它同名，moc 不会生成，链接期就会报
+    #   undefined reference to `vtable for V4L2Camera'
+    # （Q_OBJECT 的虚表由 moc 提供）。列进来即可，不需要任何生产代码改动。
+    ${ACCESSTERMINAL_SRC_ROOT}/core/vision/v4l2_camera.h
+)
+
+target_include_directories(t113_test_video_push PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_LIST_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/../tools/devstubs
+)
+
+target_link_libraries(t113_test_video_push PRIVATE
+    Qt5::Core
+    Qt5::Test
+    Qt5::Gui          # QImage / QBuffer
+)
+
+add_test(NAME t113_video_push COMMAND t113_test_video_push)
+
+# ---------------------------------------------------------------------------
+# CameraUdpServer：UDP 50000 远程监看
+#
+# 与 UDP 23456 的差异全是线上语义：只在收到裸 `getframe`（**不带 '\n'**）后
+# 才推帧、收到 `stop` 立刻停、50ms/20fps、JPEG 用默认质量（通话视频是 75）。
+# 此前没有测试。
+#
+# 本目标用**真实 QUdpSocket** 走 127.0.0.1:50000，把 bind、事件循环、
+# readyRead 派发一起验证，而不是直接调私有槽（那会绕开真正的线上路径）。
+# 相机仍用链接期替身，故不链接 v4l2_camera.cpp。
+# ---------------------------------------------------------------------------
+add_executable(t113_test_camera_preview
+    test_camera_preview.cpp
+    fake_v4l2_camera.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/core/media/camera_preview_server.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/config/app_config.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/core/vision/v4l2_camera.h  # 见下方说明
+)
+
+target_include_directories(t113_test_camera_preview PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_LIST_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/../tools/devstubs
+)
+
+target_link_libraries(t113_test_camera_preview PRIVATE
+    Qt5::Core
+    Qt5::Test
+    Qt5::Gui
+    Qt5::Network
+)
+
+add_test(NAME t113_camera_preview COMMAND t113_test_camera_preview)

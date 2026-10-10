@@ -94,11 +94,20 @@ cmake --build /tmp/t113-tests
 ctest --test-dir /tmp/t113-tests --output-on-failure
 ```
 
-当前 5 个目标：`t113_protocol`（协议编解码）、`t113_fingerprint_parser`
+当前 8 个目标：`t113_protocol`（协议编解码）、`t113_fingerprint_parser`
 （指纹帧解析）、`t113_app_config`（配置读取与夹取）、`t113_audio_manager`
 （提示音播放，用假 ALSA 注入设备错误）、`t113_audio_sender`（UDP 12345
-上行音频，用假 ALSA + 假套接字对**线上字节**做断言）。后两者不碰真实硬件，
-硬件错误按需注入——详见下面两节。
+上行音频）、`t113_audio_receiver`（UDP 12345 下行播放）、`t113_video_push`
+（UDP 23456 视频推流）、`t113_camera_preview`（UDP 50000 远程监看）。
+
+除前三个是纯逻辑外，其余都用**可注入的假替身**在真实接口边界上跑：
+假 ALSA（设备错误按需注入）、假套接字（记录/投递数据报）、假 V4L2 相机
+（链接期替身）。因此它们不碰任何真实硬件，却对**线上字节**做逐字节断言——
+详见后面各节。
+
+> 至此，**四类线上通路（TCP 8887 信令、UDP 12345 音频、UDP 23456 视频、
+> UDP 50000 监看）全部有可执行的线上字节断言**，不再存在"看起来测过、
+> 其实一步没跑"的通路。
 
 跨工程信令互通测试同理，见 `tests/interop/run_interop.sh`（同样不依赖 ALSA）。
 
@@ -294,7 +303,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下二十三条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下二十五条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -909,6 +918,82 @@ return QByteArray::fromHex(compact.toLatin1());
 > 会触发 `QThread: Destroyed while thread is still running` 并 abort，把真正的
 > 失败原因淹没。故用 RAII `ThreadGuard` 保证任何路径都 `stop()` + `wait()`。
 
+### 视频推流（CameraPushThread / UDP 23456）的线上字节断言
+
+UDP 23456 是协议硬约束的一员：**每个数据报就是一个完整 JPEG**（质量 75），
+不做分片重组、不做重传，端口固定 23456。它此前**完全没有测试**，与刚修过
+缺陷的两个音频线程属于同一类问题——`tools/devstubs` 的 `sendto()` 只"返回
+len"、不记录载荷，其 `inet_pton()` 还永远返回 0，而真实 `V4L2Camera` 需要
+`/dev/video0`，开发机上都不存在。
+
+因此这里用两件替身把**真实网络路径**跑起来：
+
+- `tests/fake_net.cpp` —— 记录每次 `sendto()` 的 fd/目标地址/目标端口/完整
+  载荷（本轮补上了 `socket()`，因为本线程自己建 socket）；
+- `tests/fake_v4l2_camera.cpp` —— `V4L2Camera` 的**链接期替身**。
+  `getFrame()` 不是 virtual，无法继承覆盖，所以只能替换链接时的符号定义；
+  好处是**生产代码一行都不用改**（不加任何测试钩子）。
+
+> AUTOMOC 陷阱：替身顶掉了 `v4l2_camera.cpp`，就没有任何源文件与
+> `v4l2_camera.h` 同名，AUTOMOC 不会为它生成 moc，链接期报
+> `undefined reference to 'vtable for V4L2Camera'`。把真实的
+> `v4l2_camera.h` 显式列进 `add_executable` 的源文件列表即可。
+
+| 用例 | 钉住的行为 |
+| --- | --- |
+| `eachPacketIsAWholeJpegWithoutHeader` | 第 0 字节就是 JPEG 的 SOI（FF D8），末两字节是 EOI（FF D9），且能解回原尺寸 —— "无包头"的直接证据 |
+| `wireJpegMatchesExplicitQuality75` | 线上字节与本地 `save(..., "JPEG", 75)` **逐字节相同**（质量改动会静默改变带宽/画质） |
+| `sendsToConfiguredAddressAndVideoPort` | 发往指定 IP 与固定端口 23456 |
+| `videoPortIsFrozenAndDistinct` | 8887 / 12345 / 23456 / 50000 四个端口互不重叠 |
+| `noFrameMeansNoPacket` | 没有可用帧时**不发空包**，但仍持续取帧 |
+| `everyFrameIsPushed` | 多帧都发出、都发往同一目标 |
+| `socketFailureEmitsNothing` | `socket()` 失败时干净退出，一个包不发、一次帧都不取 |
+| `stopEndsThreadPromptly` | `stop()` 及时生效（40ms 分片睡眠的作用） |
+| `stopBeforeStartIsNotLostByRun` | 停止标志不可逆（第 10 轮真实缺陷回归） |
+
+### 远程监看（CameraUdpServer / UDP 50000）的线上语义断言
+
+UDP 50000 与 23456 的差异**全是线上语义**，改错只在现场表现为"看不到画面"，
+不报任何错：只在收到裸 `getframe` 后才推帧、收到 `stop` 立即停止、
+50 ms 定时器 = 20 fps、JPEG 用 `save(&buffer, "JPEG")` 默认质量。
+
+本目标刻意使用**真实 `QUdpSocket`** 走 `127.0.0.1:50000`，把 bind、事件循环、
+`readyRead` 派发一起验证，而不是直接调私有槽（那会绕开真正的线上路径）。
+客户端发的是**裸文本**（不带 `'\n'`，与 TCP 8887 的信令不同）。
+
+| 用例 | 钉住的行为 |
+| --- | --- |
+| `noPushBeforeGetFrame` | 没收到请求时一个字节都不推，**也不取帧**（"不长期占用带宽"的核心保证） |
+| `getFrameStartsPushingWholeJpegs` | 裸 `getframe` 后开始推完整 JPEG（无包头、可解码） |
+| `getFrameWithNewlineIsAccepted` | 带 `'\n'` 也接受（`fromWire` 会 trim），但裸文本才是线上形态 |
+| `stopHaltsPushing` | `stop` 后不再推帧 |
+| `getFrameAfterStopResumesPushing` | **停止后再次 `getframe` 能恢复推帧**（见下方对照实验说明） |
+| `unknownDatagramIsIgnored` | 无法识别的文本被忽略，且不影响后续请求 |
+| `noFrameMeansNoPacket` | 没有可用帧时不发空包 |
+| `wireJpegMatchesExplicitQuality75` | 线上字节等于显式质量 75 的编码结果 |
+| `previewJpegMatchesCallVideoQualityOnQt5` | 固化"Qt5 默认质量 == 75"这一实测事实 |
+| `previewPortIsFrozen` | 端口固定 50000，且与其余三个端口不同；裸信令文本为 `getframe` / `stop` |
+
+#### 一个被澄清的"差异"
+
+预览用 `save(&buffer, "JPEG")`（默认质量），通话视频用 `save(&buffer, "JPEG", 75)`
+（显式 75）。两者**看起来**质量参数不同，但实测（Qt 5.15.19，探针遍历质量
+1..100 逐一比对字节）Qt 的**默认 JPEG 质量恰好就是 75**，因此二者输出逐字节
+相同。我最初想当然地断言"两者必然不同"，被实测当场证伪。该事实现已固化为
+断言：若将来 Qt 改变默认质量，或有人改掉显式的 75，测试会立刻失败。
+
+#### 对照实验暴露的两个真实覆盖盲区
+
+| 对照（还原被钉住的行为） | 首次结果 | 结论与处置 |
+| --- | --- | --- |
+| 生产代码质量 75 -> 1 | **测试仍全过** | 旧断言只校验 JPEG 魔数与可解码性，**不校验质量**；已新增逐字节质量断言 |
+| 去掉 `sending = false;` | **测试仍全过** | 该赋值对"停止"是冗余的（`sendTimer->stop()` 已足够，且 `sendFrame()` 开头的 `if (!sending) return;` 使其线上不可见）；它真正的作用在**恢复**路径 —— 少了它，`stop` 后再次 `getframe` 时 `if (!sending)` 为假、`sendTimer->start()` 不被调用，**第二次监看永远看不到画面**。已新增 `getFrameAfterStopResumesPushing` |
+| 去掉 `sendTimer->stop()` | 线上不可见 | 同上，冗余但保留（防御性） |
+
+> 教训：**"有断言"不等于"有区分度"**。上表第二行正是我先写错了对照用例
+> （选了"什么都不发"的场景，根本进不了分支），换到正确用例后才暴露出来。
+> 最终 6 项对照 18/18 全部符合预期。
+
 ### 提示音播放（AudioManager）的可编程测试
 
 `AudioManager` 是本工程出过**两个真实缺陷**的类（第 11 轮 XRUN 静默丢数据、
@@ -1038,7 +1123,7 @@ python3 tools/verify.py . ../Accessterminal_desktop
 > **已加载的模块**后才真正生效。这正是必须做故障注入的理由——**自检脚本自己
 > 也会骗人**。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述二十三条请以
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述二十五条请以
 `verify.py` 的结果为准。
 
 ---
@@ -1062,6 +1147,34 @@ python3 tools/verify.py . ../Accessterminal_desktop
 **函数体**判定（不是整个文件），自检见 `tools/verify_nonblock_pcm.py`（6/6）。
 桌面端当前没有 ALSA 代码，规则同为空转，但已同步过去以防将来加入播放逻辑。
 
+### 24. 图像编码质量属于线上字节，必须被逐字节断言
+
+`QImage::save(&buffer, "JPEG", quality)` 的质量参数**不改变可解码性**，只改变
+字节。因此"质量被改动"是一类**静默的线上差异**：带宽与画质变了，接收端照样
+能解码，谁也不报错。
+
+只校验"是 JPEG 魔数 + 能解码"是**不够的**。对照实验证实：把通话视频的质量
+从 75 改成 1，原有测试**全部仍然通过**。
+
+正确做法是把收到的数据报与本地同一张图、同一个显式质量参数编码出的字节做
+**逐字节比较**，并补一条"换一个质量必须产生不同字节"的反向断言，证明该比较
+有区分度。注意期望值必须**显式写出质量数**（如 75），不能也用默认质量——
+那样比较会退化成"默认 == 默认"，完全不校验编码参数。
+
+### 25. 只写"停止"是不够的，必须断言"停止之后还能重新开始"
+
+状态机类代码里，`stop` 分支常有一行把状态置回初始值的赋值（如
+`CameraUdpServer::onReadyRead` 里 `stop` 分支的 `sending = false;`）。
+这行赋值对"停止"本身往往是**冗余**的 —— 实测去掉它，停止行为完全不变，
+线上字节一模一样，因此**任何只测"停止后不再发"的用例都发现不了它的缺失**。
+
+它真正的作用在**恢复**路径：若停止时没有复位，再次启动的条件判断
+（`if (!sending) sendTimer->start();`）就不成立，**第二次使用永远起不来**，
+而界面不报任何错。
+
+因此对"有开始/有停止"的通路，必须覆盖完整序列：
+**开始 -> 收到数据 -> 停止 -> 再次开始 -> 必须能再次收到数据**。
+本轮对照实验正是靠这一条找出了 `getFrameAfterStopResumesPushing` 这个缺口。
 ## 开发约定
 
 - **标准**：C++11（不可使用 C++17 的 inline 变量等特性）
@@ -1087,7 +1200,8 @@ python3 tools/check_signatures.py .
 #     check_declared_signal_is_emitted / check_connect_signal_is_signal /
 #     check_abandoned_async_tasks / check_subproject_cmake_is_selfcontained /
 #     check_hex_parse_is_validated / check_load_state_reset / check_wire_format_constants_are_pinned /
-#     check_nonblock_pcm_handles_eagain / check_narrowing_cast_of_config
+#     check_nonblock_pcm_handles_eagain /
+#     check_gated_wire_paths_have_resume_test / check_narrowing_cast_of_config
 #     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
@@ -1102,6 +1216,7 @@ python3 tools/verify_config_state.py .
 python3 tools/verify_cross_target.py .
 python3 tools/verify_wire_format.py .
 python3 tools/verify_nonblock_pcm.py .
+python3 tools/verify_gated_resume.py .
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
 #     含「原实现对照」与随机模糊测试；无需编译即可验证定帧逻辑）

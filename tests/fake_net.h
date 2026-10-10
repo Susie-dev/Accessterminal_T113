@@ -21,9 +21,11 @@ namespace fakenet {
 
 /// 一次 sendto 的完整记录。
 struct Datagram {
-    int fd;
-    unsigned short destPort;   ///< 主机序（已从网络序还原）
-    unsigned int destAddr;     ///< 网络序原样保存
+    // 默认初始化：cppcheck 的 uninitMemberVarNoCtor 会告警，且未初始化的字段
+    // 在"某次 sendto 没被记录/记录不完整"时会给出难以察觉的假数据。
+    int fd = -1;
+    unsigned short destPort = 0;   ///< 主机序（已从网络序还原）
+    unsigned int destAddr = 0;     ///< 网络序原样保存
     std::vector<char> payload;
 };
 
@@ -57,6 +59,14 @@ std::vector<Datagram> received();
 
 int recvfromCount();
 int selectCount();
+
+// ---- 视频推送方向（CameraPushThread / UDP 23456）----
+
+/// 让下一批 socket() 失败（模拟 fd 耗尽）。
+void setSocketFail(bool fail);
+
+/// socket() 被调用的次数。
+int socketCount();
 
 } // namespace fakenet
 
