@@ -340,6 +340,165 @@ def check_json_configs(root):
                      f"实为 {type(node).__name__}")
 
 
+def check_deferred_session_guard(root, src_root):
+    """
+    延时任务必须保护“通话会话”有效性。
+
+    背景（真实缺陷，曾存在于 baseline 与本工程）：
+    widget.cpp 中音频播放线程是延迟 400ms 创建的，用于错开声卡争用：
+
+        QTimer::singleShot(400, this, [this]() {
+            m_audioReceiverThread = new AudioReceiverThread(m_audioSocketFd, this);
+            ...
+        });
+
+    但 hangUpCall() 会 ::close(m_audioSocketFd) 并把它置为 -1。
+    若在这 400ms 内通话被挂断（远端 recstop / 本地挂断 / 采集线程报
+    connectionLost），这个已排队的 lambda 仍会执行，于是
+    AudioReceiverThread 拿到 fd = -1；其 run() 随后对该 fd 调用
+    fcntl()、FD_SET()，属于未定义行为。
+
+    做法：找到 QTimer::singleShot(...) 的调用，检查其 lambda 体内是否
+    引用了通话期资源（m_audioSocketFd / m_audioSenderThread /
+    m_audioReceiverThread / m_cameraPushThread），若引用了，则要求
+    同一 lambda 内出现会话守卫（m_callActive 或 m_callGeneration）。
+    """
+    # 这些成员只在通话期间有效，且会被 hangUpCall() 销毁或置为无效。
+    guarded_members = (
+        "m_audioSocketFd",
+        "m_audioSenderThread",
+        "m_audioReceiverThread",
+        "m_cameraPushThread",
+    )
+    guard_tokens = ("m_callActive", "m_callGeneration")
+
+    for path in find_files(src_root, {".cpp"}):
+        raw = read(path)
+        text = strip_comments_and_strings(raw)
+        rel = os.path.relpath(path, root)
+
+        # 定位每个 QTimer::singleShot( 的起始位置
+        for m in re.finditer(r'QTimer\s*::\s*singleShot\s*\(', text):
+            start = m.end() - 1                      # 指向 '('
+            depth = 0
+            i = start
+            # 括号配平，取出整个调用表达式
+            while i < len(text):
+                ch = text[i]
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            if depth != 0:
+                continue
+            call_text = text[start:i + 1]
+
+            used = [name for name in guarded_members if name in call_text]
+            if not used:
+                continue
+            if any(tok in call_text for tok in guard_tokens):
+                continue
+
+            line_no = text.count("\n", 0, m.start()) + 1
+            fail("[deferred] {}:{} 延时任务引用了通话期资源 {}，"
+                 "但未检查会话有效性（m_callActive / m_callGeneration）；"
+                 "通话若在此之前挂断，这些资源已被关闭/销毁"
+                 .format(rel, line_no, "/".join(used)))
+
+
+def check_accept_gated_threads(root, src_root):
+    """
+    “音视频线程仅在 accept 之后创建”这一硬约束的结构化守卫。
+
+    背景：这是跨设备契约里最容易被重构破坏、又最难靠运行测试发现的一条。
+    空闲时零资源占用（不建线程、不占声卡与摄像头）是门口机的核心设计，
+    一旦有人把 new CameraPushThread / new AudioSenderThread /
+    new AudioReceiverThread 挪到别处（例如构造函数里“预建”），
+    功能上可能仍然正常，但空闲功耗与资源占用立刻退化，且没有测试会报警。
+
+    做法：
+      1. 定位唯一允许创建这些线程的函数 startCallSession()，取函数体；
+      2. 检查这三个线程的 new 表达式确实都在该函数体内；
+      3. 检查 startCallSession() 只在 Signal::Accept 分支被调用。
+    """
+    widget_cpp = os.path.join(src_root, "ui", "widget.cpp")
+    if not os.path.isfile(widget_cpp):
+        return  # 该项目结构不同，跳过
+
+    raw = read(widget_cpp)
+    text = strip_comments_and_strings(raw)
+    rel = os.path.relpath(widget_cpp, root)
+
+    # ---- 1. 取出 startCallSession() 的函数体 ----
+    m = re.search(r'\bWidget\s*::\s*startCallSession\s*\([^)]*\)\s*\{', text)
+    if not m:
+        fail("[gating] {} 找不到 Widget::startCallSession() 的定义；"
+             "该函数是音视频线程的唯一创建点，不允许改名或删除".format(rel))
+        return
+
+    # 从 '{' 开始做花括号配平，得到函数体范围
+    start = text.index('{', m.end() - 1)
+    depth = 0
+    i = start
+    while i < len(text):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    if depth != 0:
+        fail("[gating] {} startCallSession() 花括号不配平，无法分析".format(rel))
+        return
+    body = text[start:i + 1]
+    body_line0 = text.count("\n", 0, start)
+
+    # ---- 2. 三个线程的 new 必须都在函数体内 ----
+    for cls in ("CameraPushThread", "AudioSenderThread", "AudioReceiverThread"):
+        # 允许的创建写法：new CameraPushThread(...)
+        in_body = re.search(r'\bnew\s+' + cls + r'\b', body) is not None
+        # 全文里的创建位置（排除头文件里的成员声明）
+        all_sites = [mm.start() for mm in
+                     re.finditer(r'\bnew\s+' + cls + r'\b', text)]
+        if not in_body:
+            line_no = text.count("\n", 0, all_sites[0]) + 1 if all_sites else 0
+            where = "{}:{}".format(rel, line_no) if all_sites else "未找到创建点"
+            fail("[gating] {} 创建了 {} 却不在 startCallSession() 内（{}）；"
+                 "音视频线程只能在收到 accept 后创建，否则空闲时会有资源占用"
+                 .format(rel, cls, where))
+        # 函数体之外的创建点（若存在）同样有问题
+        for pos in all_sites:
+            if not (start <= pos <= i):
+                fail("[gating] {}:{} {} 的创建点位于 startCallSession() 之外；"
+                     "这破坏了“accept 之前不建流”的约定"
+                     .format(rel, text.count("\n", 0, pos) + 1, cls))
+
+    # ---- 3. startCallSession() 只能由 Signal::Accept 触发 ----
+    call_sites = [mm.start() for mm in
+                  re.finditer(r'\bstartCallSession\s*\(\s*\)', text)]
+    # 去掉函数定义自身与头文件中的声明（本文件内定义处已排除）
+    call_sites = [p for p in call_sites
+                  if not (m.start() <= p <= m.end())]
+    for pos in call_sites:
+        line_no = text.count("\n", 0, pos) + 1
+        # 往上看 6 行，应能看到 Accept 分支标记
+        head = text[:pos]
+        ctx_start = max(0, pos - 400)
+        ctx = text[ctx_start:pos]
+        if "Signal::Accept" not in ctx:
+            fail("[gating] {}:{} 调用了 startCallSession()，但邻近上下文没有 "
+                 "Signal::Accept 判断；该函数只允许在收到 accept 信令时调用"
+                 .format(rel, line_no))
+    if not call_sites:
+        fail("[gating] {} 没有任何地方调用 startCallSession()；"
+             "accept 将无法建立通话".format(rel))
+    _ = body_line0
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: python verify.py <项目根目录>")
@@ -358,6 +517,8 @@ def main():
     check_legacy_identifiers(root, src_root)
     check_qt5_portability(root, src_root)
     check_forward_declarations(root, src_root)
+    check_deferred_session_guard(root, src_root)
+    check_accept_gated_threads(root, src_root)
     check_json_configs(root)
 
     print(f"校验目录: {root}")

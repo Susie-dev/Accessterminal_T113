@@ -191,6 +191,24 @@ private:
     CameraPushThread* m_cameraPushThread = nullptr;
     int m_audioSocketFd = -1;  ///< 音视频共用的 UDP socket，由 Widget 统一持有
 
+    /// 通话会话是否处于活跃状态（accept 后置 true，hangUpCall() 置 false）。
+    ///
+    /// 存在的理由：音频播放线程是**延迟 400ms** 才创建的（错开声卡争用）。
+    /// 若在这 400ms 内通话就被挂断（远端 recstop、本地挂断按钮、或采集线程
+    /// 报告连接丢失），那个已排队的延时 lambda 仍会触发。没有本标志时它会
+    /// 用已经被 close() 并置为 -1 的 m_audioSocketFd 去建线程，线程进入
+    /// run() 后对 fd = -1 执行 fcntl/FD_SET，属于未定义行为。
+    ///
+    /// 所有“通话期间才有效”的延时/异步操作都必须先检查本标志。
+    bool m_callActive = false;
+
+    /// 通话会话代次计数器，每次 startCallSession() 递增。
+    ///
+    /// 配合 m_callActive 解决“旧延时任务误作用于新通话”的问题：
+    /// 延时任务在排队时记下当时的代次，执行时若代次已变则说明它属于一次
+    /// 已经结束的通话，必须丢弃。
+    quint64 m_callGeneration = 0;
+
     // ---- GPIO 与轮询线程 ----
     GpioPe4MonitorThread* m_pe4Thread = nullptr;
     // 开锁继电器与补光灯在硬件上共用同一条 GPIO（PE5，线号 133）。

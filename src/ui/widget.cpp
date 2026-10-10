@@ -429,6 +429,10 @@ void Widget::startCallSession()
         return;
     }
 
+    // 音频 socket 已就绪，通话会话正式开始。此后所有延时/异步操作都要用
+    // m_callActive 判断这次会话是否仍然有效（见 widget.h 中的说明）。
+    m_callActive = true;
+
     // ---- 2. 视频推流线程 ----
     if (m_cameraPushThread) {
         m_cameraPushThread->stop();
@@ -457,7 +461,26 @@ void Widget::startCallSession()
             this, &Widget::hangUpCall);
 
     // ---- 4. 音频播放线程：延迟 400ms 启动，避免与采集争用声卡 ----
-    QTimer::singleShot(400, this, [this]() {
+    //
+    // 用 m_callGeneration 作为“会话代次”令牌而不是只检查 m_callActive：
+    // 若本次通话在 400ms 内被挂断、随后又立刻接通了**新**的一次通话，
+    // 此时 m_callActive 已重新为 true，仅凭它无法区分“本代的延时任务”与
+    // “新一代的会话”，旧令牌会误在新通话上再建一个播放线程。
+    // 代次令牌使过期的延时任务必然失效。
+    const quint64 generation = ++m_callGeneration;
+    QTimer::singleShot(400, this, [this, generation]() {
+        // 会话已结束，或已被新一次通话取代：丢弃这个过期的延时任务。
+        if (!m_callActive || generation != m_callGeneration) {
+            qDebug() << "[音频] 延迟启动播放线程被跳过（会话已结束或已换代）";
+            return;
+        }
+        // 二重防御：fd 必须在建线程前仍然有效。
+        // 绝不能把 -1 传给 AudioReceiverThread —— 其 run() 会对该 fd 调用
+        // fcntl() 与 FD_SET()，属于未定义行为。
+        if (m_audioSocketFd < 0) {
+            qWarning() << "[音频] socket 已关闭，不启动播放线程";
+            return;
+        }
         if (m_audioReceiverThread) {
             m_audioReceiverThread->stop();
             m_audioReceiverThread->wait(kThreadStopTimeoutMs);
@@ -483,6 +506,12 @@ void Widget::startCallSession()
 
 void Widget::hangUpCall()
 {
+    // 第一件事就把会话标记为结束：此后任何尚未执行的延时任务（例如延迟
+    // 400ms 创建音频播放线程的那个）都会据此自行放弃，不会再去碰即将被
+    // 关闭的 socket。必须放在拆解逻辑之前。
+    m_callActive = false;
+    ++m_callGeneration;
+
     if (m_connAudioManager) {
         m_connAudioManager->stop();
     }
