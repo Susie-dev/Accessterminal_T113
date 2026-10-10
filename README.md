@@ -288,7 +288,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下二十条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下二十一条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -788,6 +788,38 @@ return QByteArray::fromHex(compact.toLatin1());
 自检见 `tools/verify_hex_parse.py`（5/5）。室内机侧另有可执行断言
 （`tests/test_app_config.cpp`）用真实 Qt 跑出上表结果，把该语义钉死。
 
+### 提示音播放（AudioManager）的可编程测试
+
+`AudioManager` 是本工程出过**两个真实缺陷**的类（第 11 轮 XRUN 静默丢数据、
+第 12 轮异步任务漏等待），而它的危险分支全在"设备报错 / 被打断 / 并发"上——
+真实 ALSA **无法按需制造 -EPIPE**，也无法让写入变慢以观察打断时机。
+
+因此 `tests/test_audio_manager.cpp` 链接一份**可编程的假 ALSA**
+（`tests/fake_alsa.cpp`，直接 include `tools/devstubs/alsa/asoundlib.h`，
+故每个函数签名都由头文件在编译期校验）。它用失败注入把那些从未被执行过的
+分支真正跑了一遍（13 个用例）：
+
+| 用例 | 钉住的行为 |
+| --- | --- |
+| `normalPlaybackWritesEveryChunkAndDrains` | 每块都写出、收尾用 drain、内容不错位 |
+| `negotiatesProtocolAudioFormat` | 协商为 S16_LE / 16000 / 单声道（与协议一致） |
+| `recoversFromXrunWithoutLosingData` | **XRUN 后 prepare 并重写同一包**（第 11 轮回归） |
+| `survivesXrunBeyondRetryLimit` | 重试超限后仍继续处理后续块，不提前结束 |
+| `fatalWriteErrorDoesNotAbortRemainingChunks` | 不可恢复错误只告警，不跳过剩余提示音 |
+| `interruptDropsInsteadOfDraining` | 被打断时 drop（丢弃尾巴），不是 drain |
+| `nextPlaybackInterruptsPreviousTask` | 上次播放**可以**被后续 `playAsync()` 打断 |
+| `destructorWaitsForAllRunningTasks` | 析构返回时句柄已配平、不再有新任务开始 |
+| `openFailureIsHandledGracefully` | 打不开设备：只告警，不崩溃、不多余 close |
+| `missingFileIsHandledGracefully` | 文件不存在：**已打开的句柄必须关闭** |
+| `playbackFinishedFiresEvenWhenInterrupted` | 被打断时 `playbackFinished` 仍会发射 |
+
+对照实验（还原修复后测试必须失败）确认了区分度：去掉 XRUN 重试会让
+`framesWritten` 立刻变少；`stop()` 不置位或忽略中断标志则 3 个打断类用例
+同时失败。**唯一例外**是析构用例：把它还原成"只等最后一个 future"后**仍然
+通过**，因为 `playPcmFile()` 入口的静态 `pcmMutex` 把各任务完全串行化，
+"只等最后一个"往往传递性地也等到了更早的任务。该用例因此只断言确实成立的
+性质，并在代码注释里写明这一局限——不留一条永远为真的"回归测试"。
+
 > 关于本检查的实现坑：`strip_comments_and_strings()` 会清空**字符字面量**
 > （`'0'` → `''`），所以判据**不能**基于 `QChar('0')` / `c >= '0'` 这类写法，
 > 只能识别"名字里含 hex 的校验型函数调用"。而且提取 `fromHex` 实参必须
@@ -845,7 +877,22 @@ python3 tools/verify.py . ../Accessterminal_desktop
 ```
 
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述二十条请以
+
+### 21. 提示音播放的控制流必须有可执行测试（假 ALSA）
+
+`AudioManager` 的危险分支是"XRUN / 被打断 / 并发"，而真实声卡**无法按需制造
+`-EPIPE`**、也无法让写入变慢来观察打断时机，所以这些分支长期只靠阅读代码
+判断，正是第 11 轮 XRUN 静默丢数据能存活至今的原因。
+
+`tests/fake_alsa.cpp` 提供一份可编程假 ALSA（`setEpipeFirst`、
+`setWriteDelayMs`、`setOpenFail`、`setFatalError` …），使 `AudioManager`
+**不加任何测试钩子**就能被驱动到每条出错路径。它直接 include
+`tools/devstubs/alsa/asoundlib.h`，因此签名与真实 ALSA 一致——不会因为参数
+类型不符而在链接期"碰巧能过"。
+
+新增类似"设备出错才走到"的代码时，请同样用失败注入把它跑起来；只做静态
+分析会重复第 11 轮的教训。
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述二十一条请以
 `verify.py` 的结果为准。
 
 ---

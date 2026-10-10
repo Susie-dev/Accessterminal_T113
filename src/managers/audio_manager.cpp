@@ -35,17 +35,20 @@ AudioManager::~AudioManager()
     // playAsync() 用 QtConcurrent::run 起后台任务，lambda 以 [=] 捕获了 this
     // 并会调用成员函数 playPcmFile()、发射 playbackStarted/playbackFinished。
     // 原实现析构函数为空，于是 Widget 析构（连带删除 parent 为 this 的
-    // AudioManager）时，若后台任务仍在播放，就会：
-    //   - 在已析构对象上 emit 信号（Qt 会访问已释放的 QObject 内部状态）
-    //   - playPcmFile() 读取已释放的成员
-    // 即典型的 use-after-free。
+    // AudioManager）时，若后台任务仍在播放，就会在已析构对象上 emit 信号
+    // （Qt 会访问已释放的 QObject 内部状态）并读取已释放的成员。
     //
-    // 为什么不能只 `waitForFinished()` 一个 future：
-    // playAsync() 每次都会把新任务赋给 playFuture，而 **QFuture 赋值不会等待
-    // 上一个任务**（只转移内部 d 指针）。因此上一次播放若尚未结束，它是被
-    // "丢弃"而非被等待的：它的 interruptFlag 已不是成员指向的那个对象，
-    // stop() 打不断它；析构也只等最后一个 future。结果就是析构返回后旧任务
-    // 仍在跑并访问已释放的 this。
+    // 为什么保存的是**全部** future：playAsync() 每次把新任务赋给 playFuture，
+    // 而 **QFuture 赋值不会等待**上一个任务（只转移内部 d 指针）。只留最后一个
+    // 就没人能等到更早的任务了，故用 playFutures 全量登记。
+    //
+    // 第 16 轮的澄清（实测后更正）：早先此处断言"旧任务的 flag 已不再是成员
+    // 指向的对象，stop() 打不断它"。**那是错的** —— lambda 捕获的是 shared_ptr
+    // 的拷贝，与成员指向同一个 atomic，playAsync() 开头的 stop() 照样能打断它。
+    // 又因为 playPcmFile() 入口持有静态 pcmMutex、各任务被完全串行化，
+    // "只等最后一个"往往恰好也等到了更早的任务。所以本修复消除的是一个**窗口**
+    // （任务在锁外 emit 信号期间对象被析构），而未必是必然的崩溃。
+    // 相关行为由 tests/test_audio_manager.cpp 固定。
     //
     // 顺序：先置中断标志（让所有循环尽快 drop 并返回），再等待全部结束，
     // 最后才让成员被销毁。仅等待而不置标志的话，一段较长的提示音会让析构

@@ -101,3 +101,37 @@ target_link_libraries(t113_test_app_config PRIVATE
 )
 
 add_test(NAME t113_app_config COMMAND t113_test_app_config)
+
+# ---------------------------------------------------------------------------
+# AudioManager 写循环 / XRUN 恢复 / 打断 / 析构等待
+#
+# 本工程出过两个真实缺陷的类（第 11 轮 XRUN 静默丢数据、第 12 轮
+# playAsync 漏等待导致 use-after-free），此前没有任何可执行测试。
+#
+# 危险分支全在"设备报错 / 被打断 / 并发"上，真实 ALSA 无法按需制造 -EPIPE、
+# 也无法让写入变慢以观察打断时机，因此本目标链接 tests/fake_alsa.cpp ——
+# 一份**可编程的假 ALSA**。它直接 include tools/devstubs/alsa/asoundlib.h，
+# 于是每个函数签名都由头文件在编译期校验，与真实 ALSA 接口一致。
+#
+# 注意：只构建本目标就能完整验证 AudioManager 的控制流，不需要真实声卡，
+# 也不需要 ALSA 开发库。
+# ---------------------------------------------------------------------------
+add_executable(t113_test_audio_manager
+    test_audio_manager.cpp
+    fake_alsa.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/managers/audio_manager.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/config/app_config.cpp   # 取 audioDevice()
+)
+
+target_include_directories(t113_test_audio_manager PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_LIST_DIR}                # fake_alsa.h
+    ${CMAKE_CURRENT_LIST_DIR}/../tools/devstubs  # <alsa/asoundlib.h>
+)
+
+target_link_libraries(t113_test_audio_manager PRIVATE
+    Qt5::Core
+    Qt5::Test
+)
+
+add_test(NAME t113_audio_manager COMMAND t113_test_audio_manager)
