@@ -402,7 +402,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下二十七条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下二十九条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -1222,7 +1222,7 @@ python3 tools/verify.py . ../Accessterminal_desktop
 > **已加载的模块**后才真正生效。这正是必须做故障注入的理由——**自检脚本自己
 > 也会骗人**。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述二十七条请以
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述二十九条请以
 `verify.py` 的结果为准。
 
 ---
@@ -1298,6 +1298,51 @@ python3 tools/verify.py . ../Accessterminal_desktop
 匹配被测规则的匹配模式（本轮另有 `startTimer()` 不匹配 `\bstart\s*\(`
 的实例，只因仓库里恰好存在真实文件才没暴露）。
 
+### 28. 断言"最终出现了什么"是不够的，还要断言"在错误的一侧发生之前什么都没出现"
+
+室内机的 `decodersArePerConnection` 首版只断言"最终出现了一条 `Call`"。而
+"所有连接共用同一个解码器"这个 bug **恰好也能产生一条** `Call`（A 连接的
+前半 + B 连接的后半拼起来），于是测试照样通过 —— 断言形式没错，却完全没有
+区分度。
+
+正确写法是在**错误的那一侧动作之前**插入一个否定断言：
+
+```cpp
+a.write("cal");  b.write("l\n");
+QTest::qWait(300);
+QCOMPARE(spy.count(), 0);   // ← 这一条才真正有区分度
+a.write("l\n");            // 只有补上 A 自己的后半，才应出现 Call
+```
+
+推广：任何"多方各自持有状态"的逻辑（按连接/按线程/按设备的映射），
+都要断言"**串味不会发生**"，而不只是"正确的那种情况最终能成功"。
+第 22 轮的对照实验正是这样抓到首版测试的空转断言。
+
+> 与本工程第 26 条的区别：第 26 条讲的是**同一个流程里两道守卫互为遮蔽**，
+> 要断言"外层守卫独有的效果"；本条讲的是**多方之间不得串味**，
+> 要断言"错误的一侧动作之前什么都没发生"。两者都是"否定断言"，
+> 但被否定的对象不同。
+
+### 29. 测试用 QSignalSpy 断言自定义类型前必须 `qRegisterMetaType`
+
+`Q_DECLARE_METATYPE` 只让 `QVariant::value<T>()` **编译**通过；跨越队列投递
+传递自定义类型还需要**运行时注册**，否则 Qt 打印
+"Cannot queue arguments of type ..." 并把参数丢成默认构造值 ——
+spy 里拿到的是 `Unknown` / `nullptr`，**断言失败的样子像被测代码的 bug**。
+
+第 22 轮逐项变异实测出的边界（不能笼统概括成"不注册就整片变哑"）：
+
+| 变异 | 失败用例 |
+| --- | --- |
+| 只去掉 `protocol::Signal` 注册 | 只有 `receivesExactWireBytes` |
+| 只去掉 `QTcpSocket*` 注册 | 只有 `replyWritesExactWireBytes` |
+| 两个都去掉 | 以上两条 |
+
+本工程的 `tests/interop/test_interop.cpp` 早就注册了这两个类型（并被这条规则
+复查通过），室内机侧新增的 `test_signaling_server.cpp` 一度漏掉、被此规则抓出。
+现由 `check_signalspy_types_are_registered` 强制，自检见
+`tools/verify_signalspy_metatype.py`（4/4）。
+
 ## 开发约定
 
 - **标准**：C++11（不可使用 C++17 的 inline 变量等特性）
@@ -1325,7 +1370,8 @@ python3 tools/check_signatures.py .
 #     check_hex_parse_is_validated / check_load_state_reset / check_wire_format_constants_are_pinned /
 #     check_nonblock_pcm_handles_eagain /
 #     check_gated_wire_paths_have_resume_test /
-#     check_fingerprint_ack_tag_is_validated / check_narrowing_cast_of_config
+#     check_fingerprint_ack_tag_is_validated /
+#     check_signalspy_types_are_registered / check_narrowing_cast_of_config
 #     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
@@ -1342,6 +1388,7 @@ python3 tools/verify_wire_format.py .
 python3 tools/verify_nonblock_pcm.py .
 python3 tools/verify_gated_resume.py .
 python3 tools/verify_fp_ack_tag.py .
+python3 tools/verify_signalspy_metatype.py .
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
 #     含「原实现对照」与随机模糊测试；无需编译即可验证定帧逻辑）
