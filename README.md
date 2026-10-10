@@ -198,6 +198,91 @@ virtual，无法继承覆盖，因此用**链接期替身** `tests/fake_fingerpr
 timeout 不会再调用 lambda。**那句注释描述的 use-after-free 在当前结构下
 无法发生**，该行属于防御性写法。已在测试里如实标注"不具区分度"。
 
+### 产线代码覆盖率：第一次量化，以及"94.4%"为什么是误导
+
+第 24 轮之前，本工程能说"9/9 通过"，但**从未量化过测试执行了多少产线代码**。
+补上 gcov 度量后，第一个数字是 **94.4%** —— 看着很好。实际是 **25.0%**。
+
+原因在于**分母**：那个 94.4% 只统计了**被链接进测试目标的 17 个文件**。
+另有 **19 个产线源文件（约 1972 行）从未被任何测试目标链接**，压根不出现在
+gcov 数据里：
+
+| 从未被任何测试链接的产线文件 | 近似可执行行 |
+| --- | --- |
+| `src/ui/widget.cpp` | 678 |
+| `src/hal/fingerprint_hailin.cpp` | 332 |
+| `src/ui/form_finger.cpp` | 162 |
+| `src/core/vision/v4l2_camera.cpp` | 131 |
+| `src/hal/gpio.cpp` | 105 |
+| `src/managers/face_manager.cpp` | 52 |
+| `src/ui/form_call.cpp` | 46 |
+| `src/ui/form_passwd.cpp` | 85 |
+| `src/managers/password_manager.cpp` | 19 |
+| 其余头文件与 `main.cpp` | — |
+
+**数字正确、口径错误，比没有数字更危险** —— 它会让人停止寻找缺口。
+
+`tools/run_coverage.sh` 一键产出：
+
+```
+已测文件 707 行（覆盖 671）+ 未测文件约 1972 行 = 分母 2679
+近似总覆盖率 = 25.0%   （上表那个 94.9% 仅描述已测文件）
+```
+
+#### 已测文件的明细与未覆盖行
+
+被测到的文件覆盖度其实相当高（707 行中 671 行，94.9%）：
+
+| 文件 | 可执行行 | 覆盖 | 覆盖率 |
+| --- | --- | --- | --- |
+| `src/config/app_config.cpp` | 89 | 89 | 100% |
+| `src/core/media/audio_sender_thread.cpp` | 51 | 51 | 100% |
+| `src/managers/audio_manager.cpp` | 69 | 68 | 98.6% |
+| `src/core/net/protocol.h` | 58 | 56 | 96.6% |
+| `src/hal/fingerprint_frame_parser.h` | 50 | 48 | 96.0% |
+| `src/core/media/audio_receiver_thread.cpp` | 93 | 89 | 95.7% |
+| `src/core/media/video_push_thread.cpp` | 31 | 29 | 93.5% |
+| `src/core/media/camera_preview_server.cpp` | 52 | 45 | 86.5% |
+| `src/core/net/signaling_client.cpp` | 61 | 45 | 73.8% |
+| `src/managers/fingerprint_manager.cpp` | 128 | 110 | 85.9% |
+
+`coverage_report.py --json` 会给出每个文件的**未覆盖行号**，直接指出测试没碰到
+的分支 —— 这比百分比可行动得多。"94%"不指向任何缺口，"第 87-88、91-92、
+124-131 行没执行"可以立刻去补。
+
+#### 由此补出的测试：SignalingClient 的错误与重连路径
+
+覆盖率数据立刻暴露出 `src/core/net/signaling_client.cpp` 有 16/61 行从未执行，
+恰好是**发送失败**与**断线重连**两条路径（47-51、87-92、124-139）—— 全在
+TCP 8887 这条硬约束路径上。互操作测试覆盖了正常收发，但"连不上时会不会退化
+成静默失败或疯狂重试"一直没人验证。
+
+新增 `tests/test_signaling_client.cpp`（12 个用例），用真实
+`QTcpServer`/`QTcpSocket` 走 127.0.0.1，覆盖发送失败、半包/多包解码、
+连接被拒、按间隔真的重试、`stop()` 后不再重试。该文件的覆盖率从 73.8% 提升，
+错误与重连分支全部被走到。
+
+##### 实测时序事实（改这些用例前必读）
+
+向 `127.0.0.1` 上无人监听的端口 `connectToHost`，失败**不是立刻返回**：
+`Connection refused` 约 **4.1 秒**后才到达。因此一轮重连的真实周期是
+
+```
+3 秒（重连定时器） + 约 4.1 秒（这次尝试失败） ≈ 7.1 秒
+```
+
+实测时间线：`t≈4.1s / 11.2s / 18.2s / 25.3s` 各一次 `errorOccurred`。
+
+**教训**：绝不要用"3 秒后应出现第二次错误"这类**基于设计常量的固定等待**。
+首版就是这么写的，断言失败 —— 看上去像"重连只安排未执行"的**真实缺陷**，
+实际是等待窗口短于一次真实往返。差一步就把正常代码误判成 bug。
+正确做法是用 `QTRY_*` 等待**属性**（计数增加），给它足够宽的上界。
+
+另一个反例：`start()` 后立刻 `stop()` 时，那次连接尝试**仍会**以错误收场
+（探针实测 t≈8.6s）。所以"stop 后不得重试"绝不能断言"零错误" —— 那会让
+正确代码失败。必须先把这次不可避免的错误等出来记为**基线**，再断言之后
+不再新增。
+
 ### 不可达槽与"平行实现"：为死代码写测试的陷阱
 
 第 23 轮审计发现：`FingerprintManager::startEnroll(int)` 有完整实现、有挂起
@@ -461,7 +546,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下三十一条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下三十三条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -1281,7 +1366,7 @@ python3 tools/verify.py . ../Accessterminal_desktop
 > **已加载的模块**后才真正生效。这正是必须做故障注入的理由——**自检脚本自己
 > 也会骗人**。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述三十一条请以
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述三十三条请以
 `verify.py` 的结果为准。
 
 ---
@@ -1428,6 +1513,36 @@ spy 里拿到的是 `Unknown` / `nullptr`，**断言失败的样子像被测代�
 这与"协议常量必须被测试钉住"（第 17 条）是同一思路的延伸：**能用运行时
 测试就用运行时测试，不能用就用静态契约，但绝不能没人守**。
 
+### 32. 报覆盖率必须连**分母**一起报，否则数字本身就是误导
+
+第 24 轮第一次量化覆盖率得到 94.4%，看着很好；把从未被任何测试目标链接的
+产线文件折进分母后，真实值是 **25.0%**。差别全在口径：那个 94.4% 只统计了
+被链接进测试的 17 个文件，另有 19 个产线文件（约 1972 行，含 `widget.cpp`
+678 行）压根不出现在 gcov 数据里。
+
+**数字正确、口径错误，比没有数字更危险** —— 它会让人停止寻找缺口。
+
+规则：凡声称覆盖率，必须同时给出"已测文件 / 产线文件总数"与未测清单。
+`check_coverage_denominator_is_declared` 会强制 `tools/coverage_report.py`
+既列出未测文件、又输出折入未测文件后的真实总覆盖率。
+
+### 33. 故障注入的"全部仍然通过"要先怀疑**夹具**，不是被测代码
+
+第 24 轮给 `test_signaling_client.cpp` 做故障注入自检时，前两版夹具都因
+**路径**问题而静默失效（bash 把 MSYS 路径传给 Windows Python；构建目录用了
+MSYS 的 `/tmp`，Windows 侧看不到），结果 6 个变异**全部**报"仍然通过" ——
+看上去像"测试全是假绿"，实际一个变异都没注入成功。
+
+把"夹具坏了"当成"产品有缺陷"写进结论，就是自己制造了一个假 bug。
+
+规则：故障注入夹具必须**自证**三件事：
+  1. 变异确实改动了文件（写入后重新读回比对）；
+  2. 目标 `.obj` 的时间戳确实更新了（跑的确实是新二进制）；
+  3. 锚点在源文件中**唯一**（`count == 1`）。
+任一不满足即判**夹具错误**，不得计入"仍然通过"。
+
+跨 shell/解释器传路径时，统一用**目标解释器认识的形式**。
+
 ## 开发约定
 
 - **标准**：C++11（不可使用 C++17 的 inline 变量等特性）
@@ -1458,7 +1573,8 @@ python3 tools/check_signatures.py .
 #     check_fingerprint_ack_tag_is_validated /
 #     check_signalspy_types_are_registered /
 #     check_declared_slot_is_reachable /
-#     check_live_fingerprint_enroll_sequence_is_pinned / check_narrowing_cast_of_config
+#     check_live_fingerprint_enroll_sequence_is_pinned /
+#     check_coverage_denominator_is_declared / check_narrowing_cast_of_config
 #     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
@@ -1477,6 +1593,8 @@ python3 tools/verify_gated_resume.py .
 python3 tools/verify_fp_ack_tag.py .
 python3 tools/verify_signalspy_metatype.py .
 python3 tools/verify_dead_slot.py .
+python3 tools/verify_signaling_client_test.py .
+bash tools/run_coverage.sh
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
 #     含「原实现对照」与随机模糊测试；无需编译即可验证定帧逻辑）

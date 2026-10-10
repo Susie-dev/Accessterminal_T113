@@ -314,3 +314,32 @@ target_link_libraries(t113_test_fingerprint_manager PRIVATE
 )
 
 add_test(NAME t113_fingerprint_manager COMMAND t113_test_fingerprint_manager)
+
+# ---------------------------------------------------------------------------
+# SignalingClient：门口机侧 TCP 8887 信令客户端
+#
+# 第 24 轮首次量化覆盖率后发现 signaling_client.cpp 有 16/61 行从未执行，
+# 恰好是**发送失败**与**断线重连**两条路径（47-51、87-92、124-139）。这几行
+# 全在 TCP 8887 这条硬约束路径上：互操作测试覆盖了正常收发，但"连不上时会
+# 不会退化成静默失败或疯狂重试"没人验证过。
+#
+# 本目标用真实 QTcpServer/QTcpSocket 走 127.0.0.1：连接被拒、3 秒后真的
+# 重试、stop() 后不再重试 —— 全部靠可观测信号计数判定，不看内部标志位。
+# ---------------------------------------------------------------------------
+add_executable(t113_test_signaling_client
+    test_signaling_client.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/core/net/signaling_client.cpp
+)
+
+target_include_directories(t113_test_signaling_client PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_LIST_DIR}
+)
+
+target_link_libraries(t113_test_signaling_client PRIVATE
+    Qt5::Core
+    Qt5::Test
+    Qt5::Network
+)
+
+add_test(NAME t113_signaling_client COMMAND t113_test_signaling_client)
