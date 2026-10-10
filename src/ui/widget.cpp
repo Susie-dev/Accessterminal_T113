@@ -824,9 +824,19 @@ void Widget::updateFrame()
         // m_faceCascade 是生成检测器前就要用到的成员，因此在提交任务时就
         // 把分类器按值拷贝进 lambda，避免任务体内再触碰 this 的成员。
         QPointer<Widget> self(this);
-        const cv::CascadeClassifier cascade = m_faceCascade;
+        // 必须是**非 const** 拷贝：cv::CascadeClassifier::detectMultiScale()
+        // 不是 const 成员函数（内部有可变的缓存/状态），用 const 对象调用会
+        // 编不过：
+        //   error: passing 'const cv::CascadeClassifier' as 'this' argument
+        //          discards qualifiers [-fpermissive]
+        // 按值拷贝进 lambda 的初衷（避免任务体内再触碰 this 的成员）不变。
+        cv::CascadeClassifier cascade = m_faceCascade;
         const QImage small = frame.scaled(kDetectWidth, kDetectHeight, Qt::KeepAspectRatio);
-        QtConcurrent::run([self, small, cascade]() {
+        // 注意 lambda 必须带 mutable：lambda 的 operator() 默认是 const，
+        // 按值捕获的 cascade 在体内就成了 const 对象，而
+        // cv::CascadeClassifier::detectMultiScale() 不是 const 成员，
+        // 于是即使外面不加 const 仍然编不过（同上一条错误）。
+        QtConcurrent::run([self, small, cascade]() mutable {
             if (self.isNull()) {
                 return; // Widget 已析构，直接放弃本次检测
             }

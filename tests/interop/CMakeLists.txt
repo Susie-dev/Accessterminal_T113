@@ -16,6 +16,12 @@ set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
+# 注册 add_test 前必须启用测试，否则该注册是"哑"的：
+# 构建成功、CTestTestfile.cmake 不生成，ctest 报 "No tests were found!!!"。
+# run_interop.sh 目前直接运行可执行文件，不依赖 ctest，因此这个缺陷此前一直
+# 没有暴露；启用后 ctest 也能驱动同一套用例（两种入口等价）。
+enable_testing()
+
 find_package(Qt5 5.12 REQUIRED COMPONENTS Core Network Test)
 
 if(NOT DESKTOP_REPO OR NOT T113_REPO)

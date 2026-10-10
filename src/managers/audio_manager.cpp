@@ -59,9 +59,15 @@ void AudioManager::waitForAllTasks()
 {
     // 先搬出来再等待：等待过程中不会再有新任务加入（调用方已 stop()），
     // 但清空成员可以避免下一轮 playAsync() 把已完成的 future 越积越多。
-    const QVector<QFuture<void>> pending = playFutures;
+    //
+    // 注意 pending 与循环变量都**不能**加 const：QFuture::waitForFinished()
+    // 不是 const 成员（它要修改内部 d 的状态），const 引用会编不过：
+    //   error: passing 'const QFuture<void>' as 'this' argument discards
+    //          qualifiers [-fpermissive]
+    // 而 isRunning() 是 const，所以这里对 f 用非 const 引用即可两者兼顾。
+    QVector<QFuture<void>> pending = playFutures;
     playFutures.clear();
-    for (const QFuture<void>& f : pending) {
+    for (QFuture<void>& f : pending) {
         if (f.isRunning()) {
             f.waitForFinished();
         }

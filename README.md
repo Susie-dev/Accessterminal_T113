@@ -82,6 +82,26 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+### 单元测试（无 ALSA 的开发机也能跑）
+
+主工程的根 `CMakeLists.txt` 需要 ALSA，而 ALSA 在 Windows/macOS 上装不了，
+因此上面那条命令在开发机上通常走不通。单元测试只依赖 `Qt5::Core`/`Qt5::Test`
+（纯协议编解码与指纹帧解析逻辑，不碰硬件），可以**独立构建**：
+
+```sh
+cmake -S tests -B /tmp/t113-tests -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/t113-tests
+ctest --test-dir /tmp/t113-tests --output-on-failure
+```
+
+跨工程信令互通测试同理，见 `tests/interop/run_interop.sh`（同样不依赖 ALSA）。
+
+> **注意**：这两条路径此前实际上是坏的 —— `tests/CMakeLists.txt` 缺
+> `cmake_minimum_required`/`project()`，配置阶段就直接失败；补上之后又会
+> 因为缺 `enable_testing()` 而"构建成功、`ctest` 一个用例都不跑"。这类
+> 失败**只看构建退出码会被误判为通过**，故已由 `check_subproject_cmake_is_selfcontained`
+> 强制（自检见 `tools/verify_subcmake.py`，8/8 用例）。
+
 ### 主机端编译验证（无 ALSA/libgpiod 的开发机可用）
 
 ALSA 与 libgpiod 是 Linux 专有接口，Windows/macOS 开发机上装不了；但没有
@@ -268,7 +288,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下十五条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下十六条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -716,7 +736,30 @@ void waitForAllTasks();               // 析构中调用（先 stop() 再等）
 `widget.cpp` 的人脸检测那样不把结果赋给任何变量、且自带 `QPointer` 守卫的
 任务不存在"被覆盖丢弃"的问题。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述十五条请以
+### 16. 可独立构建的子工程 CMake 必须自包含
+
+`tests/CMakeLists.txt`、`tests/interop/CMakeLists.txt` 这类**既能作为主工程的
+子目录、又能被单独 `cmake -S tests`** 的文件，必须自带：
+
+| 必须有 | 缺了会怎样 |
+|---|---|
+| `cmake_minimum_required()` | 配置阶段直接失败：`No cmake_minimum_required command is present` |
+| `project()` | 同上，CMake 要求顶层脚本必须有 `project()` |
+| `enable_testing()` | **配置成功、构建成功，`ctest` 报 `No tests were found!!!`** |
+| `set(CMAKE_AUTOMOC ON)` | 测试文件里 `#include "test_xxx.moc"` 找不到 |
+
+作为子目录时这几行是幂等的（主 CMakeLists 已提供），所以对两种用法都安全。
+
+第三种最危险：构建退出码为 0，看起来一切正常，**实际一个用例都没执行**。
+在有 ALSA 的机器上用主工程构建时 `enable_testing()` 由顶层提供，缺陷被掩盖；
+只有在没有 ALSA 的开发机上走"独立构建"这条唯一可行的路时才会暴露 —— 而
+那条路此前从未被真正跑通过。
+
+用 `check_subproject_cmake_is_selfcontained` 强制，自检见
+`tools/verify_subcmake.py`（8/8 用例，含"缺 enable_testing""缺 AUTOMOC 但
+无 `.moc` include（真阴性）"等）。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述十六条请以
 `verify.py` 的结果为准。
 
 ---
@@ -744,7 +787,7 @@ python3 tools/check_signatures.py .
 # 2b. 校验器自检：对 check_config_value_sanity / check_config_knobs_are_used /
 #     check_no_running_reset_in_run / check_no_secret_in_logs /
 #     check_declared_signal_is_emitted / check_connect_signal_is_signal /
-#     check_abandoned_async_tasks
+#     check_abandoned_async_tasks / check_subproject_cmake_is_selfcontained
 #     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
@@ -753,6 +796,7 @@ python3 tools/verify_secret_logs.py .
 python3 tools/verify_dead_signal.py .
 python3 tools/verify_connect_signal.py .
 python3 tools/verify_abandoned_task.py .
+python3 tools/verify_subcmake.py .
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
 #     含「原实现对照」与随机模糊测试；无需编译即可验证定帧逻辑）
@@ -774,6 +818,10 @@ bash tools/check_host_link.sh
 
 # 6. 跨工程信令互通（需同级目录存在 Accessterminal_desktop）
 bash tests/interop/run_interop.sh
+
+# 7. 单元测试（独立构建，不需要 ALSA）
+cmake -S tests -B /tmp/t113-tests -G Ninja && cmake --build /tmp/t113-tests \
+  && ctest --test-dir /tmp/t113-tests --output-on-failure
 ```
 
 以上脚本在 CI 中也可直接使用，退出码非 0 即表示失败。
@@ -781,6 +829,8 @@ bash tests/interop/run_interop.sh
 第 1~3 步是静态检查，速度快但覆盖有限；**第 4、5 步不能省**——
 像“前置声明了不存在的类名”“把 ALSA 枚举存成 int 再传回枚举形参”
 这类缺陷只有编译器能发现，“漏定义某个符号”只有链接器能发现。
+第 7 步同样不能省：**只有构建退出码、却没有任何用例被执行**是最容易被
+误判为“测试通过”的失败模式（本轮就修掉了一例）。
 
 第 3b 步（cppcheck）介于两者之间：它不需要编译器和 Qt 就能做数据流分析，
 在没有工具链的机器上也能跑，是本工程唯一可用的“半编译级”检查手段。
