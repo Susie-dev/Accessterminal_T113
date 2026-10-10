@@ -13,6 +13,10 @@
 #include <QTimer>
 // 引入系统或第三方头文件 <QElapsedTimer>。
 #include <QElapsedTimer>
+// 引入系统或第三方头文件 <QList>（待处理帧队列使用）。
+#include <QList>
+// 引入串口帧解析器（纯逻辑，可单元测试）。
+#include "hal/fingerprint_frame_parser.h"
 
 // 声明类 HailinFingerprint。
 class HailinFingerprint : public QObject {
@@ -81,6 +85,17 @@ private:
     QString m_portName;
     // 执行本行语句完成对应变量、对象或业务状态处理。
     QMutex m_mutex;
+
+    // 串口字节流帧解析器。**必须是成员**而非 readPacket() 的局部变量：
+    // 原实现在函数内用局部 QByteArray 累积数据，解析出第一帧后其余字节
+    // 随局部变量一起丢弃，超时返回时半包也一并丢失（详见
+    // fingerprint_frame_parser.h 顶部说明）。作为成员后，残留字节可跨调用
+    // 保存，一次 readAll() 收到的多帧也不会丢。
+    accessterminal::FingerprintFrameParser m_parser;
+    // 已从解析器取出但尚未被上层消费的完整帧队列。
+    // 一次 feed() 可能切出多帧，而 readPacket() 每次只返回一帧，
+    // 故需要在这里排队，避免“多出来的帧”被丢掉。
+    QList<QByteArray> m_pendingFrames;
 
     // 定义或声明函数 calcChecksum。
     quint16 calcChecksum(const QByteArray& pkt);

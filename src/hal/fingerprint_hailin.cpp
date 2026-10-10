@@ -49,6 +49,15 @@ bool HailinFingerprint::open() {
     }
     // 执行本行语句完成对应变量、对象或业务状态处理。
     debug(QString("[指纹] 串口打开成功: %1").arg(m_portName));
+    // 新会话开始：清空解析状态与驱动侧残留字节。上电/重连时模块可能已在
+    // 发送上一轮的应答，若不清空，这些旧字节会与本次请求的应答混在一起，
+    // 让“发一帧收一帧”的时序错位。
+    // 执行本行语句完成对应变量、对象或业务状态处理。
+    m_parser.reset();
+    // 执行本行语句完成对应变量、对象或业务状态处理。
+    m_pendingFrames.clear();
+    // 执行本行语句完成对应变量、对象或业务状态处理。
+    m_serial.clear();
     // 返回当前函数的执行结果或结束函数。
     return true;
 // 结束当前代码块作用域。
@@ -62,6 +71,12 @@ void HailinFingerprint::close() {
     if (m_serial.isOpen()) {
         // 执行本行语句完成对应变量、对象或业务状态处理。
         m_serial.close();
+        // 关闭时清空解析状态：半包与排队帧都属于上一个会话，若留到下次
+        // 打开，会把旧字节拼到新会话的数据前，导致解析持续错位。
+        // 执行本行语句完成对应变量、对象或业务状态处理。
+        m_parser.reset();
+        // 执行本行语句完成对应变量、对象或业务状态处理。
+        m_pendingFrames.clear();
         // 执行本行语句完成对应变量、对象或业务状态处理。
         debug("[指纹] 串口已关闭");
     // 结束当前代码块作用域。
@@ -372,8 +387,13 @@ bool HailinFingerprint::sendPacket(const QByteArray& pkt) {
 
 // 定义或声明函数 HailinFingerprint::readPacket。
 QByteArray HailinFingerprint::readPacket(int timeoutMs) {
-    // 创建或使用字节数组保存协议或音视频数据。
-    QByteArray buf;
+    // 先把上次残留的完整帧消费掉。一次 feed() 可能切出多帧，而本函数每次
+    // 只返回一帧，多出来的帧存在 m_pendingFrames 里，不能丢——否则表现为
+    // “注册随机失败”：下一次调用会一直等一帧永远不来的应答而超时。
+    if (!m_pendingFrames.isEmpty()) {
+        return m_pendingFrames.takeFirst();
+    }
+
     // 执行本行语句完成对应变量、对象或业务状态处理。
     QElapsedTimer timer;
     // 执行本行语句完成对应变量、对象或业务状态处理。
@@ -382,31 +402,28 @@ QByteArray HailinFingerprint::readPacket(int timeoutMs) {
     while (timer.elapsed() < timeoutMs) {
         // 根据条件判断是否执行该分支。
         if (m_serial.waitForReadyRead(100)) {
-            // 执行本行语句完成对应变量、对象或业务状态处理。
-            buf += m_serial.readAll();
-            // 尝试解析完整包
-            // 根据条件判断是否执行该分支。
-            if (buf.size() >= 12) {
-                // 包头2+地址4+标识1+长度2+payload+校验2
-                // 执行本行语句完成对应变量、对象或业务状态处理。
-                quint16 pktLen = ((quint8)buf[7] << 8) | (quint8)buf[8];
-                // 执行本行语句完成对应变量、对象或业务状态处理。
-                int totalLen = 9 + pktLen;
-                // 根据条件判断是否执行该分支。
-                if (buf.size() >= totalLen) {
-                    // 当前实现取第一个完整包返回；若串口噪声较多，可再补包头同步和校验验证。
-                    // 创建或使用字节数组保存协议或音视频数据。
-                    QByteArray pkt = buf.left(totalLen);
-                    //debug("[指纹] 接收: " + pkt.toHex(' '));
-                    // 返回当前函数的执行结果或结束函数。
-                    return pkt;
-                // 结束当前代码块作用域。
-                }
-            // 结束当前代码块作用域。
+            // 交给解析器定帧：它跨调用保存半包，且一次喂入可切出多帧。
+            // 原实现用局部 buf 累积并 `return buf.left(totalLen)`，会把
+            // 同一次 readAll() 里的后续帧和超时时的半包一起丢弃。
+            const QList<QByteArray> frames = m_parser.feed(m_serial.readAll());
+            if (frames.isEmpty()) {
+                // 本次没凑出完整帧，继续等（半包已留在解析器内部）。
+                continue;
             }
+            // 第一帧返回给调用方，其余排队供后续 readPacket() 取用。
+            for (int i = 1; i < frames.size(); ++i) {
+                m_pendingFrames.append(frames.at(i));
+            }
+            // 返回当前函数的执行结果或结束函数。
+            return frames.at(0);
         // 结束当前代码块作用域。
         }
     // 结束当前代码块作用域。
+    }
+    // 超时：不返回半包（半包仍留在解析器中，下次喂入可继续拼），
+    // 但若此时已有完整帧排队，仍应返回它而不是空。
+    if (!m_pendingFrames.isEmpty()) {
+        return m_pendingFrames.takeFirst();
     }
     // 返回当前函数的执行结果或结束函数。
     return QByteArray();

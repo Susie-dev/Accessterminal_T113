@@ -21,3 +21,19 @@ target_link_libraries(test_protocol PRIVATE
 )
 
 add_test(NAME protocol COMMAND test_protocol)
+
+# ---------------------------------------------------------------------------
+# 指纹串口帧解析测试（纯逻辑，无需硬件）
+# ---------------------------------------------------------------------------
+add_executable(test_fingerprint_parser test_fingerprint_parser.cpp)
+
+target_include_directories(test_fingerprint_parser PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(test_fingerprint_parser PRIVATE
+    Qt5::Core
+    Qt5::Test
+)
+
+add_test(NAME fingerprint_parser COMMAND test_fingerprint_parser)

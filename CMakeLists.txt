@@ -133,6 +133,7 @@ set(APP_HEADERS
     src/core/media/video_push_thread.h
     src/core/vision/v4l2_camera.h
 
+    src/hal/fingerprint_frame_parser.h
     src/hal/fingerprint_hailin.h
     src/hal/gpio.h
 

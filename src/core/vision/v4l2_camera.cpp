@@ -21,16 +21,17 @@
 // 逐行注释：引入系统或第三方头文件 <QMutexLocker>。
 #include <QMutexLocker>
 
-// 逐行注释：继续当前代码块的参数、表达式或结构定义。
-extern "C" {
-    // 逐行注释：执行本行语句完成对应变量、对象或业务状态处理。
-    extern unsigned char* g_last_jpeg;
-    // 逐行注释：执行本行语句完成对应变量、对象或业务状态处理。
-    extern size_t g_last_jpeg_size;
-    // 逐行注释：执行本行语句完成对应变量、对象或业务状态处理。
-    extern pthread_mutex_t g_jpeg_mutex;
-// 逐行注释：结束当前代码块作用域。
-}
+// 说明：这里原有一段 extern "C" 声明，引用 g_last_jpeg / g_last_jpeg_size /
+// g_jpeg_mutex 三个全局量。它们来自更早的版本——当时这三个变量定义在
+// widget.cpp 里，用于把最后一帧 JPEG 跨模块传递。重构后改用
+// V4L2Camera::lastFrame + frameMutex 封装（见下方的 getFrame/captureLoop），
+// widget.cpp 中的定义已删除，这三个名字在全工程内既无定义也无引用。
+//
+// 声明未使用的 extern 变量不会产生链接错误（不构成未定义引用），
+// 因此编译一直是通过的，但留着会造成两点误导：
+//   1. 让人以为存在一个仍需维护的全局帧缓冲；
+//   2. pthread_mutex_t 强制引入 <pthread.h> 依赖，而本文件并不需要。
+// 故一并移除。
 
 // 逐行注释：定义类 V4L2Camera 的成员函数 V4L2Camera。
 V4L2Camera::V4L2Camera(const QString& devPath)
