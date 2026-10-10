@@ -1518,6 +1518,81 @@ def check_no_running_reset_in_run(root, src_root):
                     break
 
 
+def check_abandoned_async_tasks(root, src_root):
+    """
+    用 `QtConcurrent::run` 启动、且把结果只赋给**单个变量**的异步任务，
+    必须在同一函数里把 future 收集进容器，否则上一次任务会被"丢弃仍在运行"。
+
+    背景（真实缺陷，本轮修复）：
+    `AudioManager::playAsync()` 每次播放都做三件事：
+
+        stop();                                       // 置旧标志
+        interruptFlag = std::make_shared<std::atomic<bool>>(false);
+        playFuture = QtConcurrent::run([=]() { ... 捕获 this ... });
+
+    而 **`QFuture` 赋值不会等待上一个任务结束**（只转移内部 d 指针的引用，
+    `~QFuture()` 也不阻塞）。于是上一次播放若尚未结束，它就成了"被丢弃但仍在
+    运行"的任务：
+
+      - 它捕获的 `flag` 已不再是 `interruptFlag` 指向的对象，`stop()` 再也
+        打不断它（会把整段提示音播完，并继续持有静态 pcmMutex）；
+      - 析构若只 `waitForFinished()` 最后一个 future，旧任务完全不被等待，
+        `~AudioManager()` 返回后它仍在 emit 信号、读成员 —— use-after-free。
+
+    判定规则：某函数内出现 `X = QtConcurrent::run(...)`，且整个函数体内
+    **没有任何** future 收集动作（`isRunning()` 过滤后 `append` 到容器），
+    即判定为缺陷。理由是这类"每次播放都覆盖同一个成员"的写法必然会在第二次
+    调用时丢弃第一次的任务；只有把未完成的 future 收集起来，析构才可能等到
+    全部任务（本工程修复后的写法正是如此）。
+
+    不误伤"即发即忘"用法（`QtConcurrent::run(...)` 不赋给任何变量）：那类任务
+    自带 QPointer 守卫，没有"被覆盖丢弃"的问题，见 widget.cpp 的人脸检测。
+    """
+    for path in find_files(src_root, {".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        rel = os.path.relpath(path, root)
+        if "QtConcurrent::run" not in text:
+            continue
+
+        funcs = list(re.finditer(
+            r'^[\w:<>,\s\*&]+\b(\w+)\s*::\s*(\w+)\s*\([^;]*?\)\s*(?:const\s*)?\{',
+            text, re.M))
+        for fm in funcs:
+            body_start = fm.end() - 1
+            depth, i = 0, body_start
+            while i < len(text):
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            body = text[body_start:i + 1]
+            if "QtConcurrent::run" not in body:
+                continue
+
+            assigned = re.findall(
+                r'\b(\w+)\s*=\s*QtConcurrent\s*::\s*run\s*\(', body)
+            if not assigned:
+                continue  # 即发即忘，不判定
+
+            # 收集动作：先把已完成的滤掉，再把仍在运行的收进容器。
+            collects = bool(re.search(r'\.\s*append\s*\(', body)) and \
+                bool(re.search(r'\bisRunning\s*\(', body))
+            if collects:
+                continue
+
+            line = text.count("\n", 0, fm.start()) + 1
+            fail("[abandoned-task] {}:{} {}() 里由 QtConcurrent::run 启动的异步"
+                 "任务被直接赋给 \"{}\" 且未收集进容器。QFuture 赋值不会等待"
+                 "上一个任务，故上一次仍在运行的任务会被丢弃：它捕获的 this 在"
+                 "析构时不被等待会变成 use-after-free，它捕获的中断标志也不再受"
+                 "stop() 影响。应把未完成的 future 收集起来，并在析构时逐个 "
+                 "waitForFinished()。"
+                 .format(rel, line, fm.group(2), "/".join(sorted(set(assigned)))))
+
+
 def check_no_secret_in_logs(root, src_root):
     """
     禁止把密码/密钥等敏感值打进日志。
@@ -1649,6 +1724,7 @@ def main():
     check_config_knobs_are_used(root, src_root)
     check_no_running_reset_in_run(root, src_root)
     check_declared_signal_is_emitted(root, src_root)
+    check_abandoned_async_tasks(root, src_root)
     check_no_secret_in_logs(root, src_root)
 
     print(f"校验目录: {root}")

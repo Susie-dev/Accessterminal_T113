@@ -30,21 +30,43 @@ AudioManager::AudioManager(QObject* parent)
 // 定义类 AudioManager 的成员函数 ~AudioManager。
 AudioManager::~AudioManager()
 {
-    // 关键：必须等异步播放任务真正结束后再析构。
+    // 关键：必须等**所有**异步播放任务真正结束后再析构。
     //
-    // playAsync() 用 QtConcurrent::run 起了一个后台任务，该任务的 lambda
-    // 以 [=] 捕获了 this 并会调用成员函数 playPcmFile()、发射
-    // playbackStarted/playbackFinished 信号。原实现析构函数为空，
-    // 于是当 Widget 析构（连带删除 parent 为 this 的 AudioManager）时，
-    // 若后台任务恰好还在播放一段音频，就会出现：
+    // playAsync() 用 QtConcurrent::run 起后台任务，lambda 以 [=] 捕获了 this
+    // 并会调用成员函数 playPcmFile()、发射 playbackStarted/playbackFinished。
+    // 原实现析构函数为空，于是 Widget 析构（连带删除 parent 为 this 的
+    // AudioManager）时，若后台任务仍在播放，就会：
     //   - 在已析构对象上 emit 信号（Qt 会访问已释放的 QObject 内部状态）
     //   - playPcmFile() 读取已释放的成员
     // 即典型的 use-after-free。
     //
-    // 顺序很重要：先置中断标志（让循环尽快 drop 并返回），再 waitForFinished
-    // 等它退出，最后才让成员被销毁。仅 waitForFinished 而不置标志的话，
-    // 一段较长的提示音会让析构阻塞到整段播完。
+    // 为什么不能只 `waitForFinished()` 一个 future：
+    // playAsync() 每次都会把新任务赋给 playFuture，而 **QFuture 赋值不会等待
+    // 上一个任务**（只转移内部 d 指针）。因此上一次播放若尚未结束，它是被
+    // "丢弃"而非被等待的：它的 interruptFlag 已不是成员指向的那个对象，
+    // stop() 打不断它；析构也只等最后一个 future。结果就是析构返回后旧任务
+    // 仍在跑并访问已释放的 this。
+    //
+    // 顺序：先置中断标志（让所有循环尽快 drop 并返回），再等待全部结束，
+    // 最后才让成员被销毁。仅等待而不置标志的话，一段较长的提示音会让析构
+    // 阻塞到整段播完。
     stop();
+    waitForAllTasks();
+}
+
+// 定义或声明函数 AudioManager::waitForAllTasks。
+void AudioManager::waitForAllTasks()
+{
+    // 先搬出来再等待：等待过程中不会再有新任务加入（调用方已 stop()），
+    // 但清空成员可以避免下一轮 playAsync() 把已完成的 future 越积越多。
+    const QVector<QFuture<void>> pending = playFutures;
+    playFutures.clear();
+    for (const QFuture<void>& f : pending) {
+        if (f.isRunning()) {
+            f.waitForFinished();
+        }
+    }
+    // playFuture 是"最近一个任务"的别名（供既有代码/日志使用），一并失效。
     if (playFuture.isRunning()) {
         playFuture.waitForFinished();
     }
@@ -56,6 +78,19 @@ void AudioManager::playAsync(const QString& pcmFilePath)
 {
     // 继续当前代码块的参数、表达式或结构定义。
     stop(); // 打断上一次
+    // 回收已经结束的任务，避免 playFutures 无限增长。
+    // 注意这里**只清理已完成的**：仍在运行的任务必须保留在列表里，
+    // 否则析构时又会漏等它（这正是原实现只留一个 future 的缺陷）。
+    {
+        QVector<QFuture<void>> alive;
+        alive.reserve(playFutures.size() + 1);
+        for (const QFuture<void>& f : playFutures) {
+            if (f.isRunning()) {
+                alive.append(f);
+            }
+        }
+        playFutures = alive;
+    }
     // 执行本行语句完成对应变量、对象或业务状态处理。
     interruptFlag = std::make_shared<std::atomic<bool>>(false);
     // 使用自动类型推导保存表达式结果。
@@ -70,6 +105,8 @@ void AudioManager::playAsync(const QString& pcmFilePath)
         emit playbackFinished(pcmFilePath);
     // 结束当前代码块作用域。
     });
+    // 与 playFuture 一并登记，使析构能等到**所有**捕获了 this 的任务。
+    playFutures.append(playFuture);
 // 结束当前代码块作用域。
 }
 

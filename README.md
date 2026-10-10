@@ -268,7 +268,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下十四条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下十五条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -680,7 +680,43 @@ form_passwd.cpp:48  ui->btnok, ...
 `tools/verify_connect_signal.py`（5/5 用例，含“首实参含 `->` 且第二实参是槽”
 的真阳性）锁定，确保第 7 条不再被悄悄绕过。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述十四条请以
+### 15. 异步播放任务必须全部等待，不能只留最后一个
+
+`AudioManager::playAsync()` 每次播放都覆盖同一个成员：
+
+```cpp
+stop();                                     // 置旧标志
+interruptFlag = std::make_shared<std::atomic<bool>>(false);
+playFuture = QtConcurrent::run([=]() { ... 捕获 this ... });
+```
+
+`QFuture` 赋值**不会等待**上一个任务（只转移内部 d 指针的引用，`~QFuture()`
+也不阻塞）。所以上一次播放若尚未结束，它就变成"被丢弃但仍在运行"的任务：
+
+- 它捕获的 `flag` 已不再是 `interruptFlag` 指向的对象，`stop()` 再也打不断
+  它 —— 会把整段提示音播完，并继续持有静态 `pcmMutex`，令后续提示音排队；
+- 析构只 `waitForFinished()` **最后一个** future，旧任务完全不被等待，于是
+  `~AudioManager()` 返回后它仍在 `emit` 信号、读成员 —— use-after-free。
+  在门口机上表现为关机/退出时的偶发崩溃。
+
+修法是把所有未完成任务收集起来，析构时逐个等待：
+
+```cpp
+QVector<QFuture<void>> playFutures;   // 成员
+void waitForAllTasks();               // 析构中调用（先 stop() 再等）
+```
+
+`playAsync()` 回收已完成项后把新 future 一并登记；`waitForAllTasks()` 在
+`stop()` 之后逐个 `waitForFinished()`。顺序不能颠倒：仅等待而不置标志会让
+析构阻塞到整段提示音播完。
+
+由 `check_abandoned_async_tasks` 强制，自检见
+`tools/verify_abandoned_task.py`（5/5 用例，含"收集未完成任务"与
+"即发即忘 + QPointer 守卫"两个反例）。注意**不误伤即发即忘的用法**：像
+`widget.cpp` 的人脸检测那样不把结果赋给任何变量、且自带 `QPointer` 守卫的
+任务不存在"被覆盖丢弃"的问题。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述十五条请以
 `verify.py` 的结果为准。
 
 ---
@@ -707,7 +743,8 @@ python3 tools/check_signatures.py .
 
 # 2b. 校验器自检：对 check_config_value_sanity / check_config_knobs_are_used /
 #     check_no_running_reset_in_run / check_no_secret_in_logs /
-#     check_declared_signal_is_emitted / check_connect_signal_is_signal
+#     check_declared_signal_is_emitted / check_connect_signal_is_signal /
+#     check_abandoned_async_tasks
 #     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
@@ -715,6 +752,7 @@ python3 tools/verify_stop_flag.py .
 python3 tools/verify_secret_logs.py .
 python3 tools/verify_dead_signal.py .
 python3 tools/verify_connect_signal.py .
+python3 tools/verify_abandoned_task.py .
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
 #     含「原实现对照」与随机模糊测试；无需编译即可验证定帧逻辑）
