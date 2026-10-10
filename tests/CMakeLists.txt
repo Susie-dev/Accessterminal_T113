@@ -343,3 +343,40 @@ target_link_libraries(t113_test_signaling_client PRIVATE
 )
 
 add_test(NAME t113_signaling_client COMMAND t113_test_signaling_client)
+
+# ---------------------------------------------------------------------------
+# HailinFingerprint 的**真实**报文构造（fingerprint_hailin.cpp 的纯逻辑部分）
+#
+# 第 25 轮新增。此前报文字节从未被运行时测试直接验证过：
+#   - t113_test_fingerprint_manager 用的是**链接期替身**
+#     （tests/fake_fingerprint_device.cpp），其 buildFrame() 是真实算法的
+#     逐字节拷贝，但那个"拷贝"**没有任何检查盯着它是否还一致**；
+#   - 于是生产的 buildPacket() 覆盖率为 0，且契约存在两份副本。
+#     有人改了生产的校验和起始下标或长度字段，替身不跟着变，测试照样全绿，
+#     而真机报文已经错了 —— 这是第 23 轮"平行实现"教训的又一种形态。
+#
+# 本轮查明 buildPacket() 是 **public 且纯函数**（只拼字节，不碰串口），
+# 构造函数也只设置串口参数、不 open()。因此可以**链接真实实现**直接测，
+# 无需替身、也无需给生产代码加任何测试钩子。
+#
+# 与 t113_test_fingerprint_manager 相反的链接取向，两者互不干扰：
+# 本目标**不含** fake_fingerprint_device.cpp，也不含 fingerprint_manager.cpp。
+# ---------------------------------------------------------------------------
+add_executable(t113_test_fingerprint_wire
+    test_fingerprint_wire.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/hal/fingerprint_hailin.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/hal/fingerprint_frame_parser.h
+)
+
+target_include_directories(t113_test_fingerprint_wire PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_LIST_DIR}
+)
+
+target_link_libraries(t113_test_fingerprint_wire PRIVATE
+    Qt5::Core
+    Qt5::Test
+    Qt5::SerialPort
+)
+
+add_test(NAME t113_fingerprint_wire COMMAND t113_test_fingerprint_wire)

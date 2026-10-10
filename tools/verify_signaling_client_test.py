@@ -27,6 +27,21 @@ import os
 import shutil
 import subprocess
 import sys
+
+# 把标准输出固定为 UTF-8 且不可编码字符降级为替代符。
+#
+# 必要性（第 25 轮实测）：本机控制台是 GBK；脚本里的 ✓ 会抛
+#   UnicodeEncodeError: 'gbk' codec can't encode character '\u2713'
+# 而**在打印成功率那一行**崩溃 —— 报告前面的内容已经正常输出，很容易被误读成
+# "检查通过"。第 24 轮我误诊为"多余参数"问题，因为当时用 pwsh 且设了
+# PYTHONIOENCODING=utf-8 去测。系统性修法是重配输出编码，
+# 而不是逐个删掉符号（那样下次加个新符号又会复发）。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 import time
 
 # 本脚本不需要参数，但 tools/ 下其它自检脚本的惯例是接收

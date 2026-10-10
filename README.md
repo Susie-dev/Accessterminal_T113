@@ -94,12 +94,18 @@ cmake --build /tmp/t113-tests
 ctest --test-dir /tmp/t113-tests --output-on-failure
 ```
 
-当前 9 个目标：`t113_protocol`（协议编解码）、`t113_fingerprint_parser`
+当前 11 个目标：`t113_protocol`（协议编解码）、`t113_fingerprint_parser`
 （指纹帧解析）、`t113_app_config`（配置读取与夹取）、`t113_audio_manager`
 （提示音播放，用假 ALSA 注入设备错误）、`t113_audio_sender`（UDP 12345
 上行音频）、`t113_audio_receiver`（UDP 12345 下行播放）、`t113_video_push`
 （UDP 23456 视频推流）、`t113_camera_preview`（UDP 50000 远程监看）、
-`t113_fingerprint_manager`（指纹串口互斥调度）。
+`t113_fingerprint_manager`（指纹串口互斥调度，用**链接期替身**）、
+`t113_signaling_client`（TCP 8887 发送失败与断线重连）、
+`t113_fingerprint_wire`（指纹报文构造，链接**真实**实现）。
+
+注意最后两个目标的取向**相反**，这是刻意的：
+`t113_fingerprint_manager` 用替身替换 `fingerprint_hailin.cpp`，
+`t113_fingerprint_wire` 则链接真实实现。前者测流程调度，后者测报文字节。
 
 除前三个是纯逻辑外，其余都用**可注入的假替身**在真实接口边界上跑：
 假 ALSA（设备错误按需注入）、假套接字（记录/投递数据报）、假 V4L2 相机
@@ -225,9 +231,18 @@ gcov 数据里：
 `tools/run_coverage.sh` 一键产出：
 
 ```
-已测文件 707 行（覆盖 671）+ 未测文件约 1972 行 = 分母 2679
-近似总覆盖率 = 25.0%   （上表那个 94.9% 仅描述已测文件）
+已测文件 969 行（覆盖 714）+ 未测文件约 1640 行 = 分母 2609
+近似总覆盖率 = 27.4%   （上表那个 73.7% 仅描述已测文件）
 ```
+
+（第 25 轮新增 `t113_test_fingerprint_wire` 后，把 332 行的
+`fingerprint_hailin.cpp` 从"从未链接"移进了"已测"一栏，因此：分子从 671 升到
+714，**已测文件的百分比反而从 94.9% 降到 73.7%**——因为刚接进来的那个文件
+只覆盖了纯逻辑部分，硬件路径仍为空。分母从 2679 降到 2609，真实总覆盖率
+从 25.0% 升到 **27.4%**。
+
+这正是"分母必须一起报"的价值：只报已测文件百分比的话，**做对了事数字反而
+变难看**，会诱导人不去补齐未测文件。）
 
 #### 已测文件的明细与未覆盖行
 
@@ -282,6 +297,81 @@ TCP 8887 这条硬约束路径上。互操作测试覆盖了正常收发，但"�
 （探针实测 t≈8.6s）。所以"stop 后不得重试"绝不能断言"零错误" —— 那会让
 正确代码失败。必须先把这次不可避免的错误等出来记为**基线**，再断言之后
 不再新增。
+
+### 报文契约被复制成两份，却没有人盯着"两份还一样吗"
+
+第 20/21 轮用「链接期替身」测指纹流程，前提写在替身文件顶部：
+
+> 关键约束：**buildPacket() 必须是真实算法**。报文字节是唯一需要逐字节守住
+> 的契约，如果连这里都换成"简化版"，测试就退化成"替身和自己比"。
+
+这个前提**是对的，但从未被自动验证**。第 25 轮补查后暴露两个后果：
+
+1. **生产的 `buildPacket()` 覆盖率为 0。** 它从未被链接进任何测试目标，
+   报文字节实际上没有被任何运行时测试直接验证过——所有指纹测试跑的都是替身。
+2. **契约存在两份副本**（生产一份、替身一份），却没有一条检查盯着两者是否
+   仍然一致。有人改了生产的校验和起始下标或长度字段，替身不跟着变，
+   测试照样全绿，而真机报文已经错了。
+
+这是第 23 轮"平行实现"教训的**又一种形态**：第 23 轮是"同一功能有两套实现
+（`FingerprintManager::startEnroll` 与 `Form_finger` 内联状态机）"；
+本轮是"同一契约有两份拷贝"。前者靠静态检查钉住**线上字节**，后者要靠
+静态检查钉住**两份拷贝的一致性**。
+
+#### 查明其实不必用替身
+
+`buildPacket()` 是 **public 且纯函数**：只拼字节，不碰串口；构造函数也只
+`setPortName/setBaudRate` 等设置参数，**不 `open()`**。所以可以**直接链接
+真实实现**来测，无需替身、也无需给生产代码加任何测试钩子。
+
+新增 `tests/test_fingerprint_wire.cpp`（14 个用例，链接真实的
+`src/hal/fingerprint_hailin.cpp`），覆盖：
+
+- GET_IMAGE 帧的**逐字节**期望值（`ef 01 ff ff ff ff 01 00 03 01 00 05`）
+- 包头 `0xEF01` 与广播地址 `0xFFFFFFFF` 恒定
+- 长度字段 = payload + 2、**大端**，含跨字节边界（253/254/300）
+- 校验和**自下标 6 起算**（附反证：从下标 0 起算会差 1260）
+- 校验和**大端**（特意构造 ≥ 0x100 的值，否则大小端写反也看不出来）
+- 6 种已知命令字面量的完整帧
+- 与 `FingerprintFrameParser` 的**互操作**（构造出的帧必须能被自己的解析器解回）
+- 设备不可用时不崩：`open()` 失败返回 false、`sendPacket()` 返回 false
+
+##### 实测：未打开的 `QSerialPort` 上调 `waitForReadyRead()` 会**段错误**
+
+首版用例里有一条"串口未打开时 `readPacket()` 应返回空"——它让测试**段错误**
+（退出码 139）。探针查明这不是测试的 bug：
+
+```
+=== A: 未打开的 QSerialPort 上调 waitForReadyRead ===
+isOpen = false  即将调用 waitForReadyRead(50)
+Segmentation fault        退出码=139
+```
+
+崩溃栈落在 Qt5 `QSerialPort` 内部。`readPacket()` 的循环第一句就是
+`m_serial.waitForReadyRead(100)`，所以**对未打开的设备调它属于 Qt 未定义行为**。
+
+原来的用例是"想当然地认为调一下没坏处"。改正后改为两条**安全且更有价值**的
+用例：不存在的串口 `open()` 必须返回 false 且不崩（真实场景：接错线/驱动没起来），
+以及设备不可用时纯逻辑仍正确、`sendPacket()` 返回 false 而不是崩。
+
+##### 实测：`calcChecksum()` 是**死代码**，校验和逻辑在同一文件里有两份
+
+```
+src/hal/fingerprint_hailin.cpp:484  quint16 HailinFingerprint::calcChecksum(...)
+                                    调用者：0
+buildPacket() 体内：不含 calcChecksum，自己内联了同一个累加循环
+文件里 `for (int i = 6; ...) sum += ...` 出现次数：2
+```
+
+实测 baseline（`terminal/smartpronew/HailinFingerprint.cpp`）**同样零调用者**——
+是**继承来的**，不是重构引入的，故本轮不改行为。
+
+但它是个真实隐患，故障注入给出了确切后果：**只把 `calcChecksum` 的起始下标
+从 6 改成 0，18 个指纹用例全部照常通过**（因为没人调用它）。若有人"顺手修好"
+这个死函数并开始调用，报文校验和就会与 `buildPacket()` 不一致。
+
+`check_fingerprint_checksum_logic_is_not_duplicated` 以**告警**级别记录此事
+（改它是否属于"修缺陷"需要产品决策）；实际生效的那一份契约由报文单元测试钉住。
 
 ### 不可达槽与"平行实现"：为死代码写测试的陷阱
 
@@ -546,7 +636,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下三十三条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下三十六条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -1366,7 +1456,7 @@ python3 tools/verify.py . ../Accessterminal_desktop
 > **已加载的模块**后才真正生效。这正是必须做故障注入的理由——**自检脚本自己
 > 也会骗人**。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述三十三条请以
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述三十六条请以
 `verify.py` 的结果为准。
 
 ---
@@ -1543,6 +1633,81 @@ MSYS 的 `/tmp`，Windows 侧看不到），结果 6 个变异**全部**报"仍�
 
 跨 shell/解释器传路径时，统一用**目标解释器认识的形式**。
 
+### 34. 同一契约的**多份拷贝**之间没有契约：一致
+性必须被检查，否则测试只验证了副本自己
+
+第 25 轮发现指纹报文的构造契约存在两份副本：生产
+`src/hal/fingerprint_hailin.cpp` 的 `buildPacket()`，以及链接期替身
+`tests/fake_fingerprint_device.cpp` 的 `buildFrame()`（逐字节照搬）。所有指纹
+单元测试跑的都是**替身**。
+
+后果：生产的 `buildPacket()` 覆盖率为 **0**，报文字节从未被运行时测试直接
+验证过；而两份拷贝可以各自漂移——改了生产那份，替身不跟着变，测试照样全绿，
+**真机报文已经错了**。
+
+这是第 23 轮"平行实现"的又一种形态：
+  - 第 23 轮 = 同一**功能**有两套实现（`startEnroll` vs `Form_finger` 内联）；
+  - 第 25 轮 = 同一**契约**有两份拷贝。
+前者靠静态检查钉住线上字节，后者靠静态检查钉住两份拷贝的一致性。
+
+规则：凡"契约被复制进测试替身"，必须有一条检查比较两份实现的**操作序列**，
+且该检查要经**双向**故障注入验证（改生产要报、改替身也要报），并配一个
+"两边都改成一样、应保持通过"的**对照实验**（证明它比较的是一致性，
+而不是等于某个死写的期望序列）。
+
+`check_fake_fingerprint_builds_same_bytes` 即此检查。
+
+### 35. 优先链接**真实实现**，而不是复制一份进替身
+
+第 25 轮查明 `HailinFingerprint::buildPacket()` 是 **public 且纯函数**——只拼
+字节、不碰串口，构造函数也只设置参数不 `open()`。因此完全可以**直接链接真实
+实现**来测。
+
+此前的替身方案并非必要：它为了"不依赖串口硬件"而把报文逻辑复制了一份，
+反而制造了第 34 条所说的漂移风险，并让真实实现覆盖率停在 0。
+
+规则：做链接期替身之前，先问"被测的这部分到底碰不碰硬件？"。**纯逻辑就链接
+真实实现**；只有真正需要隔离硬件时（`readPacket`/`sendPacket`/`open` 这些
+真的走 `QSerialPort` 的路径）才用替身。
+
+本工程现在两种取向**并存且刻意**，不要"统一"掉：
+  - `t113_test_fingerprint_manager` 用替身，测**流程调度**（互斥、步进、超时）
+  - `t113_test_fingerprint_wire` 链真实实现，测**报文字节**
+一个链接 `fake_fingerprint_device.cpp`，另一个链接 `fingerprint_hailin.cpp`，
+互不干扰。
+
+**附带实测事实**：在**未打开的** `QSerialPort` 上调 `waitForReadyRead()` 会让
+Qt5 **段错误**（探针实测退出码 139，崩溃栈在 QSerialPort 内部）。`readPacket()`
+循环第一句就是它，所以"对未打开的设备调 readPacket() 看它是否优雅返回"这类
+想当然的用例会让测试进程直接崩掉。这也正是"纯逻辑该与硬件访问分开"的又一
+理由：纯逻辑部分不碰这条未定义行为路径。
+
+### 36. 自检脚本必须能在**目标控制台编码**下安全输出，否则会伪装成"通过"
+
+第 25 轮两个故障注入自检脚本在本机崩溃：
+
+```
+UnicodeEncodeError: 'gbk' codec can't encode character '\u2713'
+```
+
+它们用了 `✓`。本机控制台是 GBK。危险之处在**它伪装成通过**：报告前面的
+检查结果已经正常输出，看上去一切正常，而 rc=1；调用方若忽略返回码或只看尾部
+输出，就会读成"全绿"。
+
+**代价是两轮误诊。** 第 24 轮遇到同一现象时，我因为当时用 pwsh 且设了
+`PYTHONIOENCODING=utf-8` 去测（恰好掩盖了真因），把它误判为"多余参数"问题，
+打了个忽略参数的补丁——治的是症状。第 25 轮在 bash、不带该环境变量时复现，
+才查出真因。
+
+规则：脚本要么把 stdout/stderr
+`reconfigure(encoding="utf-8", errors="replace")`，要么不含目标控制台编不出的
+字符。**逐个删符号不算修好**——第 24 轮我删了 `⚠`，第 25 轮就冒出 `✓`。
+`check_tool_scripts_are_console_encoding_safe` 强制此事。
+
+推而广之：**"在我这儿能跑"不是验证。** 验证必须在**目标环境的确切条件**下进行
+（这里是"不带 PYTHONIOENCODING 的 GBK 控制台"）。用一个恰好掩盖问题的环境变量
+去测试一个环境相关问题，得到的绿色是假的。
+
 ## 开发约定
 
 - **标准**：C++11（不可使用 C++17 的 inline 变量等特性）
@@ -1594,6 +1759,11 @@ python3 tools/verify_fp_ack_tag.py .
 python3 tools/verify_signalspy_metatype.py .
 python3 tools/verify_dead_slot.py .
 python3 tools/verify_signaling_client_test.py .
+python3 tools/verify_fingerprint_wire_test.py .
+# 自检脚本必须在**不带 PYTHONIOENCODING** 的 GBK 控制台下也安全
+# （第 25 轮的教训：带 utf-8 测会掩盖真因，绿色是假的）
+env -u PYTHONIOENCODING python3 tools/verify_signaling_client_test.py .
+env -u PYTHONIOENCODING python3 tools/verify_fingerprint_wire_test.py .
 bash tools/run_coverage.sh
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
