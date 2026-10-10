@@ -244,6 +244,26 @@ udevadm control --reload-rules && udevadm trigger
 > **重要**：音视频线程在收到 `accept` 之前**不会创建**，空闲时零资源占用。
 > 修改代码时务必保留此约束。
 
+### TCP 分包处理
+
+TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完整信令、
+半条信令，或一次拿到多条（粘包）。两端统一使用
+`protocol::StreamDecoder` 做跨包重组，它处理三种情况：
+
+1. **粘包**：`"call\nunlock\n"` → 切出两条信令；
+2. **半包**：`"unl"` 先到、`"ock\n"` 后到 → 缓冲后还原成 `unlock`；
+3. **歧义前缀**：`"stop"` 是 `"stopsend"` 的前缀。若 TCP 恰好把
+   `"stopsend\n"` 拆成 `"stop"` + `"send\n"`，**不能**凭 `"stop"`
+   立即判定为 `Stop`——否则会触发错误行为（停掉监看推流，而不是
+   通知对端停止发送）。解码器会继续等待以消歧。
+
+> **兼容性注意**：历史版本的室内机发出的 `recstop` **没有** `'\n'`
+> （见 baseline `desktop/smartserver/widget.cpp:566`）。旧版解析用
+> `split('\n', SkipEmptyParts)`，会把末尾无终止符的片段也当作完整信令。
+> `StreamDecoder` 刻意保留这一宽容语义：末尾片段若**本身已是完整信令**
+> 且无歧义，则立即识别。否则“新版门口机 + 未升级的旧版室内机”组合
+> 会永远收不到挂断指令。
+
 ---
 
 ## 开发约定
@@ -274,13 +294,21 @@ bash tools/check_host_compile.sh
 
 # 5. 链接完整性检查（发现 undefined reference / 重复定义）
 bash tools/check_host_link.sh
+
+# 6. 跨工程信令互通（需同级目录存在 Accessterminal_desktop）
+bash tests/interop/run_interop.sh
 ```
 
-五个脚本在 CI 中也可直接使用，退出码非 0 即表示失败。
+六个脚本在 CI 中也可直接使用，退出码非 0 即表示失败。
 
 第 1~3 步是静态检查，速度快但覆盖有限；**第 4、5 步不能省**——
 像“前置声明了不存在的类名”“把 ALSA 枚举存成 int 再传回枚举形参”
 这类缺陷只有编译器能发现，“漏定义某个符号”只有链接器能发现。
+
+**第 6 步是协议兼容性的最终防线**：它把门口机的 `SignalingClient` 与
+室内机的 `SignalingServer`（两个仓库里的**真实**实现）链接到一起，
+在 127.0.0.1 上做真实 TCP 收发，逐条校验信令。端口、信令字符串、
+`'\n'` 分包、粘包与半包处理，任何偏差都会在这里失败。
 
 ---
 

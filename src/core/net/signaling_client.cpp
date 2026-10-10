@@ -99,6 +99,8 @@ bool SignalingClient::send(protocol::Signal signal)
 void SignalingClient::onConnected()
 {
     qDebug() << "[信令] 已连接:" << m_socket->peerAddress().toString() << m_socket->peerPort();
+    // 新连接开始，丢弃上一条连接残留的半包，避免陈旧字节与新数据拼接。
+    m_decoder.reset();
     if (!m_wasConnected) {
         m_wasConnected = true;
         emit connectedChanged(true);
@@ -108,6 +110,7 @@ void SignalingClient::onConnected()
 void SignalingClient::onDisconnected()
 {
     qDebug() << "[信令] 连接断开";
+    m_decoder.reset();
     if (m_wasConnected) {
         m_wasConnected = false;
         emit connectedChanged(false);
@@ -140,20 +143,15 @@ void SignalingClient::scheduleReconnect()
 void SignalingClient::onReadyRead()
 {
     const QByteArray data = m_socket->readAll();
-    // TCP 是字节流，一条 readAll 可能包含多条以 '\n' 分隔的信令，
-    // 也可能只有半条。按终止符切分并逐条解析，避免粘包/半包漏判。
-    const QList<QByteArray> lines = data.split(protocol::kSignalTerminator);
-    for (const QByteArray& line : lines) {
-        const QByteArray trimmed = line.trimmed();
-        if (trimmed.isEmpty()) {
-            continue;
-        }
-        const protocol::Signal sig = protocol::fromWire(trimmed);
-        if (sig == protocol::Signal::Unknown) {
-            qWarning() << "[信令] 收到未知信令，已忽略:" << trimmed;
-            continue;
-        }
-        qDebug() << "[信令] 收到:" << trimmed;
+    // TCP 是字节流：一次 readAll 可能包含多条以 '\n' 分隔的信令，也可能
+    // 只有半条，甚至末尾没有 '\n'。交给 protocol::StreamDecoder 做跨包
+    // 重组——它既修掉了旧版“半包会被静默丢弃”的缺陷，又保留了旧版对
+    // 无 '\n' 结尾信令（如历史遗留的 "recstop"）的宽容语义。
+    // 注意：局部变量不能叫 signals —— Qt 把 signals 定义成了宏
+    // （#define signals public），用它会直接把类体语法打乱。
+    const QList<protocol::Signal> decoded = m_decoder.feed(data);
+    for (const protocol::Signal sig : decoded) {
+        qDebug() << "[信令] 收到:" << protocol::toWire(sig);
         emit signalReceived(sig);
     }
 }

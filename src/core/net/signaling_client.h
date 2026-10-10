@@ -78,6 +78,9 @@ private:
     quint16 m_port = protocol::kSignalingPort;
     bool m_running = false;
     bool m_wasConnected = false;
+
+    /// TCP 字节流解码器：跨 readyRead 保存半包，避免拆包丢信令。
+    protocol::StreamDecoder m_decoder;
 };
 
 } // namespace accessterminal
