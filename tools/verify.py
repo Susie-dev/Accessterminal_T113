@@ -499,6 +499,72 @@ def check_accept_gated_threads(root, src_root):
     _ = body_line0
 
 
+def check_unqueued_poll_timers(root, src_root):
+    """
+    轮询定时器不得以「无句柄」的局部变量创建。
+
+    背景（真实缺陷，来自 baseline，已修复）：Form_finger::startFingerRegisterStep()
+    里写的是
+
+        QTimer* timer = new QTimer(this);      // 局部变量，没有任何成员保存它
+        connect(timer, &QTimer::timeout, this, [=]{ ... });
+        timer->start(500);
+
+    这个轮询回调里做的是**阻塞串口读**且跑在 GUI 线程。只有“检测到手指”
+    那一条路径会 stop 它；用户点『退出』（onAddQuitClicked 只调 close()）时
+    定时器仍在跑。由于 Form_finger 没有设 WA_DeleteOnClose，close() 只是隐藏
+    窗口、对象还活着，于是：每 500ms 在 GUI 线程上阻塞一次，界面永久卡顿。
+
+    判定规则只针对「可被 close() 隐藏、但对象仍存活」的窗口类：
+      - 该类必须继承 QWidget，并且代码里出现 close() 调用；
+      - 该 QTimer 在创建后调用了 start(...)（成为周期定时器）；
+      - 其句柄既不是类成员，也没有放进任何容器。
+    此时除回调自身外无人能停止它，而窗口已经隐藏 —— 定时器会永久空转。
+
+    为什么把范围收窄到 QWidget：像 FingerprintManager 这样随程序存活的
+    QObject，其“等待手指”轮询本来就是设计上的常驻行为（识别流程结束时
+    才 stop），并非缺陷。只有「承载它的界面可能先消失」时才构成问题。
+    单次触发（singleShot / setSingleShot(true)）也会自己结束，不在范围内。
+    """
+    for path in find_files(src_root, {".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        rel = os.path.relpath(path, root)
+        if "new QTimer" not in text:
+            continue
+
+        header = path[:-4] + ".h"
+        if not os.path.isfile(header):
+            continue
+        htext = strip_comments_and_strings(read(header))
+
+        # 只处理 QWidget 子类，且该文件里确实会 close()（说明能被隐藏而非销毁）
+        if not re.search(r'class\s+\w+\s*:\s*public\s+QWidget\b', htext):
+            continue
+        if not re.search(r'\bclose\s*\(\s*\)', text):
+            continue
+
+        # 头文件里的成员变量名
+        members = set(re.findall(r'\b(m_\w+)\s*(?:=|;)', htext))
+
+        for m in re.finditer(r'\bQTimer\s*\*\s*(\w+)\s*=\s*new\s+QTimer\b', text):
+            var = m.group(1)
+            # 只关心“使能了周期性启动”的定时器
+            if not re.search(re.escape(var) + r'\s*->\s*start\s*\(', text):
+                continue
+            if var in members:
+                continue  # 有成员句柄，外部可停
+            # 句柄是否被放进了某个容器（QList/QVector/append/<<）
+            if re.search(r'\b\w+\s*(?:\.append|<<)\s*\(\s*' + re.escape(var), text):
+                continue
+            line = text.count("\n", 0, m.start()) + 1
+            fail("[unguarded-timer] {}:{} 窗口类里的局部定时器 '{}' 被 start() 成"
+                 "周期定时器却没有任何成员/容器保存句柄；除回调自身外无人能停止它。"
+                 "该类会 close()（窗口被隐藏但对象仍存活，未设 WA_DeleteOnClose 时"
+                 "尤其如此），定时器会在 GUI 线程上永久空转。"
+                 "请改为成员变量并提供停止入口。"
+                 .format(rel, line, var))
+
+
 def check_deleted_on_close_members(root, src_root):
     """
     WA_DeleteOnClose 窗口不得用裸指针成员跟踪。
@@ -584,6 +650,7 @@ def main():
     check_deferred_session_guard(root, src_root)
     check_accept_gated_threads(root, src_root)
     check_deleted_on_close_members(root, src_root)
+    check_unqueued_poll_timers(root, src_root)
     check_json_configs(root)
 
     print(f"校验目录: {root}")

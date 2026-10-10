@@ -57,8 +57,36 @@ Form_finger::Form_finger(QWidget *parent) :
 void Form_finger::onAddQuitClicked()
 // 进入新的代码块作用域。
 {
+    // 退出时务必停掉轮询：窗口只是被 close() 隐藏（Form_finger 没有设
+    // WA_DeleteOnClose，对象仍然活着），若不停定时器，它会继续每 500ms
+    // 在 GUI 线程上做一次阻塞串口读，把界面拖死。
+    stopFingerPoll();
+    // 同时复位等待状态。注意这一步必须放在这里、而不是塞进 stopFingerPoll()：
+    // startFingerRegisterStep() 里是「先 waitingFinger = true，再建定时器」，
+    // 若 stopFingerPoll() 顺手把它清成 false，计时中的那一步就失去重复点击保护。
+    waitingFinger = false;
     // 执行本行语句完成对应变量、对象或业务状态处理。
     this->close();
+// 结束当前代码块作用域。
+}
+
+// 定义或声明函数 Form_finger::stopFingerPoll。
+void Form_finger::stopFingerPoll()
+// 进入新的代码块作用域。
+{
+    // 代数 +1：作废所有已排队、尚未触发的延时重启（见头文件里的说明）。
+    ++m_pollGeneration;
+    // 只负责“停表”，不碰 waitingFinger（见 onAddQuitClicked 的注释）。
+    // 根据条件判断是否执行该分支。
+    if (m_pollTimer) {
+        // 执行本行语句完成对应变量、对象或业务状态处理。
+        m_pollTimer->stop();
+        // 执行本行语句完成对应变量、对象或业务状态处理。
+        m_pollTimer->deleteLater();
+        // 执行本行语句完成对应变量、对象或业务状态处理。
+        m_pollTimer = nullptr;
+    // 结束当前代码块作用域。
+    }
 // 结束当前代码块作用域。
 }
 
@@ -96,8 +124,14 @@ void Form_finger::startFingerRegisterStep(int step)
     // 在前一条件不满足时继续判断该分支。
     else if (step == 3) mainWidget->audioManager()->playAsync(accessterminal::AppConfig::instance().pcmFile(QStringLiteral("caijifinger.pcm")));
     // 启动定时器轮询检测手指
+    // 复用同一个成员定时器：重复进入本函数（第 2、3 步）时不要叠加新定时器。
+    stopFingerPoll();
     // 创建或使用 Qt 定时器对象。
-    QTimer* timer = new QTimer(this);
+    m_pollTimer = new QTimer(this);
+    // 把句柄按值捕获进 lambda（QTimer* 是值语义），这样回调里 stop/deleteLater
+    // 操作的是本次这一只定时器；同时 clear 成员，避免回调里把已经 deleteLater
+    // 的指针再指一次。
+    QTimer* const timer = m_pollTimer;
     // 建立 Qt 信号与槽或 lambda 回调连接。
     connect(timer, &QTimer::timeout, this, [=]() {
         // 检测有无手指，假设用 getImage 判断
@@ -117,6 +151,8 @@ void Form_finger::startFingerRegisterStep(int step)
             timer->stop();
             // 执行本行语句完成对应变量、对象或业务状态处理。
             timer->deleteLater();
+            // 成员句柄同步清空，保持“句柄有效 <=> 定时器在跑”这一不变式。
+            if (m_pollTimer == timer) m_pollTimer = nullptr;
             // 输出调试日志。
             qDebug() << QString("第%1次检测到手指，开始采集").arg(step);
             // 执行本行语句完成对应变量、对象或业务状态处理。
@@ -204,8 +240,14 @@ void Form_finger::doFingerCollect(int step)
     if (step < 3) {
         // 执行本行语句完成对应变量、对象或业务状态处理。
         currentStep++;
+        // 记录发起时的代数：若这 1.5 秒内用户点了『退出』（stopFingerPoll()
+        // 会 ++m_pollGeneration），下面的延时回调就作废，不再把轮询拉起来。
+        const int gen = m_pollGeneration;
         // 定义类 QTimer 的成员函数 singleShot。
-        QTimer::singleShot(1500, this, [=]() { startFingerRegisterStep(currentStep); });
+        QTimer::singleShot(1500, this, [this, gen]() {
+            if (gen != m_pollGeneration) return; // 已被取消（退出/析构）
+            startFingerRegisterStep(currentStep);
+        });
     // 结束当前代码块作用域。
     } else {
         // 合并特征和存储模板
@@ -270,6 +312,9 @@ void Form_finger::doFingerCollect(int step)
 Form_finger::~Form_finger()
 // 进入新的代码块作用域。
 {
+    // 先停轮询再 delete ui：轮询回调里会经由 parentWidget() 向上找 Widget、
+    // 访问 ui 所建立的控件树，析构期间让它继续触发是危险的。
+    stopFingerPoll();
     // 释放动态创建的对象资源。
     delete ui;
 // 结束当前代码块作用域。
