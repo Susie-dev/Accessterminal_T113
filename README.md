@@ -268,7 +268,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下十条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下十二条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -537,7 +537,84 @@ m_faceManager->setConfidenceThreshold(cfg.faceConfidenceThreshold());
 `m_x = jsonInt(o, "x", m_x)` 只是回退实参，若把它算作消费，假旋钮就会被
 漏掉（本条规则第一版正是这样漏掉了 `faceConfidenceThreshold`）。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述十条请以
+### 11. 指纹/密码等凭据不得写入日志
+
+门口机是**实体门禁设备**，门禁密码即物理准入凭据。重构前的密码校验路径
+把用户输入和**已存储的正确密码**一并打进 `qDebug`：
+
+```cpp
+qDebug() << "[PasswordManager] checkPassword: input=" << input
+         << ", password=" << password
+         << ", inputHex=" << input.toUtf8().toHex()
+         << ", pwdHex=" << password.toUtf8().toHex();
+```
+
+输入窗体还逐位记录按键、并打印整串输入：
+
+```cpp
+qDebug() << "[passwd] Digit clicked:" << btn->text();
+qDebug() << "[passwd] OK clicked, inputBuffer=" << inputBuffer << ...;
+```
+
+后果是**任何一次密码校验（含输错）都会把门禁密码明文写进日志**。嵌入式
+Linux 上 `qDebug` 落到 stderr / systemd journal，可被任何有日志读取权限的
+人拿到，且跨重启留存；逐位日志与整串日志叠加还能完整还原输入过程。
+
+修法是只保留非内容信息 —— 校验结论与输入长度：
+
+```cpp
+const bool matched = (input == password);
+qDebug() << "[PasswordManager] 密码校验完成，结果:" << (matched ? "通过" : "拒绝");
+emit passwordChecked(matched);          // 比较逻辑与信号语义完全不变
+```
+
+由 `check_no_secret_in_logs` 强制，自检见 `tools/verify_secret_logs.py`
+（5/5 用例）。规则要求日志语句中不得把凭据标识符、**被当作密码传递的
+变量**（如 `emit passwordEntered(inputBuffer)` 里的 `inputBuffer`）、或
+密码输入界面的按键文本作为被输出的值；同时放行两类反例以免误伤 ——
+敏感词仅作日志前缀标签（`"[passwd]"`），以及只取 `.size()` /
+`.isEmpty()` 等非内容信息。注意 `passwordChecked(matched)` 里的 `matched`
+是 bool 结果而非密码，故标记凭据时已排除 `checked`/`result`/`success`
+这类结果型名字。
+
+### 12. `run()` 内不得重置停止标志
+
+`CameraPushThread` 的停止标志初值为 `false`，并在 `run()` 开头无条件
+`running = true`：
+
+```cpp
+CameraPushThread::CameraPushThread(...) : ..., running(false) {}
+void CameraPushThread::run() { running = true; ... while (running) { ... } }
+```
+
+而调用方是「先清理旧的、再 new + start 新的」：
+
+```cpp
+m_cameraPushThread = new CameraPushThread(...);
+m_cameraPushThread->start();
+```
+
+从 `start()` 到 `run()` 真正执行之间存在时间窗口。若期间调用 `stop()`
+（用户瞬时挂断），`running` 被置 `false`，随后 `run()` 又把它写回 `true`
+—— **停止请求被吞掉**。线程于是继续长时间推流，导致挂断流程
+`wait(3000)` 超时、`delete` 一个仍在运行的 `QThread`（Qt 打印
+`QThread: Destroyed while thread is still running` 并终止进程），
+且该线程继续向已关闭的 socket `sendto`。
+
+正确做法是把停止标志初值置 `true`、`run()` 内不再重置，使 `stop()` 成为
+**不可逆**操作 —— 这正是同工程 `AudioSenderThread` /
+`AudioReceiverThread` 已有的写法：
+
+```cpp
+CameraPushThread::CameraPushThread(...) : ..., running(true) {}
+void CameraPushThread::run() { /* 不再写 running = true */ ... }
+```
+
+由 `check_no_running_reset_in_run` 强制，自检见
+`tools/verify_stop_flag.py`（6/6 用例，含「重置的是非停止标志」与
+「非 QThread 类」两个反例）。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述十二条请以
 `verify.py` 的结果为准。
 
 ---
@@ -562,11 +639,13 @@ python3 tools/verify.py .
 # 2. 签名一致性（.h 声明 vs .cpp 定义）
 python3 tools/check_signatures.py .
 
-# 2b. 校验器自检：对 check_config_value_sanity / check_config_knobs_are_used
-#     做故障注入（各 6/6 用例）。静态规则写错会静默失效，必须证明它真能
-#     区分好坏代码。
+# 2b. 校验器自检：对 check_config_value_sanity / check_config_knobs_are_used /
+#     check_no_running_reset_in_run / check_no_secret_in_logs 做故障注入。
+#     静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
+python3 tools/verify_stop_flag.py .
+python3 tools/verify_secret_logs.py .
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
 #     含「原实现对照」与随机模糊测试；无需编译即可验证定帧逻辑）

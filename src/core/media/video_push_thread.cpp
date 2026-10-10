@@ -16,9 +16,28 @@
 #include <QImage>
 
 // 定义类 CameraPushThread 的成员函数 CameraPushThread。
+//
+// running 初值为 true（构造即“待运行”），且 **run() 内不再重置它**。
+// 这一点与同工程的 AudioSenderThread / AudioReceiverThread 保持一致，
+// 用来消除一个真实的“丢停止”竞态：
+//
+//   if (m_cameraPushThread) { stop(); wait(); delete; }   // 先清理旧的
+//   m_cameraPushThread = new CameraPushThread(...);
+//   m_cameraPushThread->start();                          // 再启动新的
+//
+// 线程对象创建与 start() 之间、以及 start() 到 run() 真正开始执行之间，
+// 存在时间窗口。若此期间有人调用 stop()（例如用户在这几十微秒内挂断），
+// running 会被置为 false；而旧代码在 run() 开头无条件写 running = true，
+// **会把这次停止请求覆盖掉**，线程随即进入 while(running) 长时间推流。
+// 后果：挂断流程里的 wait(3000) 超时、delete 掉一个仍在运行的 QThread
+// （Qt 会打印 QThread: Destroyed while thread is still running 并终止进程），
+// 同时该线程还持有已关闭的 socket 继续 sendto。
+//
+// 改为初值 true、run() 不重置后，stop() 的语义变为“不可逆地置 false”，
+// 任何时刻调用都不会被后续的 run() 抹掉——这正是 stop() 应有的语义。
 CameraPushThread::CameraPushThread(V4L2Camera* cam, const QString& ip, quint16 port, QObject* parent)
     // 继续当前代码块的参数、表达式或结构定义。
-    : QThread(parent), camera(cam), serverIp(ip), serverPort(port), running(false)
+    : QThread(parent), camera(cam), serverIp(ip), serverPort(port), running(true)
 // 进入新的代码块作用域。
 {}
 
@@ -33,8 +52,9 @@ void CameraPushThread::stop() {
 void CameraPushThread::run() {
     // 输出调试日志。
     qDebug() << "[视频推送] 线程启动 -> 目标服务器:" << serverIp << ":" << serverPort;
-    // 执行本行语句完成对应变量、对象或业务状态处理。
-    running = true;
+    // 注意：这里**不能**写 running = true。
+    // running 的初值已在构造函数中置为 true，run() 内再置 true 会覆盖掉
+    // 在 start() 与 run() 之间到达的 stop() 请求（详见构造函数上方的说明）。
     // 执行本行语句完成对应变量、对象或业务状态处理。
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     // 根据条件判断是否执行该分支。

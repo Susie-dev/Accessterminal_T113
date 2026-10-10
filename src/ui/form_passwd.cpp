@@ -73,7 +73,9 @@ void Form_passwd::onDigitClicked()
     // 根据条件判断是否执行该分支。
     if (!btn) return;
     // 输出调试日志。
-    qDebug() << "[passwd] Digit clicked:" << btn->text();
+    // 只记录“按下了一个数字键”这一事件，**不要**打印 btn->text()：
+    // 逐位日志会把用户输入的密码拼出来，等于把密码明文写进日志。
+    qDebug() << "[passwd] 数字键按下";
     // 根据条件判断是否执行该分支。
     if (inputBuffer.size() >= 8) return; // 最多8位
     // 执行本行语句完成对应变量、对象或业务状态处理。
@@ -109,7 +111,10 @@ void Form_passwd::on_btnok_clicked()
 // 进入新的代码块作用域。
 {
     // 输出调试日志。
-    qDebug() << "[passwd] OK clicked, inputBuffer=" << inputBuffer << ", hex=" << inputBuffer.toUtf8().toHex();
+    // 这里原本打印 inputBuffer 及其 hex —— 那就是用户刚输入的完整密码明文，
+    // 且与上方逐位日志叠加后可完整还原密码。改为只记录长度（非敏感），
+    // 既能诊断“是否收到按键”，又不泄露任何一位。信号与后续流程不变。
+    qDebug() << "[passwd] 确认键按下，已输入位数=" << inputBuffer.size();
     // 根据条件判断是否执行该分支。
     if (!inputBuffer.isEmpty())
         // 发出 Qt 信号 passwordEntered 通知其他对象。

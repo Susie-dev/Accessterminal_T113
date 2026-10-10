@@ -1288,6 +1288,193 @@ def check_connect_signal_is_signal(root, src_root):
                  .format(rel, line, cname, name, cname))
 
 
+def check_no_running_reset_in_run(root, src_root):
+    """
+    `run()` 内不得重置停止标志（否则会丢掉先到的 stop() 请求）。
+
+    背景（真实缺陷，本轮修复）：
+    `CameraPushThread` 的停止标志初值为 false，并在 `run()` 开头无条件
+    `running = true`：
+
+        CameraPushThread::CameraPushThread(...) : ..., running(false) {}
+        void CameraPushThread::run() { running = true; ... while (running) {...} }
+
+    而调用方是“先清理旧的、再 new + start 新的”：
+
+        m_cameraPushThread = new CameraPushThread(...);
+        m_cameraPushThread->start();
+
+    在 start() 到 run() 真正执行之间存在时间窗口。若期间调用 stop()
+    （用户瞬时挂断，或紧接着再次清理），running 被置 false，随后 run()
+    又把它写回 true，**停止请求被吞掉**。线程于是长时间推流，导致：
+      - 挂断流程 `wait(3000)` 超时；
+      - `delete` 一个仍在运行的 QThread → Qt 打印
+        `QThread: Destroyed while thread is still running` 并终止进程；
+      - 该线程继续向已关闭的 socket 发送数据。
+
+    正确做法（同工程 AudioSenderThread / AudioReceiverThread 已是如此）：
+    停止标志初值置 true、`run()` 内不再重置，使 stop() 成为不可逆操作。
+
+    判定：对每个 `class X : public QThread`，若其 `stop()` 里出现
+    `NAME = false`、且 `X::run()` 内出现 `NAME = true`，则失败。
+    """
+    for hpath in find_files(src_root, {".h", ".hpp"}):
+        htext = strip_comments_and_strings(read(hpath))
+        for cm in re.finditer(r"\bclass\s+(\w+)\s*:\s*public\s+QThread\b", htext):
+            cname = cm.group(1)
+            # 取类体，找停止标志成员名
+            start = htext.find("{", cm.end())
+            if start < 0:
+                continue
+            depth, i = 0, start
+            while i < len(htext):
+                if htext[i] == "{":
+                    depth += 1
+                elif htext[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            body = htext[start + 1:i]
+            flags = re.findall(r"\b(?:std::)?atomic\s*<\s*bool\s*>\s*(\w+)\b", body)
+            if not flags:
+                continue
+            for flag in flags:
+                for cpath in find_files(src_root, {".cpp"}):
+                    ctext = strip_comments_and_strings(read(cpath))
+                    rel = os.path.relpath(cpath, root)
+                    if not re.search(r"\b" + cname + r"\s*::\s*run\s*\(", ctext):
+                        continue
+                    # run() 内把标志置 true
+                    reset = re.search(
+                        r"\b" + cname + r"\s*::\s*run\s*\([^)]*\)\s*\{",
+                        ctext)
+                    if not reset:
+                        continue
+                    rs = reset.end() - 1
+                    d2, j = 0, rs
+                    while j < len(ctext):
+                        if ctext[j] == "{":
+                            d2 += 1
+                        elif ctext[j] == "}":
+                            d2 -= 1
+                            if d2 == 0:
+                                break
+                        j += 1
+                    run_body = ctext[rs + 1:j]
+                    m = re.search(r"\b" + flag + r"\s*=\s*true\s*;", run_body)
+                    if m:
+                        line = ctext.count("\n", 0, rs + 1 + m.start()) + 1
+                        fail("[stop-flag] {}:{} {}::run() 在开头把停止标志 {} 重置为 "
+                             "true；在 start() 与 run() 之间到达的 stop() 会被吞掉，"
+                             "导致线程无法及时退出、wait() 超时后 delete 仍在运行的 "
+                             "QThread（Qt 会终止进程）。应把 {} 的初值置为 true 并"
+                             "在 run() 内不再重置（与 AudioSenderThread / "
+                             "AudioReceiverThread 一致）。"
+                             .format(rel, line, cname, flag, flag))
+                    break
+
+
+def check_no_secret_in_logs(root, src_root):
+    """
+    禁止把密码/密钥等敏感值打进日志。
+
+    背景（真实缺陷，本轮修复）：
+    门口机的密码校验路径把**已存储的正确密码**写进了 qDebug：
+
+        qDebug() << "[PasswordManager] checkPassword: input=" << input
+                 << ", password=" << password
+                 << ", inputHex=" << input.toUtf8().toHex()
+                 << ", pwdHex=" << password.toUtf8().toHex();
+
+    以及输入窗体里逐位打印按键、并打印整串输入：
+
+        qDebug() << "[passwd] Digit clicked:" << btn->text();
+        qDebug() << "[passwd] OK clicked, inputBuffer=" << inputBuffer << ...;
+
+    后果：任何一次密码校验（含输错）都会把门禁密码明文写进 stderr /
+    systemd journal。门口机是实体门禁设备，密码即物理准入凭据；日志可被
+    任何有读取权限的人拿到，且跨重启留存。逐位日志与整串日志叠加，还能
+    完整还原用户输入过程。
+
+    判定规则：日志语句（qDebug/qWarning/qInfo/qCritical）中不得出现敏感
+    标识符（password/passwd/pwd/secret/token/credential）作为**被输出的值**。
+    - 例外一：仅出现在日志的**前缀字符串**里（如 "[passwd]" 标签）不算，
+      否则会误伤正常的模块标签。
+    - 例外二：仅取长度/是否为空等非内容信息（.size()/.length()/.isEmpty()）
+      不算泄露。
+
+    只做词法判定，不做数据流分析。
+    """
+    # 规则 1：日志中直接输出了名字本身就像凭据的标识符。
+    secret_name = r"(?:password|passwd|pwd|secret|token|credential)"
+    rule1 = re.compile(
+        r"<<[^;]*?\b" + secret_name + r"\b\s*"
+        r"(?:\.\w+\s*\([^()]*\))?\s*(?=[,;<])",
+        re.IGNORECASE)
+    # 规则 2：日志中输出了“被当作密码传出去的”那个变量。
+    #   emit passwordEntered(inputBuffer);
+    #   connect(..., &Form_passwd::passwordEntered, mgr, &PasswordManager::checkPassword);
+    # 前者把 inputBuffer 标记为凭据变量，之后 log 里出现它就报错。
+    #
+    # 注意必须排除“结果型”名字：`passwordChecked(matched)` 里的 matched 是
+    # 一个 bool 结果，不是密码本身；把它的实参也标成凭据会造成误报。
+    # 故只认名字含 password 且**不含** checked/result/valid/ok/success/failed
+    # 的被调方（如 passwordEntered / checkPassword / setPassword）。
+    taint_call = re.compile(
+        r"\b(?:emit\s+)?(?!\w*(?:checked|result|valid|success|failed|ok)\w*)"
+        r"\w*password\w*\s*\(([^()]*)\)",
+        re.IGNORECASE)
+    # 规则 3：在涉及密码的文件里打印按钮文本（逐位记录用户输入的数字）。
+    button_text = re.compile(r"\b\w+\s*->\s*text\s*\(\s*\)")
+    auth_file = re.compile(secret_name, re.IGNORECASE)
+    safe_re = re.compile(r"\.(size|length|count)\s*\(\s*\)|\.isEmpty\s*\(\s*\)")
+    log_re = re.compile(r"\bq(?:Debug|Warning|Info|Critical)\s*\(\s*\)")
+
+    for path in find_files(src_root, {".cpp", ".h", ".hpp"}):
+        raw = read(path)
+        text = strip_comments_and_strings(raw)
+        rel = os.path.relpath(path, root)
+
+        # 收集本文件内被当作凭据传递的标识符
+        tainted = set()
+        for tm in taint_call.finditer(text):
+            for arg in tm.group(1).split(","):
+                a = arg.strip()
+                if re.fullmatch(r"[A-Za-z_]\w*", a):
+                    tainted.add(a)
+
+        is_auth = bool(auth_file.search(text))
+
+        for m in log_re.finditer(text):
+            end = text.find(";", m.end())
+            if end < 0:
+                continue
+            stmt = text[m.end():end]
+            if safe_re.search(stmt):
+                continue  # 只看长度/空判定，不泄露内容
+
+            hit = None
+            if rule1.search(stmt):
+                hit = "密码/密钥类标识符"
+            else:
+                # 规则 2：语句里出现了被标记的凭据变量
+                for v in tainted:
+                    if re.search(r"\b" + re.escape(v) + r"\b", stmt):
+                        hit = "被当作密码传递的变量 " + v
+                        break
+                if hit is None and is_auth and button_text.search(stmt):
+                    hit = "密码输入界面的按键文本"
+
+            if hit is None:
+                continue
+            line = text.count("\n", 0, m.start()) + 1
+            fail("[secret-log] {}:{} 日志中输出了{}；门口机为实体门禁设备，"
+                 "日志可被他人读取且跨重启留存，应只记录“校验是否通过”或"
+                 "输入长度等非内容信息。"
+                 .format(rel, line, hit))
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: python verify.py <项目根目录>")
@@ -1317,6 +1504,8 @@ def main():
     check_json_configs(root)
     check_config_value_sanity(root, src_root)
     check_config_knobs_are_used(root, src_root)
+    check_no_running_reset_in_run(root, src_root)
+    check_no_secret_in_logs(root, src_root)
 
     print(f"校验目录: {root}")
     print("=" * 70)

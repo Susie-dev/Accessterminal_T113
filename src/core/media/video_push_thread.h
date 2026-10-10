@@ -37,8 +37,11 @@ private:
     QString serverIp;
     // 执行本行语句完成对应变量、对象或业务状态处理。
     quint16 serverPort;
-    // 执行本行语句完成对应变量、对象或业务状态处理。
-    std::atomic<bool> running{false};
+    // 停止标志。初值为 true，表示“构造完成即可运行”；run() 内**不得**
+    // 再置 true，否则会覆盖掉在 start() 与 run() 之间到达的 stop() 请求。
+    // 详见 video_push_thread.cpp 中构造函数的说明，以及 tools/verify.py
+    // 的 check_no_running_reset_in_run。
+    std::atomic<bool> running{true};
 // 结束当前代码块作用域。
 };
 
