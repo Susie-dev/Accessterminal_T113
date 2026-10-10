@@ -74,11 +74,20 @@ void CameraUdpServer::onReadyRead()
         
 
         
-        // 逐行注释：执行本行语句完成对应变量、对象或业务状态处理。
-        qint64 bytesRead = udpSocket->readDatagram(datagram.data(), datagram.size(), &sender, &senderPort);
-        
-
-
+        // 读取一个数据报。
+        //
+        // 注意不能忽略返回值：QByteArray::resize() 不会清零新分配的内存，
+        // 若实际读到的字节数少于 pendingDatagramSize()（或返回 -1），
+        // 后续 fromWire() 会解析到未初始化的尾部字节。
+        // 正常情况下 bytesRead == datagram.size()，行为与重构前完全一致。
+        const qint64 bytesRead = udpSocket->readDatagram(
+            datagram.data(), datagram.size(), &sender, &senderPort);
+        if (bytesRead < 0) {
+            continue; // 读取失败，丢弃该数据报
+        }
+        if (bytesRead < datagram.size()) {
+            datagram.resize(static_cast<int>(bytesRead));
+        }
 
         // 逐行注释：执行本行语句完成对应变量、对象或业务状态处理。
         const accessterminal::protocol::Signal cmd =

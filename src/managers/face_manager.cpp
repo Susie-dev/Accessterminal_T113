@@ -52,8 +52,13 @@ void FaceManager::train()
     // 这里所有样本都标记为 label=1，表示单用户门禁；多用户时应按用户 ID 分配 label。
     // 执行本行语句完成对应变量、对象或业务状态处理。
     std::vector<int> labels(collectTarget, 1);
-    // 执行本行语句完成对应变量、对象或业务状态处理。
-    faceRecognizer->train(QVector<cv::Mat>(registeredFaces).toStdVector(), labels);
+    // 用迭代器区间构造 std::vector：
+    //   - QVector::toStdVector() 在 Qt 5.15 起被标记弃用，Qt6 中已移除；
+    //   - 迭代器区间构造从 Qt4 起就可用，跨版本最稳。
+    // 原写法 QVector<cv::Mat>(registeredFaces).toStdVector() 中的 QVector
+    // 临时拷贝是多余的（registeredFaces 本身就是 QVector<cv::Mat>）。
+    const std::vector<cv::Mat> samples(registeredFaces.begin(), registeredFaces.end());
+    faceRecognizer->train(samples, labels);
     // 发出 Qt 信号 trainFinished 通知其他对象。
     emit trainFinished(true);
 // 结束当前代码块作用域。

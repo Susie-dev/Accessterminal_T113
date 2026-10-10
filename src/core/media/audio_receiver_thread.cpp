@@ -239,8 +239,13 @@ void AudioReceiverThread::run() {
                 if (bytes == 0) {
                     continue; // 空数据报，忽略
                 }
-                int rcw = snd_pcm_writei(pcm_handle, buffer,
-                                         bytes / (CHANNELS * sizeof(int16_t)));
+                // 期望写入的帧数。先算成 int：一是与 snd_pcm_writei 的返回值
+                // （存于 int rcw，与重构前的 baseline 一致）同类型比较，避免
+                // int 与 unsigned long long 比较触发 -Wsign-compare；二是每包
+                // 最多 320 帧，不存在溢出风险。
+                const int framesExpected =
+                    static_cast<int>(bytes / (CHANNELS * sizeof(int16_t)));
+                int rcw = snd_pcm_writei(pcm_handle, buffer, framesExpected);
                 if (rcw == -EPIPE) {
                     snd_pcm_prepare(pcm_handle);
                     continue;
@@ -249,7 +254,7 @@ void AudioReceiverThread::run() {
                     emit errorMsg(QString("write错误: %1").arg(snd_strerror(rcw)));
                     goto receive_done;
                 }
-                if (rcw != bytes / (CHANNELS * sizeof(int16_t))) {
+                if (rcw != framesExpected) {
                     qWarning() << "[AudioReceiverThread] 播放短写, 写了" << rcw << "帧";
                 }
             }

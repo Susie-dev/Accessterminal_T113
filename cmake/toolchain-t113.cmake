@@ -71,7 +71,8 @@ endif()
 
 # ---- 编译/链接选项 ----
 # 目标机为 ARMv7-A Cortex-A7，Tina 工具链默认已适配，这里仅补充通用优化。
-set(CMAKE_CXX_FLAGS_INIT "-Wall -Wextra -Wno-unused-parameter")
+# 警告标志（-Wall -Wextra -Wno-unused-parameter）统一由顶层 CMakeLists.txt
+# 的 ACCESSTERMINAL_WARNINGS 控制，此处不再重复设置，避免两处维护。
 set(CMAKE_EXE_LINKER_FLAGS_INIT "-Wl,--as-needed")
 
 # 嵌入式裁剪：减小二进制体积

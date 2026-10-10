@@ -29,9 +29,20 @@ SignalingClient::SignalingClient(QObject* parent)
     // 用 QOverload 挑选 error(QAbstractSocket::SocketError) 重载：
     // errorOccurred 直到 Qt 5.15 才引入，而 T113 的 Tina SDK 通常仍是
     // Qt 5.9~5.12，直接用它会在旧 SDK 上编译失败。
+    //
+    // 在 Qt 5.15+ 上该重载会被标记为弃用，因此这里就地屏蔽这个警告。
+    // 不用 errorOccurred 是**刻意的决定**（旧 SDK 上不存在），
+    // 保留警告只会让每次编译都出现无法消除的噪声。
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
     connect(m_socket,
             QOverload<QAbstractSocket::SocketError>::of(&QTcpSocket::error),
             this, &SignalingClient::onSocketError);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
     connect(m_reconnectTimer, &QTimer::timeout, this, [this]() {
         if (m_running) {
             qDebug() << "[信令] 正在重连" << m_serverIp << m_port;
