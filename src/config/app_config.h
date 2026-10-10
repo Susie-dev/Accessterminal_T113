@@ -20,6 +20,35 @@
 namespace accessterminal {
 
 /**
+ * @brief 把配置中的整数值限制到 [lo, hi]。
+ *
+ * 配置来源（JSON 文件、环境变量）都是不可信输入：
+ *   - 环境变量用 QString::toInt() 解析，**非法文本返回 0**（如
+ *     ACCESSTERMINAL_BEHAVIOR_FACE_DETECT_INTERVAL=abc → 0）；
+ *   - JSON 里也可以直接写 0 或负数。
+ *
+ * 这些值若被直接当作除数使用就会触发 SIGFPE（除零）导致进程崩溃。
+ * 例如 widget.cpp 的 `++detectCounter % cfg.faceDetectInterval()`：
+ * 重构前那里是硬编码常量 `const int detect_interval = 10;`，改写为
+ * 可配置后 0 值就变得可达了。因此所有数值型配置在**取值出口**统一兜底，
+ * 合法配置的行为与重构前逐字节一致。
+ */
+inline int clampInt(int value, int lo, int hi)
+{
+    if (value < lo) return lo;
+    if (value > hi) return hi;
+    return value;
+}
+
+/// 同上，用于浮点配置。
+inline double clampDouble(double value, double lo, double hi)
+{
+    if (value < lo) return lo;
+    if (value > hi) return hi;
+    return value;
+}
+
+/**
  * @brief 全局只读配置单例。
  *
  * 在 main() 中调用 load() 完成一次性初始化；运行期仅通过 const 访问器读取。
@@ -50,7 +79,8 @@ public:
     QString fingerprintPort() const { return m_fingerprintPort; }   ///< 如 /dev/ttyS4
     QString audioDevice() const { return m_audioDevice; }           ///< ALSA 设备名
     /// 开锁继电器与补光灯共用的 GPIO 线号（硬件上为同一引脚 PE5）。
-    int doorGpioLine() const { return m_doorGpioLine; }
+    /// 负线号会被 gpio 请求接口拒绝（错误码不直观），下限 0 使失败更明确。
+    int doorGpioLine() const { return clampInt(m_doorGpioLine, 0, 1024); }
 
     // ---- 资源路径 ----
     QString faceCascadePath() const { return m_faceCascadePath; }   ///< Haar 分类器
@@ -60,11 +90,22 @@ public:
     QString pcmFile(const QString& name) const;
 
     // ---- 行为参数 ----
-    int frameIntervalMs() const { return m_frameIntervalMs; }         ///< 画面刷新周期
-    int faceDetectInterval() const { return m_faceDetectInterval; }   ///< 每 N 帧检测一次
-    int faceRecognizeIntervalMs() const { return m_faceRecognizeIntervalMs; }
-    double faceConfidenceThreshold() const { return m_faceConfidenceThreshold; }
-    int fingerprintIdStart() const { return m_fingerprintIdStart; }
+    //
+    // 所有数值型访问器都在出口做范围兜底：配置是不可信输入，而 frame
+    // 周期 / 检测间隔 / 阈值一旦为 0 或负数，会在使用处引发除零（SIGFPE）、
+    // 定时器忙转或识别永远失败。合法值（默认值、示例配置）经兜底后不变，
+    // 因此与重构前行为一致。
+
+    /// 画面刷新周期（毫秒）。下限 1ms，避免 QTimer 被 0/负值变成忙循环。
+    int frameIntervalMs() const { return clampInt(m_frameIntervalMs, 1, 10000); }
+    /// 每 N 帧检测一次人脸。必须 >= 1，否则取模会除零。
+    int faceDetectInterval() const { return clampInt(m_faceDetectInterval, 1, 100000); }
+    /// 人脸识别冷却时间（毫秒），下限 0（0 表示不冷却，属合法配置）。
+    int faceRecognizeIntervalMs() const { return clampInt(m_faceRecognizeIntervalMs, 0, 3600000); }
+    /// LBPH 距离阈值，越小越严格；负数会让所有比对都“成功”，故下限 0。
+    double faceConfidenceThreshold() const { return clampDouble(m_faceConfidenceThreshold, 0.0, 1e9); }
+    /// 指纹起始 ID。协议用 2 字节承载，限定到 [0, 65535] 与线格式一致。
+    int fingerprintIdStart() const { return clampInt(m_fingerprintIdStart, 0, 65535); }
 
     /// 管理员开锁密码（默认值沿用重构前的 "5788"）。
     QString doorPassword() const { return m_doorPassword; }

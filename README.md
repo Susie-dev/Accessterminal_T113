@@ -268,7 +268,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下八条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下九条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -465,7 +465,44 @@ void FingerprintManager::startIdentify() {
 它与第 5 条互补：第 5 条只管「QWidget 子类、`close()` 后界面空转」，
 本条管「无法与共用同一设备的流程互斥」。二者互不覆盖。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述八条请以
+### 9. 数值配置必须在取值出口做范围兜底
+
+配置（JSON 文件、环境变量）是**不可信输入**。环境变量经
+`QString::toInt()` 解析时，非法文本会**静默返回 0**；JSON 里也可以直接
+写 0 或负数。
+
+重构前 `widget.cpp` 里是硬编码常量：
+
+```cpp
+const int detect_interval = 10;   // 每10帧检测一次
+```
+
+重构后改成从配置读取，于是这一行变成了可崩溃的代码：
+
+```cpp
+if (++detectCounter % cfg.faceDetectInterval() == 0 && ...)
+```
+
+只要把 `face_detect_interval` 配成 0，或设置
+`ACCESSTERMINAL_BEHAVIOR_FACE_DETECT_INTERVAL=abc`（→ 0），
+取模就会触发整数除零（Linux 上是 `SIGFPE`，进程直接崩溃）。
+
+同类风险还有：`frame_interval_ms` 为 0 让 `QTimer` 忙循环、
+LBPH 阈值为负导致所有人脸都判定通过、指纹起始 ID 超过 2 字节线格式。
+
+修法是在**取值出口**统一兜底（`app_config.h` 的 `clampInt()` /
+`clampDouble()`），这样所有调用方一次性被覆盖，且合法值（默认值与示例
+配置）经兜底后不变，与重构前行为一致：
+
+```cpp
+int faceDetectInterval() const { return clampInt(m_faceDetectInterval, 1, 100000); }
+```
+
+由 `check_config_value_sanity` 强制，并且它自己也有故障注入自检
+（`tools/verify_config_sanity.py`，6/6 用例）——静态规则写错会静默失效，
+必须证明它真的能区分好坏代码。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述九条请以
 `verify.py` 的结果为准。
 
 ---
@@ -490,7 +527,11 @@ python3 tools/verify.py .
 # 2. 签名一致性（.h 声明 vs .cpp 定义）
 python3 tools/check_signatures.py .
 
-# 2b. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
+# 2b. 校验器自检：对 check_config_value_sanity 做故障注入（6/6 用例）
+#     静态规则写错会静默失效，用故障注入证明它真的能区分好坏代码。
+python3 tools/verify_config_sanity.py .
+
+# 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
 #     含「原实现对照」与随机模糊测试；无需编译即可验证定帧逻辑）
 python3 tools/verify_fingerprint_parser_algorithm.py
 

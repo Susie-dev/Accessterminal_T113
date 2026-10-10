@@ -355,6 +355,111 @@ def check_json_configs(root):
                 fail(f"[json] {name} 字段 {'.'.join(keys)} 类型应为 {typ.__name__}，"
                      f"实为 {type(node).__name__}")
 
+        # 数值型字段还要做**取值**校验：随包发布的示例配置本身不能带
+        # 0/负数这类会引发除零或忙循环的值（取值出口的兜底见
+        # check_config_value_sanity()，两者互补）。
+        # 注意 bool 是 int 的子类，需显式排除，否则 true 会被当成合法整数。
+        ranges = [
+            (("behavior", "frame_interval_ms"), 1, 10000),
+            (("behavior", "face_detect_interval"), 1, 100000),
+            (("behavior", "face_recognize_interval_ms"), 0, 3600000),
+            (("behavior", "fingerprint_id_start"), 0, 65535),
+            (("hardware", "door_gpio_line"), 0, 1024),
+        ]
+        for keys, lo, hi in ranges:
+            node = data
+            ok = True
+            for k in keys:
+                if not isinstance(node, dict) or k not in node:
+                    ok = False
+                    break
+                node = node[k]
+            if not ok or isinstance(node, bool) or not isinstance(node, (int, float)):
+                continue  # 缺失/类型错误已在上面的 checks 中报过
+            if not (lo <= node <= hi):
+                fail(f"[json] {name} 字段 {'.'.join(keys)} 取值 {node} "
+                     f"越界，允许范围 [{lo}, {hi}]")
+
+
+def check_config_value_sanity(root, src_root):
+    """
+    数值型配置的取值出口必须做范围兜底。
+
+    背景（真实缺陷，重构引入）：
+    重构前 widget.cpp 里是硬编码常量
+
+        const int detect_interval = 10;   // 每10帧检测一次
+
+    重构后改成了从配置读取：
+
+        if (++detectCounter % cfg.faceDetectInterval() == 0 && ...)
+
+    而配置是不可信输入：
+      - 环境变量经 QString::toInt() 解析，**非法文本静默返回 0**，例如
+        ACCESSTERMINAL_BEHAVIOR_FACE_DETECT_INTERVAL=abc → 0；
+      - JSON 文件里也可以直接写 0 或负数。
+    于是在 widget.cpp:814 处触发整数除零（Linux 上为 SIGFPE，进程直接崩溃）。
+    同类风险还有：QTimer 周期为 0 导致忙循环、LBPH 阈值为负导致所有人脸
+    都通过、指纹 ID 超过 2 字节线格式溢出。
+
+    做法分两步：
+      A) 找出“用配置取值做除数”的取模/除法表达式，确认其配置访问器
+         在 app_config.h 里被 clampInt()/clampDouble() 包住；
+      B) 反向确认：所有 int/double 型配置访问器都必须经过 clamp。
+
+    这样既覆盖了已发现的真实缺陷，也防止将来新增配置字段时重蹈覆辙。
+    """
+    header = os.path.join(src_root, "config", "app_config.h")
+    if not os.path.isfile(header):
+        fail("[config-sanity] 找不到 src/config/app_config.h")
+        return
+    htext = strip_comments_and_strings(read(header))
+
+    # ---- 收集所有数值型访问器及其是否有 clamp 保护 ----
+    # 形如:  int faceDetectInterval() const { return clampInt(m_x, 1, 100); }
+    #
+    # 必须匹配 `return clampInt(` / `return clampDouble(` 这种**调用**形态，
+    # 而不是裸的 "clampInt(" 子串：后者会把 `return static_cast<quint16>(
+    # clampInt(...))` 之外的情形也放过，也可能被注释/无关文本误命中。
+    getter_re = re.compile(
+        r'\b(?:int|double|quint16|qint16|qint32|quint32|long|short)\s+'
+        r'(\w+)\s*\(\s*\)\s*const\s*\{([^{}]*)\}')
+    clamp_call_re = re.compile(r'\breturn\b[^;]*\bclamp(?:Int|Double)\s*\(')
+    numeric_getters = {}
+    for name, body in getter_re.findall(htext):
+        numeric_getters[name] = bool(clamp_call_re.search(body))
+
+    if not numeric_getters:
+        fail("[config-sanity] 未在 app_config.h 中解析到任何数值型访问器"
+             "（检查器已失效，请更新正则）")
+        return
+
+    unprotected = sorted(n for n, ok in numeric_getters.items() if not ok)
+    if unprotected:
+        fail("[config-sanity] 这些数值型配置访问器未做范围兜底: "
+             + ", ".join(unprotected)
+             + "（配置值可为 0/负数，用作除数会 SIGFPE）")
+
+    # ---- A) 用配置取值做除数的地方 ----
+    # 匹配 ... % cfg.xxx()  或  ... / cfg.xxx()  或 % AppConfig::instance().xxx()
+    divisor_re = re.compile(
+        r'[%\/]\s*(?:cfg|AppConfig::instance\(\))\s*\.\s*(\w+)\s*\(\s*\)')
+
+    for path in find_files(src_root, {".cpp", ".h"}):
+        text = strip_comments_and_strings(read(path))
+        for m in divisor_re.finditer(text):
+            getter = m.group(1)
+            line = text.count("\n", 0, m.start()) + 1
+            rel = os.path.relpath(path, root)
+            if getter not in numeric_getters:
+                # 可能不是数值型访问器（例如 pcmFile()），只提示不判失败
+                warn(f"[config-sanity] {rel}:{line} 用 cfg.{getter}() 做除数，"
+                     f"但未在 app_config.h 找到数值型访问器，请人工确认")
+                continue
+            if not numeric_getters[getter]:
+                fail(f"[config-sanity] {rel}:{line} 用未兜底的配置值 "
+                     f"cfg.{getter}() 做除数，配置为 0 时会除零崩溃")
+
 
 def check_deferred_session_guard(root, src_root):
     """
@@ -1057,6 +1162,7 @@ def main():
     check_response_index_bounds(root, src_root)
     check_connect_signal_is_signal(root, src_root)
     check_json_configs(root)
+    check_config_value_sanity(root, src_root)
 
     print(f"校验目录: {root}")
     print("=" * 70)
