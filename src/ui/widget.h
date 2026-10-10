@@ -5,9 +5,9 @@
  * 重构说明：原实现的 Widget 同时承担 UI、网络、硬件、AI 与线程管理，
  * 单文件超过 1300 行。现按分层拆解：
  *   - 信令       -> core/net/SignalingClient
- *   - 音视频线程  -> core/media/*
+ *   - 音视频线程  -> core/media 子模块
  *   - 硬件/协议   -> hal/fingerprint_hailin, hal/gpio
- *   - 业务逻辑    -> managers/*
+ *   - 业务逻辑    -> managers 子模块
  *   - 参数        -> config/AppConfig
  * Widget 仅保留界面控件操作与各模块之间的编排。
  */
@@ -20,7 +20,10 @@
 #include <QVector>
 #include <QWidget>
 #include <atomic>
+// cv::CascadeClassifier 由 objdetect 模块提供，仅 include core.hpp 不足以
+// 获得其声明（已由主机端真实编译验证）。
 #include <opencv2/core.hpp>
+#include <opencv2/objdetect.hpp>
 
 #include "core/net/protocol.h"
 
@@ -34,12 +37,12 @@ class QResizeEvent;
 // 工程内既有 Qt 类沿用全局命名空间（与重构前一致，降低改动风险）；
 // 新增基础设施模块位于 accessterminal 命名空间内。
 class AudioManager;
-class CameraPreviewServer;
+class CameraUdpServer;
 class FaceManager;
 class FingerprintManager;
 class HailinFingerprint;
 class PasswordManager;
-class VideoPushThread;
+class CameraPushThread;
 class AudioSenderThread;
 class AudioReceiverThread;
 class V4L2Camera;
@@ -106,6 +109,19 @@ public:
     int nextFingerId() const { return m_nextFingerId; }
     void incrementNextFingerId() { ++m_nextFingerId; }
 
+    /**
+     * @brief 通知室内机“本端已停止发送”（协议信令 stopsend）。
+     *
+     * 供通话窗口的本地挂断按钮调用。重构前该逻辑直接写在 Form_CALL 里
+     * 并通过 widget->tcpSignalSocket 裸访问 socket；现在信令通道归
+     * SignalingClient 所有，故收敛为一个明确的接口，避免 UI 层依赖
+     * socket 细节。
+     *
+     * 注意：仅在**本地**挂断时发送，远端 recstop 触发的挂断不发，
+     *       以保持与重构前完全一致的信令时序。
+     */
+    void notifyPeerStopSend();
+
 private slots:
     // ---- 主界面按钮 ----
     void on_btncall_clicked();
@@ -164,7 +180,7 @@ private:
 
     // ---- 摄像头与视觉 ----
     V4L2Camera* m_camera = nullptr;
-    CameraPreviewServer* m_previewServer = nullptr;  ///< 远程监看（UDP 50000）
+    CameraUdpServer* m_previewServer = nullptr;  ///< 远程监看（UDP 50000）
     cv::CascadeClassifier m_faceCascade;
     QVector<cv::Rect> m_faces;
     int m_collectCount = 0;
@@ -172,7 +188,7 @@ private:
     // ---- 通话期间的音视频（仅在 accept 后创建）----
     AudioSenderThread* m_audioSenderThread = nullptr;
     AudioReceiverThread* m_audioReceiverThread = nullptr;
-    VideoPushThread* m_cameraPushThread = nullptr;
+    CameraPushThread* m_cameraPushThread = nullptr;
     int m_audioSocketFd = -1;  ///< 音视频共用的 UDP socket，由 Widget 统一持有
 
     // ---- GPIO 与轮询线程 ----

@@ -10,6 +10,13 @@
 
 #include <QString>
 
+// 必须在使用 gpiod_chip/gpiod_line 之前引入 libgpiod 的声明。
+// 否则在 namespace accessterminal 内书写 `struct gpiod_chip* m_chip;`
+// 会被当作 elaborated-type-specifier，在**本命名空间**里声明出一个全新的
+// 不完整类型 accessterminal::gpiod_chip，导致 gpiod_* 函数调用时实参
+// 类型不匹配而编译失败（已由主机端真实编译验证捕获）。
+#include <gpiod.h>
+
 namespace accessterminal {
 
 /**

@@ -252,6 +252,56 @@ def check_qt5_portability(root, src_root):
                 fail(f"[cxx11] {rel} 使用了 {desc}，本工程为 C++11")
 
 
+def check_forward_declarations(root, src_root):
+    """
+    前置声明一致性检查。
+
+    背景（真实缺陷）：重构后 widget.h 曾出现
+        class VideoPushThread;
+        class CameraPreviewServer;
+    但工程里实际定义的类型是 CameraPushThread 与 CameraUdpServer。
+    前置声明本身不报错，直到 widget.cpp 写
+        m_cameraPushThread = new VideoPushThread(...);
+    才报 "invalid use of incomplete type"，而且报错位置离根因很远，
+    极易误判为缺少 include。
+
+    做法：收集本工程所有 "class X;" 形式的前置声明，若 X 既不在本工程
+    的类/结构体定义中，也不是已知的 Qt/标准库类型，则告警。
+    仅检查本工程自有的类，Qt 类型（QTimer 等）不参与。
+    """
+    candidates = {}
+    for path in find_files(src_root, {".h", ".cpp"}):
+        raw = read(path)
+        text = strip_comments_and_strings(raw)
+        for m in re.finditer(r'^\s*class\s+([A-Za-z_]\w*)\s*;', text, re.M):
+            name = m.group(1)
+            # 跳过程序内定义的类
+            if re.search(r'\b(?:class|struct)\s+' + re.escape(name) +
+                         r'\b[^;{]*\{', text):
+                continue
+            candidates.setdefault(name, []).append(os.path.relpath(path, root))
+
+    # 全局收集本工程实际定义的类型名
+    defined = set()
+    for path in find_files(src_root, {".h", ".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        for m in re.finditer(r'\b(?:class|struct)\s+([A-Za-z_]\w*)\b\s*(?::[^;{]*)?\{',
+                             text):
+            defined.add(m.group(1))
+
+    for name, where in sorted(candidates.items()):
+        if name in defined:
+            continue
+        # Qt / 标准库类型不检查
+        if name.startswith('Q') or name.startswith('Ui') or name in (
+                'timeval', 'sockaddr', 'sockaddr_in', 'gpiod_chip',
+                'gpiod_line', 'snd_pcm_t', 'snd_mixer_t', 'v4l2_buffer'):
+            continue
+        fail("[fwd] {} 前置声明了未在本工程定义的类型 '{}'；"
+             "若这是一个真实使用的成员类型，编译期会报 incomplete type"
+             .format(', '.join(sorted(set(where))), name))
+
+
 def check_json_configs(root):
     """配置文件必须是合法 JSON，且字段类型正确。"""
     import json
@@ -307,6 +357,7 @@ def main():
     check_balance(root, src_root)
     check_legacy_identifiers(root, src_root)
     check_qt5_portability(root, src_root)
+    check_forward_declarations(root, src_root)
     check_json_configs(root)
 
     print(f"校验目录: {root}")

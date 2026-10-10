@@ -8,6 +8,15 @@
 #include "config/app_config.h"
 #include "ui/widget.h"
 
+// Widget 暴露的模块指针需要完整类型才能调用其成员：
+//   - audioManager() -> AudioManager
+//   - fingerprint()  -> HailinFingerprint
+// 仅靠 widget.h 中的前置声明无法通过编译。
+#include "hal/fingerprint_hailin.h"
+#include "managers/audio_manager.h"
+
+#include <QDebug>
+
 // 定义类 Form_finger 的成员函数 Form_finger。
 Form_finger::Form_finger(QWidget *parent) :
     // 继续当前代码块的参数、表达式或结构定义。

@@ -252,7 +252,7 @@ void Widget::setupModules()
 
     // 指纹识别结果 -> 提示音，并循环重启识别。
     connect(m_fingerprintManager, &FingerprintManager::identifyResult, this,
-            [this](bool success, int /*id*/, int /*score*/, const QString& msg) {
+            [this, &cfg](bool success, int /*id*/, int /*score*/, const QString& msg) {
                 if (msg == QStringLiteral("请按下指纹进行识别")) {
                     return; // 采集提示不播报，避免持续噪音
                 }
@@ -349,7 +349,7 @@ void Widget::setupModules()
     } else {
         qInfo() << "[摄像头] 设备打开成功:" << cfg.cameraDevice();
     }
-    m_previewServer = new CameraPreviewServer(
+    m_previewServer = new CameraUdpServer(
         m_camera, accessterminal::protocol::kPreviewPort, this);
 
     // 采集+显示定时器。
@@ -436,7 +436,7 @@ void Widget::startCallSession()
         delete m_cameraPushThread;
         m_cameraPushThread = nullptr;
     }
-    m_cameraPushThread = new VideoPushThread(m_camera, cfg.serverIp(),
+    m_cameraPushThread = new CameraPushThread(m_camera, cfg.serverIp(),
                                              accessterminal::protocol::kVideoPort, this);
     m_cameraPushThread->start();
 
@@ -557,6 +557,22 @@ void Widget::onSignalReceived(Signal signal)
     default:
         // 门口机不处理 call/getframe/stop/stopsend，忽略即可。
         break;
+    }
+}
+
+// ============================================================================
+// 信令发送
+// ============================================================================
+
+void Widget::notifyPeerStopSend()
+{
+    // 重构前 Form_CALL 的判断是
+    //   if (widget->tcpSignalSocket &&
+    //       widget->tcpSignalSocket->state() == QAbstractSocket::ConnectedState)
+    // SignalingClient::send() 内部已做“未连接则告警并返回 false”的等价判断，
+    // 因此这里直接调用即可，信令内容与时机保持一致。
+    if (m_signaling) {
+        m_signaling->send(accessterminal::protocol::Signal::StopSend);
     }
 }
 

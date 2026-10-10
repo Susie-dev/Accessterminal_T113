@@ -4,6 +4,9 @@
 #include "ui_form_call.h"
 // 引入项目内部头文件 "widget.h"。
 #include "ui/widget.h"
+// Widget 的公开接口返回 AudioManager*，调用 audioManager()->stop() 需要
+// 完整类型（仅前置声明不足），故显式引入。
+#include "managers/audio_manager.h"
 
 // 定义类 Form_CALL 的成员函数 Form_CALL。
 Form_CALL::Form_CALL(QWidget *parent) :
@@ -35,15 +38,11 @@ Form_CALL::Form_CALL(QWidget *parent) :
             if (widget) {
                 // 执行本行语句完成对应变量、对象或业务状态处理。
                 widget->audioManager()->stop();
-                // 通过TCP信令通道发送stopsend
-                // 根据条件判断是否执行该分支。
-                if (widget->tcpSignalSocket && widget->tcpSignalSocket->state() == QAbstractSocket::ConnectedState) {
-                    // 执行本行语句完成对应变量、对象或业务状态处理。
-                    widget->tcpSignalSocket->write("stopsend\n");
-                    // 执行本行语句完成对应变量、对象或业务状态处理。
-                    widget->tcpSignalSocket->flush();
-                // 结束当前代码块作用域。
-                }
+                // 通过信令通道通知室内机本端已停止发送（stopsend）。
+                // 重构前这里直接访问 widget->tcpSignalSocket 并写裸字符串，
+                // 但重构后 socket 归 SignalingClient 所有，Widget 已不再暴露
+                // 该成员，故改用 Widget::notifyPeerStopSend()。
+                widget->notifyPeerStopSend();
             // 结束当前代码块作用域。
             }
         // 结束当前代码块作用域。

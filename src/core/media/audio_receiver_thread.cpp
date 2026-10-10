@@ -14,6 +14,10 @@
 #include <alsa/asoundlib.h>
 //引入系统或第三方头文件 <fcntl.h>。
 #include <fcntl.h>
+// select()/fd_set/FD_ZERO 由 POSIX 规定在 <sys/select.h> 中声明。
+// glibc 通常经其它头间接引入，但依赖间接引入不可靠（在更严格的
+// libc 或开启 _POSIX_C_SOURCE 时可能不可见），故显式包含。
+#include <sys/select.h>
 
 #include "core/net/protocol.h"
 #include "config/app_config.h"
@@ -21,7 +25,11 @@
 // 音频参数与端口统一来自 protocol.h，设备名来自 AppConfig。
 namespace {
 using namespace accessterminal::protocol;
-constexpr int kSampleFormat = SND_PCM_FORMAT_S16_LE;
+// 必须保持 ALSA 的枚举类型：snd_pcm_hw_params_set_format 的形参是
+// snd_pcm_format_t，若先存成 constexpr int 再传回，C++ 不允许 int 隐式
+// 转回枚举，会编译失败。此处用 auto 保留原类型（重构前的 baseline 是
+// 直接把 SND_PCM_FORMAT_S16_LE 传给该函数）。
+constexpr auto kSampleFormat = SND_PCM_FORMAT_S16_LE;
 
 /**
  * @brief 取得 ALSA 播放设备名字符串。

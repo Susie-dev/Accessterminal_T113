@@ -20,7 +20,10 @@
 // 设备名来自 AppConfig，避免与接收端及对端不一致。
 namespace {
 using namespace accessterminal::protocol;
-constexpr int kSampleFormat = SND_PCM_FORMAT_S16_LE;
+// 必须保持 ALSA 的枚举类型：snd_pcm_hw_params_set_format 形参为
+// snd_pcm_format_t，若存成 constexpr int 再传回会因 int->enum 非法而
+// 编译失败。用 auto 保留原类型（baseline 是直接传枚举量）。
+constexpr auto kSampleFormat = SND_PCM_FORMAT_S16_LE;
 
 /**
  * @brief 取得 ALSA 采集设备名字符串。

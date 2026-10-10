@@ -5,6 +5,9 @@
 // 引入项目内部头文件 "widget.h"。
 #include "config/app_config.h"
 #include "ui/widget.h"
+// Widget::audioManager() 返回 AudioManager*，调用其成员需要完整类型
+// （widget.h 中仅有前置声明）。
+#include "managers/audio_manager.h"
 // 引入系统或第三方头文件 <QFile>。
 #include <QFile>
 // 引入系统或第三方头文件 <QProcess>。

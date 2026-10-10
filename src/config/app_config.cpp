@@ -55,12 +55,12 @@ QJsonObject jsonObject(const QJsonObject& obj, const char* key)
  * @param name 环境变量名。
  * @param target 被覆盖的字段。
  */
-template <typename T>
-void envOverride(const char* name, T& target, T (*convert)(const QByteArray&))
+template <typename T, typename Converter>
+void envOverride(const char* name, T& target, Converter convert)
 {
     const QByteArray raw = qgetenv(name);
     if (!raw.isEmpty()) {
-        target = convert(raw);
+        target = static_cast<T>(convert(raw));
     }
 }
 
