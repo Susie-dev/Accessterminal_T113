@@ -5,6 +5,8 @@
 
 // 引入系统或第三方头文件 <QObject>。
 #include <QObject>
+// 引入系统或第三方头文件 <QImage>：接口以 const QImage& 引用该类型。
+#include <QImage>
 // 引入系统或第三方头文件 <QVector>。
 #include <QVector>
 // 引入系统或第三方头文件 <opencv2/opencv.hpp>。

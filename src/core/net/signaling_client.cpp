@@ -25,8 +25,12 @@ SignalingClient::SignalingClient(QObject* parent)
     connect(m_socket, &QTcpSocket::connected, this, &SignalingClient::onConnected);
     connect(m_socket, &QTcpSocket::disconnected, this, &SignalingClient::onDisconnected);
     connect(m_socket, &QTcpSocket::readyRead, this, &SignalingClient::onReadyRead);
-    // Qt5.15 起 error() 已弃用，errorOccurred 在 Qt5.15+/Qt6 均可用。
-    connect(m_socket, &QAbstractSocket::errorOccurred, this, &SignalingClient::onSocketError);
+    // 用 QOverload 挑选 error(QAbstractSocket::SocketError) 重载：
+    // errorOccurred 直到 Qt 5.15 才引入，而 T113 的 Tina SDK 通常仍是
+    // Qt 5.9~5.12，直接用它会在旧 SDK 上编译失败。
+    connect(m_socket,
+            QOverload<QAbstractSocket::SocketError>::of(&QTcpSocket::error),
+            this, &SignalingClient::onSocketError);
     connect(m_reconnectTimer, &QTimer::timeout, this, [this]() {
         if (m_running) {
             qDebug() << "[信令] 正在重连" << m_serverIp << m_port;
@@ -124,8 +128,8 @@ void SignalingClient::scheduleReconnect()
 void SignalingClient::onReadyRead()
 {
     const QByteArray data = m_socket->readAll();
-    // TCP 是字节流，一条 readAll 可能包含多条以 '\n' 分隔的信令。
-    // Qt6 移除了 QString::SkipEmptyParts 的旧拼写，使用 Qt::SkipEmptyParts 兼容 Qt5.14+/Qt6。
+    // TCP 是字节流，一条 readAll 可能包含多条以 '\n' 分隔的信令，
+    // 也可能只有半条。按终止符切分并逐条解析，避免粘包/半包漏判。
     const QList<QByteArray> lines = data.split(protocol::kSignalTerminator);
     for (const QByteArray& line : lines) {
         const QByteArray trimmed = line.trimmed();

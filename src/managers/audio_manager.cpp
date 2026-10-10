@@ -1,5 +1,7 @@
 // 引入项目内部头文件 "audio_manager.h"。
 #include "managers/audio_manager.h"
+// 引入项目内部头文件 "config/app_config.h"。
+#include "config/app_config.h"
 // 引入系统或第三方头文件 <QFile>。
 #include <QFile>
 // 引入系统或第三方头文件 <QDebug>。
@@ -67,7 +69,11 @@ void AudioManager::playPcmFile(const QString& pcmFilePath, std::atomic<bool>* in
     // 调用 ALSA 音频接口配置或读写 PCM 设备。
     snd_pcm_t *pcm_handle;
     // 执行本行语句完成对应变量、对象或业务状态处理。
-    int rc = snd_pcm_open(&pcm_handle, "hw:audiocodec", SND_PCM_STREAM_PLAYBACK, 0);
+    // 设备名来自 AppConfig，与音视频线程保持一致；用静态缓冲保证
+    // 指针生命周期覆盖整个运行期（snd_pcm_open 不会保留该指针）。
+    static const QByteArray deviceName =
+        accessterminal::AppConfig::instance().audioDevice().toUtf8();
+    int rc = snd_pcm_open(&pcm_handle, deviceName.constData(), SND_PCM_STREAM_PLAYBACK, 0);
     // 根据条件判断是否执行该分支。
     if (rc < 0) {
         // 输出警告日志。
