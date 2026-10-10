@@ -16,6 +16,7 @@
 
 #include <QImage>
 #include <QPixmap>
+#include <QPointer>
 #include <QThread>
 #include <QVector>
 #include <QWidget>
@@ -164,7 +165,11 @@ private:
 
     // ---- UI 子窗口 ----
     Form_finger* m_fingerForm = nullptr;
-    Form_passwd* m_passwdForm = nullptr;
+    /// 密码输入窗口。用 QPointer 而非裸指针：该窗口设了
+    /// Qt::WA_DeleteOnClose，点“确定”或用户关闭窗口后对象即被销毁；
+    /// 裸指针会立即变成悬垂指针，而 passwordChecked 回调里还会访问它。
+    /// QPointer 在被指向对象销毁后自动变空，是这里最直接的守卫。
+    QPointer<Form_passwd> m_passwdForm;
     Form_CALL* m_callForm = nullptr;
 
     // ---- 业务模块 ----

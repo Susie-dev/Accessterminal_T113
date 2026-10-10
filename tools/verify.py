@@ -499,6 +499,70 @@ def check_accept_gated_threads(root, src_root):
     _ = body_line0
 
 
+def check_deleted_on_close_members(root, src_root):
+    """
+    WA_DeleteOnClose 窗口不得用裸指针成员跟踪。
+
+    背景（真实缺陷，本轮由重构引入并修复）：on_btnpsswd_clicked() 创建
+    Form_passwd 并设 Qt::WA_DeleteOnClose，然后把裸指针存进成员
+    m_passwdForm。该窗口在用户点“确定”或直接关闭时会被 Qt 自动销毁，
+    m_passwdForm 立刻成为悬垂指针；而 PasswordManager::passwordChecked
+    的回调里还会 `if (m_passwdForm) m_passwdForm->close();` ——
+    对已释放对象调用成员函数，use-after-free。
+
+    这类缺陷静态上很好识别：凡是在某处 `setAttribute(Qt::WA_DeleteOnClose)`
+    的对象，若其句柄被赋给「裸指针类型的成员」，就需要改造成 QPointer
+    （对象销毁后自动变空）。
+
+    注意 baseline 里这段恰好不触发：原代码写的是
+        Form_passwd* passwdForm = new Form_passwd(this);
+    声明了同名【局部变量】遮蔽成员，成员永远为 nullptr，所以不会悬垂，
+    但代价是“密码正确后窗口不会关闭”。重构把局部改为成员时修掉了那个
+    功能缺陷，却引入了悬垂——这正是本检查要防住的回归。
+    """
+    for path in find_files(src_root, {".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        rel = os.path.relpath(path, root)
+        if "WA_DeleteOnClose" not in text:
+            continue
+
+        # 收集「被设置了 WA_DeleteOnClose 的变量名」
+        marked = set()
+        for m in re.finditer(r'(\w+)\s*->\s*setAttribute\s*\(\s*'
+                             r'(?:Qt::)?WA_DeleteOnClose', text):
+            marked.add(m.group(1))
+        # 形如 setAttribute(Qt::WA_DeleteOnClose) 的隐式 this 用法不涉及成员名
+
+        if not marked:
+            continue
+
+        # 在头文件里找裸指针类型的成员声明
+        header = path[:-4] + ".h"
+        if not os.path.isfile(header):
+            continue
+        htext = strip_comments_and_strings(read(header))
+        # 形如:  Form_passwd* m_passwdForm = nullptr;
+        #        Form_passwd *m_passwdForm;
+        raw_members = {}
+        for m in re.finditer(r'^\s*(?:[\w:]+)\s*\*\s*(m_\w+)\s*(?:=[^;]*)?;',
+                             htext, re.M):
+            raw_members[m.group(1)] = m.group(0).strip()
+
+        for var in marked:
+            # 该变量是否被赋给了某个裸指针成员
+            # 形如  m_xxx = var;   或   m_xxx = new ...（new 形式也查）
+            for mm in re.finditer(r'\b(m_\w+)\s*=\s*' + re.escape(var) + r'\s*;',
+                                  text):
+                member = mm.group(1)
+                if member in raw_members:
+                    line = text.count("\n", 0, mm.start()) + 1
+                    fail("[dtor-close] {}:{} 把设了 WA_DeleteOnClose 的 '{}' 存入"
+                         "裸指针成员 '{}'（{}）；该窗口关闭时会被 Qt 自动销毁，"
+                         "成员随即悬垂。请改用 QPointer<...>。"
+                         .format(rel, line, var, member,
+                                 raw_members[member]))
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: python verify.py <项目根目录>")
@@ -519,6 +583,7 @@ def main():
     check_forward_declarations(root, src_root)
     check_deferred_session_guard(root, src_root)
     check_accept_gated_threads(root, src_root)
+    check_deleted_on_close_members(root, src_root)
     check_json_configs(root)
 
     print(f"校验目录: {root}")
