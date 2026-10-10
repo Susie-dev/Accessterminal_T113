@@ -136,7 +136,6 @@ private slots:
     // ---- 指纹 ----
     void onFingerprintIdentify(bool success, int id, int score, const QString& msg);
     void onFingerprintEnroll(bool success, int id, const QString& msg);
-    void onAddFingerFromFingerForm();
 
     // ---- 人脸 ----
     void onAddFaceFromFingerForm();

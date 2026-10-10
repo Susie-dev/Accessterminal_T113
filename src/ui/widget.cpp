@@ -666,10 +666,25 @@ void Widget::on_btnadd_clicked()
 
     if (!m_fingerForm) {
         m_fingerForm = new Form_finger(this);
+        // 只连接 addFaceRequested —— 它是 Form_finger 中唯一的真信号。
+        //
+        // 这里原本还有一行
+        //     connect(m_fingerForm, &Form_finger::addFingerRequested,
+        //             this, &Widget::onAddFingerFromFingerForm);
+        // 但 Form_finger::addFingerRequested() 声明在 `public slots:` 区：它自己
+        // 就是 ui->addfinger 的槽，内部完成整套分步注册（轮询→采集→生成特征→
+        // 合并→存储）。Qt5 的 PMF 版 connect 要求第二个实参是信号，而 moc 只为
+        // `signals:` 区的成员生成信号索引，因此该 connect 在运行期必然失败
+        // （打印 "signal not found in Form_finger"）并返回 false，对应的
+        // Widget::onAddFingerFromFingerForm()（进而 HAL 的 stepRegister()）从来
+        // 没有被执行过。
+        //
+        // 指纹注册实际由 Form_finger 内部的分步流程完成，不需要再通知父窗口；
+        // 保留那行连接只会得到一个“看起来配好了、实际从未生效”的假象，
+        // 并可能诱导以后有人在两条注册路径上重复注册同一个手指（两者都会
+        // 直接读写同一个串口）。故删去。
         connect(m_fingerForm, &Form_finger::addFaceRequested,
                 this, &Widget::onAddFaceFromFingerForm);
-        connect(m_fingerForm, &Form_finger::addFingerRequested,
-                this, &Widget::onAddFingerFromFingerForm);
     }
     m_fingerForm->move(ui->widget_3->mapToGlobal(QPoint(0, 0)));
     m_fingerForm->show();
@@ -726,15 +741,6 @@ void Widget::onFingerprintEnroll(bool success, int id, const QString& msg)
         QMessageBox::warning(this, QStringLiteral("指纹注册"),
                              QStringLiteral("注册失败，ID=%1\n原因：%2").arg(id).arg(msg));
     }
-}
-
-void Widget::onAddFingerFromFingerForm()
-{
-    qDebug() << "[分步注册] 开始分步注册, ID=" << m_nextFingerId;
-    QMessageBox::information(
-        this, QStringLiteral("分步注册"),
-        QStringLiteral("请将手指按在指纹模块上，按提示操作，每次采集后抬手再按。"));
-    QtConcurrent::run(m_fingerprint, &HailinFingerprint::stepRegister, m_nextFingerId, 3);
 }
 
 void Widget::onAddFaceFromFingerForm()
