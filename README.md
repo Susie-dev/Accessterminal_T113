@@ -328,6 +328,10 @@ python3 tools/verify.py .
 # 2. 签名一致性（.h 声明 vs .cpp 定义）
 python3 tools/check_signatures.py .
 
+# 2b. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
+#     含「原实现对照」与随机模糊测试；无需编译即可验证定帧逻辑）
+python3 tools/verify_fingerprint_parser_algorithm.py
+
 # 3. 跨仓库协议一致性
 python3 tools/check_protocol_sync.py
 
@@ -341,7 +345,7 @@ bash tools/check_host_link.sh
 bash tests/interop/run_interop.sh
 ```
 
-六个脚本在 CI 中也可直接使用，退出码非 0 即表示失败。
+以上脚本在 CI 中也可直接使用，退出码非 0 即表示失败。
 
 第 1~3 步是静态检查，速度快但覆盖有限；**第 4、5 步不能省**——
 像“前置声明了不存在的类名”“把 ALSA 枚举存成 int 再传回枚举形参”
