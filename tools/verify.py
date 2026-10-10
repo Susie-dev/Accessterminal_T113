@@ -499,6 +499,94 @@ def check_accept_gated_threads(root, src_root):
     _ = body_line0
 
 
+def check_response_index_bounds(root, src_root):
+    """
+    串口/协议应答在被按下标取值前，必须先校验长度。
+
+    背景（真实缺陷，来自 baseline，本轮修复）：
+    `HailinFingerprint::autoIdentify()` 只写了
+
+        QByteArray resp = readPacket(timeoutMs);
+        if (resp.isEmpty()) { ... return false; }
+        quint8 confirm = (quint8)resp[9];
+        ...
+        quint16 score = ((quint8)resp[13] << 8) | (quint8)resp[14];   // 越界
+
+    定帧的 `FingerprintFrameParser` 只保证「长度字段自洽」，最短合法帧是
+    9(包头+地址+标识+长度) + 2(校验和) = **11 字节**。也就是说 resp 完全
+    可能是 11~14 字节的合法帧，此时 resp[11..14] 越界。
+    `QByteArray::operator[]` 越界是**未定义行为**（不像 QString 返回空引用），
+    只判 `isEmpty()` 挡不住这种“短但合法”的帧。
+
+    判定规则：对形如 `resp[K]` / `resp.at(K)` 的常量下标访问，若所在函数内
+    没有任何 `resp.size()` 与 K+1 的比较（且 K 大于包头长度 6），即报错。
+
+    包头占 0..5，下标 6（包标识）恒在最短帧内，故从 7 起才要求校验。
+    """
+    for path in find_files(src_root, {".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        rel = os.path.relpath(path, root)
+        if ".size()" not in text and "resp[" not in text:
+            continue
+
+        # 按函数切分：用「函数定义行」作为分界
+        funcs = list(re.finditer(
+            r'^[\w:<>,\s\*&]+\b(\w+)\s*::\s*(\w+)\s*\([^;]*?\)\s*(?:const\s*)?\{',
+            text, re.M))
+        for fi, fm in enumerate(funcs):
+            body_start = fm.end() - 1
+            # 花括号配平取函数体
+            depth = 0
+            i = body_start
+            while i < len(text):
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            body = text[body_start:i + 1]
+            body_line0 = text.count("\n", 0, body_start)
+
+            # 该函数体内所有「<name>[K]」形式的常量下标访问
+            max_need = {}
+            for m in re.finditer(r'\b(\w+)\s*\[\s*(\d{1,4})\s*\]', body):
+                var, idx = m.group(1), int(m.group(2))
+                if idx <= 6:
+                    continue  # 包头范围内，恒安全
+                if var not in ("resp", "resp2", "resp3", "resp4", "buffer",
+                               "datagram", "pkt", "frame"):
+                    continue
+                if idx > max_need.get(var, -1):
+                    max_need[var] = idx
+            if not max_need:
+                continue
+
+            for var, idx in sorted(max_need.items()):
+                # 该函数内是否有 var.size() 与 (idx+1) 的比较
+                need = idx + 1
+                pat = (re.escape(var) + r'\s*\.\s*size\s*\(\s*\)\s*[<>]=?\s*(\d+)')
+                ok = False
+                for gm in re.finditer(pat, body):
+                    bound = int(gm.group(1))
+                    # 只接受「长度 guard 足够」的写法：
+                    #   size() < need   /  size() <= need-1  /  size() >= need
+                    snip = gm.group(0)
+                    if '<=' in snip and bound >= need - 1:
+                        ok = True
+                    elif '<' in snip and not snip.strip().startswith(('>',)):
+                        if bound >= need:
+                            ok = True
+                    elif '>=' in snip and bound >= need:
+                        ok = True
+                if not ok:
+                    fail("[resp-bounds] {}:{} 函数内读取 {}[{}]（需至少 {} 字节），"
+                         "但未见 {}.size() 与 {} 的长度校验；"
+                         "QByteArray 越界是未定义行为，必须显式判断。"
+                         .format(rel, body_line0 + 1, var, idx, need, var, need))
+
+
 def check_unqueued_poll_timers(root, src_root):
     """
     轮询定时器不得以「无句柄」的局部变量创建。
@@ -651,6 +739,7 @@ def main():
     check_accept_gated_threads(root, src_root)
     check_deleted_on_close_members(root, src_root)
     check_unqueued_poll_timers(root, src_root)
+    check_response_index_bounds(root, src_root)
     check_json_configs(root)
 
     print(f"校验目录: {root}")

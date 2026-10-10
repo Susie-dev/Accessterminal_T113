@@ -139,6 +139,27 @@ bool HailinFingerprint::autoIdentify(quint8 scoreLevel, int timeoutMs) {
         return false;
     // 结束当前代码块作用域。
     }
+    // 长度校验：下面要读到 resp[14]（score 低字节），因此至少需要 15 字节。
+    //
+    // 为什么必须显式判断：enable 定帧的 FingerprintFrameParser 只保证
+    // **长度字段自洽**，最短合法帧是 9(包头+地址+标识+长度) + 2(校验和)
+    // = 11 字节。也就是说 resp 完全可能是 11~14 字节的合法帧，此时
+    // resp[11]~resp[14] 越界。QByteArray::operator[] 越界是未定义行为
+    // （不像 QString 那样返回空引用），必须挡住。
+    //
+    // 旧的 `resp.isEmpty()` 只挡住了 0 字节，挡不住这种“短但合法”的帧。
+    // stepIdentify() 用 `resp.size() < 16` 做同类校验（同为读取到
+    // resp[14]，那里多留了 1 字节余量）；此处按实际需要取 15。
+    // 根据条件判断是否执行该分支。
+    if (resp.size() < 15) {
+        // 执行本行语句完成对应变量、对象或业务状态处理。
+        debug(QString("[指纹] 自动识别应答过短(%1字节)，忽略").arg(resp.size()));
+        // 发出 Qt 信号 identifyResult 通知其他对象。
+        emit identifyResult(false, -1, 0, "应答过短");
+        // 返回当前函数的执行结果或结束函数。
+        return false;
+    // 结束当前代码块作用域。
+    }
     // 解析应答
     // 根据条件判断是否执行该分支。
     if ((quint8)resp[6] != PKT_ACK) {
@@ -324,6 +345,17 @@ bool HailinFingerprint::cancel() {
     if (resp.isEmpty()) {
         // 执行本行语句完成对应变量、对象或业务状态处理。
         debug("[指纹] 取消无应答");
+        // 返回当前函数的执行结果或结束函数。
+        return false;
+    // 结束当前代码块作用域。
+    }
+    // 长度校验：下面要读 resp[9]，至少需要 10 字节（最短合法帧为 11 字节，
+    // 但这里按实际访问下标判断，留出最小必要长度）。理由同上：
+    // QByteArray::operator[] 越界是未定义行为。
+    // 根据条件判断是否执行该分支。
+    if (resp.size() < 10) {
+        // 执行本行语句完成对应变量、对象或业务状态处理。
+        debug(QString("[指纹] 取消应答过短(%1字节)，忽略").arg(resp.size()));
         // 返回当前函数的执行结果或结束函数。
         return false;
     // 结束当前代码块作用域。
