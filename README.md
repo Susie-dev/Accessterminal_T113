@@ -268,7 +268,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下三条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下五条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -303,7 +303,42 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 `AudioManager::~AudioManager()` 会先 `stop()` 再 `waitForFinished()`；
 人脸检测任务改用 `QPointer` 观察 `this` 并在提交时按值拷贝分类器。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述三条请以
+### 4. `WA_DeleteOnClose` 的窗口不能用裸指针成员跟踪
+
+设了 `Qt::WA_DeleteOnClose` 的窗口会在关闭瞬间被 Qt 自动销毁。若把它存进
+裸指针成员，该成员立刻悬垂，而“密码正确后关窗”这类回调仍会访问它。
+
+`Form_passwd` 的 `m_passwdForm` 因此改为 `QPointer<Form_passwd>`
+（对象销毁后自动变空）。注意 baseline 里这段恰好不触发：原代码用了同名
+**局部变量**遮蔽成员，所以不悬垂，但代价是密码正确后窗口关不掉——
+重构把它改成成员时修掉了那个功能缺陷，同时引入了悬垂。
+
+由 `check_deleted_on_close_members` 强制。
+
+### 5. 轮询定时器必须有可停止的句柄
+
+`X = new QTimer(...)` 之后若 `X->start(...)`，它就变成了周期定时器。
+若 `X` 只是局部变量（不是成员、也没放进容器），则除回调自身外没人在外部
+能停止它。此时若承载它的窗口只是被 `close()` 隐藏（未设
+`WA_DeleteOnClose`，对象仍存活），这个定时器就会永远每 N 毫秒在 GUI 线程
+上跑一次。
+
+`Form_finger::startFingerRegisterStep()` 里的“检测手指”轮询正是如此：
+回调中 `readPacket(500)` 是**阻塞串口读**，用户点『退出』后 `close()` 只隐藏
+窗口，于是每 500ms 阻塞一次界面。现已改为成员 `m_pollTimer`，并提供
+`stopFingerPoll()` 在退出与析构时调用。
+
+与之配套的还有延时重启的作废：分步采集之间是
+`QTimer::singleShot(1500, ...)`，只停周期定时器不够——用户若在 1.5 秒内退出，
+已排队的 `singleShot` 仍会把轮询重新拉起来。因此 `stopFingerPoll()` 会
+`++m_pollGeneration`，延时回调携带发起时的代数，不匹配即放弃
+（与第 2 条的 `m_callGeneration` 同一手法）。
+
+由 `check_unqueued_poll_timers` 强制。该检查**只覆盖 QWidget 子类**——
+像 `FingerprintManager` 这种随程序存活的 QObject，其常驻轮询是设计意图，
+不算缺陷。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述五条请以
 `verify.py` 的结果为准。
 
 ---
