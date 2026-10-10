@@ -268,7 +268,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下七条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下八条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -336,7 +336,10 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 由 `check_unqueued_poll_timers` 强制。该检查**只覆盖 QWidget 子类**——
 像 `FingerprintManager` 这种随程序存活的 QObject，其常驻轮询是设计意图，
-不算缺陷。
+不算“界面空转”类缺陷。
+
+但“不算缺陷”只对界面卡顿成立：常驻轮询器**仍然必须持有句柄**，理由见第 8 条
+（串口互斥）。两条规则互补，不要只看这一条。
 
 ### 6. 收 UDP 包必须检查 `readDatagram()` / `recvfrom()` 的返回值
 
@@ -405,7 +408,64 @@ connect(m_fingerForm, &Form_finger::addFingerRequested,
 `signals:` / `slots:` / 访问权限分区，若 `&Cls::name` 中的 `name` 在该类的
 非 `signals` 区被显式声明，即报错。继承自 Qt 基类的信号不予判定。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述七条请以
+### 8. 共用同一硬件的轮询器必须能被他方暂停
+
+门口机上**常驻指纹识别**与**指纹注册**读写的是同一个串口：
+
+```
+识别轮询（FingerprintManager::startIdentify）
+    send(CMD_GET_IMAGE)  →  readPacket(500)    ← 抢应答
+注册流程（Form_finger::doFingerCollect）
+    send(CMD_GET_IMAGE)  →  readPacket(2000)   ← 抢应答
+```
+
+两者互为对方之应答源。只要识别轮询在跑，它就会把注册流程正在等待的
+`0x02/0x05/0x06` 应答从串口缓冲里取走，注册流程拿到空字节数组、
+判为“采集图像失败”静默返回；反过来注册流程也会抢走识别的应答。
+这不是“偶发硬件问题”，而是确定性的应答错配。
+
+要互斥就必须能**暂停识别轮询**，而暂停的前提是拿得到定时器句柄。旧实现是
+
+```cpp
+void FingerprintManager::startIdentify() {
+    static bool waitingFinger = false;      // 函数内 static：跨实例共享
+    if (waitingFinger) return;
+    waitingFinger = true;
+    QTimer* timer = new QTimer(this);       // 局部变量：外部拿不到句柄
+    connect(timer, &QTimer::timeout, this, [=]() mutable {
+        fingerprint->sendPacket(pkt);
+        QByteArray resp = fingerprint->readPacket(500);   // 阻塞读
+        ...
+    });
+    timer->start(500);
+}
+```
+
+三处独立问题，现已一并修复：
+
+1. **句柄丢失** → 无法暂停（本条的核心理由）。改为成员 `m_pollTimer`，
+   并新增 `setSuspended(bool)` 作为互斥入口。
+2. **函数内 `static`** → 状态为所有实例共享，且不随实例销毁而复位。
+   改为成员 `m_waitingFinger` / `m_enrolling`。
+3. **裸堆指针** `int* currentStep = new int(1)` 只在**成功路径** `delete`，
+   采集失败/合并失败等提前返回全部泄漏。改用 `QSharedPointer<int>`
+   按值捕获进 lambda，任何退出路径都自动释放。
+
+暂停/恢复必须成对发生，且覆盖“用户中途点退出”这条路径：
+`Form_finger::startFingerRegisterStep()` 进入时挂起，
+`onAddQuitClicked()` 与 `~Form_finger()` 都要恢复，否则门口机的
+常驻指纹识别会**永久失效**。析构里也要兜底，因为窗口可能被父窗口直接销毁
+而不走 `onAddQuitClicked()`。
+
+由 `check_blocking_poll_has_handle` 强制：找出被 `start(...)` 周期化、
+且回调体内含 `readPacket` / `waitForReadyRead` / `waitForBytesWritten` 等
+阻塞调用的 `QTimer`，若句柄不是 `m_` 成员（也未放入容器、未设
+`setSingleShot(true)`）即报错。
+
+它与第 5 条互补：第 5 条只管「QWidget 子类、`close()` 后界面空转」，
+本条管「无法与共用同一设备的流程互斥」。二者互不覆盖。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述八条请以
 `verify.py` 的结果为准。
 
 ---

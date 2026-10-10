@@ -8,6 +8,8 @@
 #include <QDateTime>
 // 引入系统或第三方头文件 <QDebug>。
 #include <QDebug>
+// 引入系统或第三方头文件 <QSharedPointer>。
+#include <QSharedPointer>
 
 // 定义类 FingerprintManager 的成员函数 FingerprintManager。
 FingerprintManager::FingerprintManager(QObject* parent)
@@ -19,7 +21,50 @@ FingerprintManager::FingerprintManager(QObject* parent)
 }
 
 // 定义类 FingerprintManager 的成员函数 ~FingerprintManager。
-FingerprintManager::~FingerprintManager() {}
+FingerprintManager::~FingerprintManager()
+{
+    // 必须显式停表：轮询回调里 readPacket() 是跑在 GUI 线程上的阻塞读，
+    // 而定时器以 this 为 parent，会在 QObject 析构过程中被销毁——此时
+    // 排队的 timeout 事件可能仍在事件队列里，回调再去访问已在拆解的
+    // 成员（fingerprint / m_pollTimer）就是 use-after-free。
+    stopPoll();
+}
+
+// 定义或声明函数 FingerprintManager::stopPoll。
+void FingerprintManager::stopPoll()
+{
+    if (m_pollTimer) {
+        m_pollTimer->stop();
+        m_pollTimer->deleteLater();
+        m_pollTimer = nullptr;
+    }
+    // 注册轮询同样自带阻塞读，也必须能被停掉。
+    if (m_enrollTimer) {
+        m_enrollTimer->stop();
+        m_enrollTimer->deleteLater();
+        m_enrollTimer = nullptr;
+        m_enrolling = false;
+    }
+}
+
+// 定义或声明函数 FingerprintManager::setSuspended。
+void FingerprintManager::setSuspended(bool suspended)
+{
+    if (m_suspended == suspended) return;
+    m_suspended = suspended;
+    if (m_suspended) {
+        // 立刻停止抢读，并解除“等待手指”状态，使恢复后能重新进入。
+        stopPoll();
+        m_waitingFinger = false;
+        return;
+    }
+    // 恢复常驻识别。用 0ms 延时而不是直接调用：本函数通常是在注册流程
+    // 的收尾路径里被调用的，直接递归进入 startIdentify() 会在仍有
+    // 串口事务在栈上时插队下发新命令。
+    QTimer::singleShot(0, this, [this]() {
+        if (!m_suspended) startIdentify();
+    });
+}
 
 // 定义或声明函数 FingerprintManager::setDevice。
 void FingerprintManager::setDevice(HailinFingerprint* device)
@@ -36,22 +81,33 @@ void FingerprintManager::startIdentify()
 {
     // 根据条件判断是否执行该分支。
     if (!fingerprint) return;
+    // 注册流程进行中：不得抢串口（见 setSuspended 的说明）。
+    if (m_suspended) return;
     // 只允许一个识别流程
-    // 声明静态变量或静态常量，保持跨调用状态。
-    static bool waitingFinger = false;
-    // 根据条件判断是否执行该分支。
-    if (waitingFinger) return;
+    if (m_waitingFinger) return;
     // 执行本行语句完成对应变量、对象或业务状态处理。
-    waitingFinger = true;
+    m_waitingFinger = true;
 
     // 只在开始时提示一次
     // 发出 Qt 信号 identifyResult 通知其他对象。
     emit identifyResult(false, -1, 0, "请按下指纹进行识别"); // UI可用此信号做提示音
 
+    // 复用同一个成员定时器：重复进入本函数时不要叠加新定时器。
+    stopPoll();
     // 创建或使用 Qt 定时器对象。
-    QTimer* timer = new QTimer(this);
+    m_pollTimer = new QTimer(this);
+    // 把句柄按值捕获进 lambda，回调里操作的就是本次这一只定时器。
+    QTimer* const timer = m_pollTimer;
     // 建立 Qt 信号与槽或 lambda 回调连接。
-    connect(timer, &QTimer::timeout, this, [=]() mutable {
+    connect(timer, &QTimer::timeout, this, [this, timer]() {
+        // 注册流程可能在本回调排队后被启动（setSuspended 会 stopPoll，
+        // 但已进入事件队列的 timeout 仍会执行一次）。此时必须立刻让路，
+        // 否则会与注册流程抢同一个串口的应答。
+        if (m_suspended) {
+            stopPoll();
+            m_waitingFinger = false;
+            return;
+        }
         // 创建或使用字节数组保存协议或音视频数据。
         QByteArray payload;
         // 继续当前代码块的参数、表达式或结构定义。
@@ -68,6 +124,8 @@ void FingerprintManager::startIdentify()
             timer->stop();
             // 执行本行语句完成对应变量、对象或业务状态处理。
             timer->deleteLater();
+            // 成员句柄同步清空，保持“句柄有效 <=> 定时器在跑”这一不变式。
+            if (m_pollTimer == timer) m_pollTimer = nullptr;
             // 生成特征
             // 创建或使用字节数组保存协议或音视频数据。
             QByteArray payload2;
@@ -86,7 +144,7 @@ void FingerprintManager::startIdentify()
                 // 发出 Qt 信号 identifyResult 通知其他对象。
                 emit identifyResult(false, -1, 0, "生成特征失败");
                 // 执行本行语句完成对应变量、对象或业务状态处理。
-                waitingFinger = false;
+                m_waitingFinger = false;
                 // 返回当前函数的执行结果或结束函数。
                 return;
             // 结束当前代码块作用域。
@@ -131,7 +189,7 @@ void FingerprintManager::startIdentify()
             // 结束当前代码块作用域。
             }
             // 执行本行语句完成对应变量、对象或业务状态处理。
-            waitingFinger = false;
+            m_waitingFinger = false;
         // 结束当前代码块作用域。
         }
         // 否则继续等待
@@ -149,22 +207,38 @@ void FingerprintManager::startEnroll(int id)
 {
     // 根据条件判断是否执行该分支。
     if (!fingerprint) return;
-    // 声明静态变量或静态常量，保持跨调用状态。
-    static bool enrolling = false;
+    // 注册流程进行中：不得抢串口（见 setSuspended 的说明）。
+    if (m_suspended) return;
     // 根据条件判断是否执行该分支。
-    if (enrolling) return;
+    if (m_enrolling) return;
+    // 先清理上一轮的定时器，再置守卫。
+    // 顺序很关键：stopPoll() 会把 m_enrolling 复位为 false，若放在置位之后
+    // 调用，刚设好的重入保护就被自己抹掉了。
+    stopPoll();
     // 执行本行语句完成对应变量、对象或业务状态处理。
-    enrolling = true;
+    m_enrolling = true;
 
     // 继续当前代码块的参数、表达式或结构定义。
-    int* currentStep = new int(1); // 用堆变量保证lambda可修改
+    // 用 QSharedPointer 而不是裸堆指针：lambda 需要修改它，但裸指针在
+    // “对象被销毁”等提前返回路径上会泄漏（baseline 只在成功路径 delete）。
+    // 共享指针由 lambda 按值捕获，任何退出路径都会自动释放。
+    QSharedPointer<int> currentStep(new int(1));
     // 发出 Qt 信号 enrollResult 通知其他对象。
     emit enrollResult(false, id, "请按下手指进行第1次采集");
 
     // 创建或使用 Qt 定时器对象。
-    QTimer* timer = new QTimer(this);
+    m_enrollTimer = new QTimer(this);
+    // 把句柄按值捕获进 lambda，回调里操作的就是本次这一只定时器。
+    QTimer* const timer = m_enrollTimer;
     // 建立 Qt 信号与槽或 lambda 回调连接。
-    connect(timer, &QTimer::timeout, this, [=]() mutable {
+    connect(timer, &QTimer::timeout, this, [this, timer, id, currentStep]() {
+        // 与识别轮询同理：注册可能被挂起（对象析构/外部暂停），
+        // 已排队的 timeout 仍会执行一次，必须先让路。
+        if (m_suspended) {
+            stopPoll();
+            m_enrolling = false;
+            return;
+        }
         // 1. 采集图像
         // 创建或使用字节数组保存协议或音视频数据。
         QByteArray payload;
@@ -196,13 +270,12 @@ void FingerprintManager::startEnroll(int id)
                 // 发出 Qt 信号 enrollResult 通知其他对象。
                 emit enrollResult(false, id, QString("第%1次生成特征失败").arg(*currentStep));
                 // 执行本行语句完成对应变量、对象或业务状态处理。
-                enrolling = false;
+                m_enrolling = false;
                 // 执行本行语句完成对应变量、对象或业务状态处理。
                 timer->stop();
                 // 执行本行语句完成对应变量、对象或业务状态处理。
                 timer->deleteLater();
-                // 释放动态创建的对象资源。
-                delete currentStep;
+                if (m_enrollTimer == timer) m_enrollTimer = nullptr;
                 // 返回当前函数的执行结果或结束函数。
                 return;
             // 结束当前代码块作用域。
@@ -229,13 +302,12 @@ void FingerprintManager::startEnroll(int id)
                     // 发出 Qt 信号 enrollResult 通知其他对象。
                     emit enrollResult(false, id, "合并特征失败");
                     // 执行本行语句完成对应变量、对象或业务状态处理。
-                    enrolling = false;
+                    m_enrolling = false;
                     // 执行本行语句完成对应变量、对象或业务状态处理。
                     timer->stop();
                     // 执行本行语句完成对应变量、对象或业务状态处理。
                     timer->deleteLater();
-                    // 释放动态创建的对象资源。
-                    delete currentStep;
+                    if (m_enrollTimer == timer) m_enrollTimer = nullptr;
                     // 返回当前函数的执行结果或结束函数。
                     return;
                 // 结束当前代码块作用域。
@@ -268,13 +340,12 @@ void FingerprintManager::startEnroll(int id)
                 // 结束当前代码块作用域。
                 }
                 // 执行本行语句完成对应变量、对象或业务状态处理。
-                enrolling = false;
+                m_enrolling = false;
                 // 执行本行语句完成对应变量、对象或业务状态处理。
                 timer->stop();
                 // 执行本行语句完成对应变量、对象或业务状态处理。
                 timer->deleteLater();
-                // 释放动态创建的对象资源。
-                delete currentStep;
+                if (m_enrollTimer == timer) m_enrollTimer = nullptr;
                 // 返回当前函数的执行结果或结束函数。
                 return;
             // 结束当前代码块作用域。

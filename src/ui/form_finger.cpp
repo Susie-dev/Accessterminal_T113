@@ -11,9 +11,11 @@
 // Widget 暴露的模块指针需要完整类型才能调用其成员：
 //   - audioManager() -> AudioManager
 //   - fingerprint()  -> HailinFingerprint
+//   - fingerprintManager() -> FingerprintManager（用于挂起/恢复常驻识别）
 // 仅靠 widget.h 中的前置声明无法通过编译。
 #include "hal/fingerprint_hailin.h"
 #include "managers/audio_manager.h"
+#include "managers/fingerprint_manager.h"
 
 #include <QDebug>
 
@@ -65,6 +67,18 @@ void Form_finger::onAddQuitClicked()
     // startFingerRegisterStep() 里是「先 waitingFinger = true，再建定时器」，
     // 若 stopFingerPoll() 顺手把它清成 false，计时中的那一步就失去重复点击保护。
     waitingFinger = false;
+
+    // 恢复常驻识别轮询。
+    //
+    // 注册期间我们把常驻识别挂起了（见 startFingerRegisterStep），否则两者会
+    // 抢同一个串口的应答：识别轮询每 500ms 下发 CMD_GET_IMAGE 并抢读应答，
+    // 会把注册流程正在等待的 0x01/0x02/0x05/0x06 应答取走，注册随机失败。
+    // 这里必须成对恢复，且要覆盖“用户中途点退出”这一路径，否则识别会永久停止。
+    if (m_suspendedFingerprintManager) {
+        m_suspendedFingerprintManager->setSuspended(false);
+        m_suspendedFingerprintManager = nullptr;
+    }
+
     // 执行本行语句完成对应变量、对象或业务状态处理。
     this->close();
 // 结束当前代码块作用域。
@@ -115,6 +129,12 @@ void Form_finger::startFingerRegisterStep(int step)
     Widget* mainWidget = qobject_cast<Widget*>(w);
     // 根据条件判断是否执行该分支。
     if (!mainWidget || !mainWidget->fingerprint()) return;
+    // 挂起常驻识别轮询：两者共用同一个串口，必须互斥（详见 onAddQuitClicked）。
+    // 只记一次句柄，退出时成对恢复。
+    if (!m_suspendedFingerprintManager && mainWidget->fingerprintManager()) {
+        m_suspendedFingerprintManager = mainWidget->fingerprintManager();
+        m_suspendedFingerprintManager->setSuspended(true);
+    }
     // 执行本行语句完成对应变量、对象或业务状态处理。
     waitingFinger = true;
     // 根据条件判断是否执行该分支。
@@ -315,6 +335,12 @@ Form_finger::~Form_finger()
     // 先停轮询再 delete ui：轮询回调里会经由 parentWidget() 向上找 Widget、
     // 访问 ui 所建立的控件树，析构期间让它继续触发是危险的。
     stopFingerPoll();
+    // 兜底恢复常驻识别：若窗口是被父窗口直接销毁（没走 onAddQuitClicked），
+    // 也必须把识别轮询放出来，否则门口机的指纹识别会永久失效。
+    if (m_suspendedFingerprintManager) {
+        m_suspendedFingerprintManager->setSuspended(false);
+        m_suspendedFingerprintManager = nullptr;
+    }
     // 释放动态创建的对象资源。
     delete ui;
 // 结束当前代码块作用域。

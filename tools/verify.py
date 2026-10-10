@@ -629,6 +629,10 @@ def check_unqueued_poll_timers(root, src_root):
     QObject，其“等待手指”轮询本来就是设计上的常驻行为（识别流程结束时
     才 stop），并非缺陷。只有「承载它的界面可能先消失」时才构成问题。
     单次触发（singleShot / setSingleShot(true)）也会自己结束，不在范围内。
+
+    注意：`check_blocking_poll_has_handle()` 覆盖了本规则的另一半 ——
+    非 QWidget 的常驻轮询器（如 FingerprintManager）即使不会“空转拖死界面”，
+    也必须持有句柄，否则无法在注册流程期间让路（串口互斥）。
     """
     for path in find_files(src_root, {".cpp"}):
         text = strip_comments_and_strings(read(path))
@@ -666,6 +670,111 @@ def check_unqueued_poll_timers(root, src_root):
                  "该类会 close()（窗口被隐藏但对象仍存活，未设 WA_DeleteOnClose 时"
                  "尤其如此），定时器会在 GUI 线程上永久空转。"
                  "请改为成员变量并提供停止入口。"
+                 .format(rel, line, var))
+
+
+def check_blocking_poll_has_handle(root, src_root):
+    """
+    任何「周期性定时器 + 阻塞式读串口/读socket」的轮询器，其句柄必须是类成员。
+
+    背景（真实缺陷，来自 baseline，本轮修复）：
+
+        void FingerprintManager::startIdentify()
+        {
+            static bool waitingFinger = false;   // (1) 函数内 static
+            if (waitingFinger) return;
+            waitingFinger = true;
+            QTimer* timer = new QTimer(this);    // (2) 局部变量，无成员句柄
+            connect(timer, &QTimer::timeout, this, [=]() mutable {
+                fingerprint->sendPacket(pkt);
+                QByteArray resp = fingerprint->readPacket(500);  // (3) 阻塞读
+                ...
+            });
+            timer->start(500);
+        }
+
+    为什么这是缺陷（两处独立问题）：
+
+    (2) 句柄丢失 → 谁也停不下来。识别轮询与注册流程（Form_finger）读写的是
+        **同一个串口**：
+
+           识别轮询：  send(CMD_GET_IMAGE) → readPacket(500)   ← 抢应答
+           注册流程：  send(CMD_GET_IMAGE) → readPacket(2000)  ← 抢应答
+
+        两者互为对方之应答源。识别轮询一旦在跑，就会把注册流程正在等待的
+        0x01/0x02/0x05/0x06 应答从串口缓冲里取走，注册流程拿到空字节数组，
+        判为“采集图像失败”静默返回。反过来注册流程也会抢走识别的应答。
+        要互斥就必须能**暂停识别轮询**，而暂停的前提是拿得到句柄。
+
+    (3) 阻塞读在 GUI 线程 → 每 500ms 冻结界面 500ms（readPacket 的最坏耗时）。
+
+    (1) 函数内 static 状态为所有实例共享，且不会随实例销毁而复位。
+
+    判定规则：在 .cpp 中找到被 `start(数字)` 周期化的 QTimer，若其创建点
+    捕获的变量不是类成员（m_xxx），且回调体内出现阻塞读调用
+    （readPacket / waitForReadyRead / waitForBytesWritten / QSerialPort 阻塞读），
+    则报错。要求改为成员句柄并提供停止入口。
+
+    为什么需要这条规则（而不是靠 check_unqueued_poll_timers）：
+    后者把范围收窄到「继承 QWidget 且会 close()」的类，理由是常驻 QObject
+    的轮询属设计常态。但对**共用硬件资源**的常驻轮询器，句柄仍然是必需的
+    ——不是为了防止空转，而是为了能与其他使用者互斥。两者互补。
+    """
+    blocking = (
+        "readPacket", "waitForReadyRead", "waitForBytesWritten",
+        "waitForBytesWritten", "waitForDisconnected", "waitForConnected",
+    )
+    for path in find_files(src_root, {".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        rel = os.path.relpath(path, root)
+        if "new QTimer" not in text:
+            continue
+
+        header = path[:-4] + ".h"
+        if not os.path.isfile(header):
+            continue
+        htext = strip_comments_and_strings(read(header))
+        members = set(re.findall(r'\b(m_\w+)\s*(?:=|;|\))', htext))
+
+        for m in re.finditer(r'\bQTimer\s*\*\s*(\w+)\s*=\s*new\s+QTimer\b', text):
+            var = m.group(1)
+            # 必须是周期定时器
+            if not re.search(re.escape(var) + r'\s*->\s*start\s*\(', text):
+                continue
+            if var in members:
+                continue  # 有成员句柄，可被外部暂停
+            # 单次触发会自己结束，不构成“永久轮询”
+            if re.search(re.escape(var) + r'\s*->\s*setSingleShot\s*\(\s*true\s*\)',
+                         text):
+                continue
+
+            # 取出该定时器对应的回调体（连接点之后的一段），判断是否有阻塞读
+            conn = re.search(re.escape(var) + r'\s*,\s*&QTimer::timeout', text)
+            if not conn:
+                continue
+            body = text[conn.end():conn.end() + 4000]
+            # 只看到该 lambda 结束为止
+            depth = 0
+            started = False
+            end = len(body)
+            for i, ch in enumerate(body):
+                if ch == '{':
+                    depth += 1
+                    started = True
+                elif ch == '}':
+                    depth -= 1
+                    if started and depth == 0:
+                        end = i
+                        break
+            body = body[:end]
+            if not any(b in body for b in blocking):
+                continue
+
+            line = text.count("\n", 0, m.start()) + 1
+            fail("[poll-handle] {}:{} 周期性定时器 '{}' 的回调里有阻塞读（每轮会冻结"
+                 "调用线程一次），却没有成员句柄保存它 → 外部无法暂停/停止。"
+                 "若该轮询与其他流程共用同一设备（如串口），对方将与之互相抢读应答。"
+                 "请改为成员变量并提供 setSuspended()/stop 入口。"
                  .format(rel, line, var))
 
 
@@ -943,6 +1052,7 @@ def main():
     check_accept_gated_threads(root, src_root)
     check_deleted_on_close_members(root, src_root)
     check_unqueued_poll_timers(root, src_root)
+    check_blocking_poll_has_handle(root, src_root)
     check_datagram_read_returns(root, src_root)
     check_response_index_bounds(root, src_root)
     check_connect_signal_is_signal(root, src_root)

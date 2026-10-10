@@ -8,6 +8,8 @@
 
 // 声明类 HailinFingerprint。
 class HailinFingerprint;
+// 声明类 QTimer（仅以指针成员持有，无需完整定义）。
+class QTimer;
 
 // 声明类 FingerprintManager。
 class FingerprintManager : public QObject
@@ -24,6 +26,28 @@ public:
 
     // 定义或声明函数 setDevice。
     void setDevice(HailinFingerprint* device);
+
+    /**
+     * @brief 暂停/恢复常驻识别轮询（与指纹注册流程互斥）。
+     *
+     * 为什么必须互斥：注册流程（Form_finger）与常驻识别（startIdentify）
+     * 操作的是**同一个串口**。识别轮询每 500ms 主动下发 CMD_GET_IMAGE，
+     * 然后 readPacket(500) 去抢读应答；而注册流程同样在下发命令后
+     * readPacket(2000) 等待**它自己**的应答。两者会互为对方之应答：
+     *  - 识别轮询把注册流程等待的 0x02/0x05/0x06 应答从串口缓冲里取走，
+     *    注册流程拿到空字节数组，判为“采集图像失败”而静默失败；
+     *  - 反之注册流程取走识别应答，识别轮询也只看到失败。
+     * 重构前 baseline 就存在这个问题，只是「步骤注册」那条路径从未被
+     * 真正连上（见 widget.cpp 中已删除的 connect），所以表现出来只是
+     * 注册偶发失败。
+     *
+     * 进入注册窗口时置 true：识别轮询会立即停止，且在暂停期间不会再被
+     * 拉起；退出注册窗口时置 false：常驻识别自动重新开始。
+     */
+    void setSuspended(bool suspended);
+
+    /// 当前是否处于暂停状态。
+    bool isSuspended() const { return m_suspended; }
 
 // 声明 Qt 信号槽成员区域。
 public slots:
@@ -45,6 +69,23 @@ signals:
 private:
     // 执行本行语句完成对应变量、对象或业务状态处理。
     HailinFingerprint* fingerprint = nullptr;
+    /// 常驻识别轮询的句柄。
+    ///
+    /// 必须保存：轮询回调里 readPacket() 是**阻塞读**且跑在 GUI 线程上，
+    /// 只有“读到手指图像”那一条路径会停它。baseline 用的是局部变量
+    /// `QTimer* timer = new QTimer(this);`，外部谁也拿不到句柄，于是注册
+    /// 流程无法让它先停下来（串口抢读），窗口析构也无法让它停止空转。
+    QTimer* m_pollTimer = nullptr;
+    /// 注册流程轮询的句柄（回调里同为阻塞读，必须可暂停/停止）。
+    QTimer* m_enrollTimer = nullptr;
+    /// 注册期间置 true，识别轮询不得运行。
+    bool m_suspended = false;
+    /// 是否正在等待手指（防重入）。原实现是函数内 static，跨实例共享。
+    bool m_waitingFinger = false;
+    /// 是否正在注册（防重入）。原实现是函数内 static，跨实例共享。
+    bool m_enrolling = false;
+    /// 停掉识别/注册轮询定时器并清空句柄。
+    void stopPoll();
 // 结束当前代码块作用域。
 };
 
