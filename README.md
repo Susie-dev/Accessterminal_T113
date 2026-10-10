@@ -82,6 +82,39 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+### 主机端编译验证（无 ALSA/libgpiod 的开发机可用）
+
+ALSA 与 libgpiod 是 Linux 专有接口，Windows/macOS 开发机上装不了；但没有
+它们并不意味着无法编译检查。`tools/devstubs/` 下提供了按官方签名复刻的
+桩头文件，可对 `src/` 下**全部** `.cpp` 做真实的语法与类型检查：
+
+```sh
+bash tools/check_host_compile.sh
+```
+
+它会：
+
+1. 用 Qt 的 `uic` 预生成 `ui_*.h`（CMake 构建时才生成）；
+2. 用 `tools/devstubs/` 的桩替代 ALSA / libgpiod / POSIX / V4L2 头文件；
+3. 对每个 `.cpp` 执行 `g++ -fsyntax-only`。
+
+**能发现**：类型不匹配、参数个数/类型错误、拼写错误、缺失头文件、
+C++ 标准越界用法。
+
+**不能发现**：链接错误、目标平台 ABI/宏差异、运行时行为。
+
+> 因此本步骤**不能替代** Tina SDK 上的真实交叉编译，它只是把绝大多数
+> 低级错误提前到开发机上暴露。桩头文件不是实现，切勿用来产出可执行文件。
+
+Windows 上的工具链（MSYS2 + MinGW-w64）：
+
+```sh
+pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-qt5-base \
+          mingw-w64-x86_64-qt5-tools mingw-w64-x86_64-opencv
+```
+
+已验证：全部 18 个 `.cpp` 通过（GCC 16.2.0 + Qt 5.15.19）。
+
 也保留了 qmake 工作流（Qt Creator 可直接打开 `smartpro.pro`）：
 
 ```sh
@@ -208,14 +241,25 @@ clang-format -i $(git ls-files '*.cpp' '*.h')
 ### 提交前自检
 
 ```sh
-# 1. 静态一致性（include 解析、构建列表、qrc、.ui 控件引用、旧标识符）
+# 1. 静态一致性（include 解析、构建列表、qrc、.ui 控件引用、旧标识符、
+#    前置声明一致性、JSON 配置）
 python3 tools/verify.py .
 
-# 2. 跨仓库协议一致性
+# 2. 签名一致性（.h 声明 vs .cpp 定义）
+python3 tools/check_signatures.py .
+
+# 3. 跨仓库协议一致性
 python3 tools/check_protocol_sync.py
+
+# 4. 真实编译验证（本机类型检查；静态检查无法发现类型不匹配等问题）
+bash tools/check_host_compile.sh
 ```
 
-两个脚本在 CI 中也可直接使用，退出码非 0 即表示失败。
+四个脚本在 CI 中也可直接使用，退出码非 0 即表示失败。
+
+第 1~3 步是静态检查，速度快但覆盖有限；**第 4 步不能省**——
+像“前置声明了不存在的类名”“把 ALSA 枚举存成 int 再传回枚举形参”
+这类缺陷只有编译器能发现。
 
 ---
 
