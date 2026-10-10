@@ -335,6 +335,11 @@ python3 tools/verify_fingerprint_parser_algorithm.py
 # 3. 跨仓库协议一致性
 python3 tools/check_protocol_sync.py
 
+# 3b. cppcheck 静态分析（不需要编译器、不需要装 Qt，可跑在任何机器上）
+#     覆盖数据流、越界、空指针解引用、初始化顺序等 verify.py 查不到的问题。
+#     退出码只受 warning/error 影响，style 类仅打印。
+bash tools/run_cppcheck.sh
+
 # 4. 真实编译验证（本机类型检查；静态检查无法发现类型不匹配等问题）
 bash tools/check_host_compile.sh
 
@@ -350,6 +355,10 @@ bash tests/interop/run_interop.sh
 第 1~3 步是静态检查，速度快但覆盖有限；**第 4、5 步不能省**——
 像“前置声明了不存在的类名”“把 ALSA 枚举存成 int 再传回枚举形参”
 这类缺陷只有编译器能发现，“漏定义某个符号”只有链接器能发现。
+
+第 3b 步（cppcheck）介于两者之间：它不需要编译器和 Qt 就能做数据流分析，
+在没有工具链的机器上也能跑，是本工程唯一可用的“半编译级”检查手段。
+安装：`pacman -S mingw-w64-x86_64-cppcheck`（MSYS2）。
 
 **第 6 步是协议兼容性的最终防线**：它把门口机的 `SignalingClient` 与
 室内机的 `SignalingServer`（两个仓库里的**真实**实现）链接到一起，

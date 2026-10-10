@@ -78,7 +78,11 @@ void CameraPushThread::run() {
             // 继续当前代码块的参数、表达式或结构定义。
             frame.save(&buffer, "JPEG", 75); // 75为压缩质量
             // 执行本行语句完成对应变量、对象或业务状态处理。
-            int ret = sendto(sock, jpegData.data(), jpegData.size(), 0, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+            // sockaddr_in* -> sockaddr* 是 POSIX socket API 规定的固定形态，
+            // 用 reinterpret_cast 表达（与 widget.cpp 中绑定端口的写法保持一致）。
+            int ret = sendto(sock, jpegData.data(), jpegData.size(), 0,
+                             reinterpret_cast<struct sockaddr*>(&serv_addr),
+                             sizeof(serv_addr));
             // 根据条件判断是否执行该分支。
             if (ret < 0) {
                 // 输出警告日志。

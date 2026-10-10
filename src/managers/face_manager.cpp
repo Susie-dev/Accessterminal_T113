@@ -29,7 +29,10 @@ void FaceManager::addFaceSample(const QImage& faceImg)
     // 创建或处理图像帧数据。
     QImage gray = faceImg.convertToFormat(QImage::Format_Grayscale8);
     // 执行本行语句完成对应变量、对象或业务状态处理。
-    cv::Mat mat(gray.height(), gray.width(), CV_8UC1, (void*)gray.bits(), gray.bytesPerLine());
+    // gray 是非 const 的 QImage，bits() 返回 uchar*，可直接传给 cv::Mat 的
+    // void* data 形参（隐式转换），无需任何显式转型。
+    cv::Mat mat(gray.height(), gray.width(), CV_8UC1,
+                gray.bits(), gray.bytesPerLine());
     // 执行本行语句完成对应变量、对象或业务状态处理。
     registeredFaces.append(mat.clone());
     // 发出 Qt 信号 faceSampled 通知其他对象。
@@ -88,7 +91,9 @@ void FaceManager::recognize(const QImage& faceImg)
     // 创建或处理图像帧数据。
     QImage gray = faceImg.convertToFormat(QImage::Format_Grayscale8);
     // 执行本行语句完成对应变量、对象或业务状态处理。
-    cv::Mat testFace(gray.height(), gray.width(), CV_8UC1, (void*)gray.bits(), gray.bytesPerLine());
+    // 同上：gray 非 const，bits() 返回 uchar*，可直接隐式转换为 void*。
+    cv::Mat testFace(gray.height(), gray.width(), CV_8UC1,
+                     gray.bits(), gray.bytesPerLine());
     // 执行本行语句完成对应变量、对象或业务状态处理。
     int predictedLabel = -1;
     // 执行本行语句完成对应变量、对象或业务状态处理。

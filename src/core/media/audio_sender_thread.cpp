@@ -115,7 +115,8 @@ void AudioSenderThread::run() {
     // 执行本行语句完成对应变量、对象或业务状态处理。
     int frames = BUFFER_FRAMES;
     // 执行本行语句完成对应变量、对象或业务状态处理。
-    int16_t *buffer = (int16_t *)malloc(frames * CHANNELS * sizeof(int16_t));
+    // malloc 返回 void*，在 C++ 中可直接隐式转换为 int16_t*，无需显式转型。
+    int16_t *buffer = static_cast<int16_t*>(malloc(frames * CHANNELS * sizeof(int16_t)));
     // 开始循环处理满足条件的数据或状态。
     while (running) {
         // 采集线程采用非阻塞 ALSA 读，没数据时短休眠，兼顾实时性和退出响应速度。
@@ -153,8 +154,11 @@ void AudioSenderThread::run() {
         // 执行本行语句完成对应变量、对象或业务状态处理。
         int bytes = rc * CHANNELS * sizeof(int16_t);
         // 发送端和接收端共用外部创建的 UDP socket，挂断时由 Widget 统一关闭 fd。
-        // 执行本行语句完成对应变量、对象或业务状态处理。
-        int sent = sendto(sockfd, buffer, bytes, 0, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+        // sockaddr_in* -> sockaddr* 是 POSIX socket API 规定的固定形态，
+        // 用 reinterpret_cast 表达（与 widget.cpp 中绑定端口的写法保持一致）。
+        int sent = sendto(sockfd, buffer, bytes, 0,
+                          reinterpret_cast<struct sockaddr*>(&serv_addr),
+                          sizeof(serv_addr));
         // 根据条件判断是否执行该分支。
         if (sent != bytes) {
             // 输出警告日志。

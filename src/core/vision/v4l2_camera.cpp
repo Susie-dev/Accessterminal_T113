@@ -253,7 +253,8 @@ void V4L2Camera::captureLoop() {
     QImage img;
     // DQBUF 取出一帧后立即解码并缓存，最后 QBUF 归还缓冲区给驱动继续采集。
     // 逐行注释：执行本行语句完成对应变量、对象或业务状态处理。
-    bool loaded = img.loadFromData((const uchar*)v4l2_buffer, buf.bytesused, "JPEG");
+    bool loaded = img.loadFromData(reinterpret_cast<const uchar*>(v4l2_buffer),
+                                   buf.bytesused, "JPEG");
     // 逐行注释：根据条件判断是否执行该分支。
     if (loaded) {
         // 逐行注释：执行本行语句完成对应变量、对象或业务状态处理。

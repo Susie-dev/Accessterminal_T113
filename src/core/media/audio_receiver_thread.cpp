@@ -154,7 +154,8 @@ void AudioReceiverThread::run() {
     //执行本行语句完成对应变量、对象或业务状态处理。
     int frames = BUFFER_FRAMES;
     //执行本行语句完成对应变量、对象或业务状态处理。
-    int16_t *buffer = (int16_t *)malloc(frames * CHANNELS * sizeof(int16_t));
+    // malloc 返回 void*，在 C++ 中可直接隐式转换为 int16_t*，无需显式转型。
+    int16_t *buffer = static_cast<int16_t*>(malloc(frames * CHANNELS * sizeof(int16_t)));
     //执行本行语句完成对应变量、对象或业务状态处理。
     setVolume(currentVolume);
     // 设置socket为非阻塞
