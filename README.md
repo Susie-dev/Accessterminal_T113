@@ -458,6 +458,66 @@ L188  emit identifyResult(false, -1, 0, "指纹识别失败");
 实验**保留，并在规则 docstring 里写明它的**能力边界**：它**不能**发现"函数还在
 但被掏空成 `return {}`"，那需要真的跑一次脚本。不写清这一点，就会高估这条规则。
 
+### 门禁密码不得进日志：静态规则之外，还要一条**运行期**测试
+
+baseline 的 `PasswordManager::checkPassword()` 把四样东西打进 `qDebug`：
+
+```
+input= <用户输入>  password= <正确密码>  inputHex= <输入hex>  pwdHex= <密码hex>
+```
+
+门口机是**实体门禁设备**，密码就是物理准入凭据。`qDebug` 在嵌入式 Linux 上
+落到 stderr / systemd journal：任何有日志读取权限的人都能拿到，且跨重启留存。
+**输错一次，门禁密码就交出去了。**
+
+重构已修掉（只记录"本次是否匹配"）。但此前守它的只有一条**静态文本规则**
+`check_no_secret_in_logs` —— 它扫源码里敏感变量名有没有出现在日志语句里。
+静态规则可能被绕过：**改名、拼串、经辅助函数转一手**，正则就看不见了。
+
+第 27 轮补上 `tests/test_password_manager.cpp`：真的把密码设成哨兵串、真的调
+校验、真的把 qDebug 抓下来，断言哨兵串及其 hex 一次都没出现。这也是
+`password_manager.cpp` 第一次被链接进任何测试目标（第 26 轮统计的 18 个
+"从未链接"文件之一）。
+
+故障注入 8 个变异全部行为正确：6 种**真实泄漏形态**都被抓到，
+2 个对照（只打长度、只打空判定）不误报。
+
+#### 但第一版测试里有一条**恒真**的断言
+
+这是本轮最值得记的事。
+
+第一版用**环境变量**注入一个**非 ASCII** 哨兵
+（`门禁-哨兵-密码-8842`），然后断言"日志里不含该哨兵的每一个前缀"。
+
+故障注入发现"**前缀脱敏** `password.left(4)`"这个变异**抓不到**。探针一查：
+
+```
+ASCII  设定 == 取回 ? true      （26 码元 -> 26 码元）
+UTF8   设定 == 取回 ? false     （13 码元 -> 16 码元）
+```
+
+原因是 `AppConfig::toQString()` 用的是 `QString::fromLocal8Bit()`
+（`app_config.cpp:67`）。在本机 GBK 代码页下，写进去的 UTF-8 字节被按 GBK
+解码，13 个码元进、16 个出。
+
+于是"日志里不含哨兵前缀"这条断言，在比较**两个不同的串** —— **恒真**。
+断言在，覆盖面看着很全，实际什么都没验证。
+
+修法有两步，缺一不可：
+
+1. 非 ASCII 与前缀脱敏场景改用 `setPassword()`（进程内 `QString`，
+   **不经过编码边界**），构造上保证哨兵原样；
+2. 另加一条 `asciiFixtureSurvivesEnvRoundTrip`，显式断言**走环境变量的
+   ASCII 哨兵原样回到 AppConfig** —— 让夹具在变形时先炸，而不是让安全断言
+   静默失效。
+
+**凡夹具跨过一次编码边界（环境变量、文件、argv），必须先断言它原样到达。**
+否则后面围绕它的所有断言都可能是空的。
+
+另外，前缀断言改成**逐一覆盖每个前缀**（`for n in 1..len`），而不是只查一个
+固定长度：只查 `left(4)` 会漏掉 `left(2)`、`mid(0,n)`、`.at(0)` 等其它脱敏
+写法，而前缀脱敏对短密码等于全泄。
+
 ### 不可达槽与"平行实现"：为死代码写测试的陷阱
 
 第 23 轮审计发现：`FingerprintManager::startEnroll(int)` 有完整实现、有挂起
@@ -721,7 +781,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下三十九条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下四十三条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -1541,7 +1601,7 @@ python3 tools/verify.py . ../Accessterminal_desktop
 > **已加载的模块**后才真正生效。这正是必须做故障注入的理由——**自检脚本自己
 > 也会骗人**。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述三十九条请以
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述四十三条请以
 `verify.py` 的结果为准。
 
 ---
@@ -1852,6 +1912,70 @@ UnicodeEncodeError: 'gbk' codec can't encode character '\u2713'
 收窄办法是带上**只有目标处才有的上下文**（此例是紧随其后的
 `emit identifyResult(...)` vs `emit enrollResult(...)`）。
 
+### 40. 安全性质要有**运行期**断言，不能只靠静态文本规则
+
+静态规则（"源码里敏感变量名没出现在日志语句里"）容易被绕过：**改名、拼串、
+经辅助函数转一手**，正则就看不见了。第 27 轮为门禁密码补了运行期测试：真的
+设哨兵密码、真的调校验、真的抓 `qDebug` 输出，断言哨兵及其 hex 一次都没出现。
+
+故障注入实测：6 种真实泄漏形态（baseline 原句、只打明文、只打 hex、
+`left(4)` 前缀脱敏、拼进 `QStringLiteral`、经局部变量转一手）全部被抓到，
+2 个对照（只打长度、只打空判定）不误报。
+
+### 41. "X 不出现"的断言必须配**阳性对照**，否则捕获管道坏了它照样通过
+
+"日志里不含密码"这类断言有个致命失效方式：若消息处理器没装上、或日志走了别的
+通道，那么**任何**"不包含"断言都会通过 —— 测试看着很严，实则零验证。
+
+所以每条"哨兵不出现"都配一条"**非敏感日志确实被捕获**"的对照
+（断言 `密码校验完成` 那行存在）。捕获管道坏了，对照先失败。
+
+同一条道理适用于任何"不存在"型断言：**先证明检测手段能看见东西。**
+
+### 42. 夹具跨过编码边界时，必须先断言它原样到达
+
+第 27 轮第一版测试用**环境变量**注入**非 ASCII** 哨兵，然后断言"日志里不含该
+哨兵的每个前缀"。故障注入发现"`left(4)` 前缀脱敏"变异**抓不到**。探针查明：
+
+```
+ASCII  设定 == 取回 ? true      （26 码元 -> 26 码元）
+UTF8   设定 == 取回 ? false     （13 码元 -> 16 码元）
+```
+
+`AppConfig::toQString()` 是 `QString::fromLocal8Bit()`（`app_config.cpp:67`），
+本机 GBK 代码页下 UTF-8 字节被按 GBK 解码。于是那条断言在比较**两个不同的串**，
+**恒真** —— 断言在，实际什么都没验证。
+
+**凡夹具跨过一次编码边界（环境变量、文件、argv），必须先断言它原样到达。**
+否则围绕它的所有断言都可能是空的。
+
+顺带：前缀断言要**逐一遍历每个前缀**，而不是只查一个固定长度 —— 只查
+`left(4)` 会漏掉 `left(2)`、`mid(0,n)`、`.at(0)` 等其它脱敏写法。
+
+### 43. 守卫条件不能引用被守卫内容里会出现的字符串
+
+第 27 轮新规则里我写成：
+
+```python
+if "Fixture" not in text and "哨兵必须原样" not in text:
+    if "doorPassword(), pwd" not in text:
+        fail(...)
+```
+
+测试文件的**头部注释**里恰好写了"哨兵必须原样到达被测代码" —— 外层条件恒
+False，真正的断言检查**永远不可达**。故障注入"去掉夹具自证往返断言"因此报
+"规则未触发"。
+
+这是第 22 轮"写了一条永远不会 fire 的规则"的同族问题。修法是干脆去掉逃生门，
+直接检查断言本体。
+
+**写守卫时要问：这个字符串会不会正好出现在我要检查的东西里？** 会，就别用它
+当门。
+
+另外，本轮夹具自己又踩了一次解析问题：verify.py 打印的是**大写** `  X [规则]`
+而夹具按小写 `x` 判断，5 个用例被误报成"规则未触发"。夹具的解析逻辑同样要
+按**真实输出**写，并靠对照用例自证（第 33/38 条）。
+
 ## 开发约定
 
 - **标准**：C++11（不可使用 C++17 的 inline 变量等特性）
@@ -1905,11 +2029,15 @@ python3 tools/verify_dead_slot.py .
 python3 tools/verify_signaling_client_test.py .
 python3 tools/verify_fingerprint_wire_test.py .
 python3 tools/verify_identify_failure_paths_test.py .
+python3 tools/verify_password_log_test.py .
+python3 tools/verify_password_log_rule.py .
 # 自检脚本必须在**不带 PYTHONIOENCODING** 的 GBK 控制台下也安全
 # （第 25 轮的教训：带 utf-8 测会掩盖真因，绿色是假的）
 env -u PYTHONIOENCODING python3 tools/verify_signaling_client_test.py .
 env -u PYTHONIOENCODING python3 tools/verify_fingerprint_wire_test.py .
 env -u PYTHONIOENCODING python3 tools/verify_identify_failure_paths_test.py .
+env -u PYTHONIOENCODING python3 tools/verify_password_log_test.py .
+env -u PYTHONIOENCODING python3 tools/verify_password_log_rule.py .
 bash tools/run_coverage.sh
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，

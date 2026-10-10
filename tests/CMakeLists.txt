@@ -380,3 +380,39 @@ target_link_libraries(t113_test_fingerprint_wire PRIVATE
 )
 
 add_test(NAME t113_fingerprint_wire COMMAND t113_test_fingerprint_wire)
+
+# ---------------------------------------------------------------------------
+# PasswordManager：门禁密码不得进日志（第 27 轮补）
+#
+# 原始 baseline 的 checkPassword() 把**用户输入、正确密码、两者 hex** 全打进
+# qDebug（已核对 baseline 源码）。门口机是实体门禁设备，密码是物理准入凭据，
+# 而 qDebug 在嵌入式 Linux 上落 stderr / journal、跨重启留存 —— 输错一次就把
+# 密码交出去。
+#
+# 重构已修掉，但此前**只有一条静态文本规则**（check_no_secret_in_logs）在守：
+# 它扫源码里敏感变量名有没有出现在日志语句里。静态规则可能被绕过（改名、
+# 拼串、经辅助函数转一手）。
+#
+# 本目标从**运行期**守：真的把密码设成哨兵串、真的调校验、真的抓 qDebug
+# 输出，断言哨兵串及其 hex 一次都没出现。这也是 password_manager.cpp 第一次
+# 被链接进任何测试目标（第 26 轮统计的 18 个"从未链接"文件之一）。
+#
+# 链接真实的 password_manager.cpp 与 app_config.cpp（密码来源）。不需要
+# ALSA / libgpiod / OpenCV，也不需要真实硬件。
+# ---------------------------------------------------------------------------
+add_executable(t113_test_password_manager
+    test_password_manager.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/managers/password_manager.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/config/app_config.cpp
+)
+
+target_include_directories(t113_test_password_manager PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+)
+
+target_link_libraries(t113_test_password_manager PRIVATE
+    Qt5::Core
+    Qt5::Test
+)
+
+add_test(NAME t113_password_manager COMMAND t113_test_password_manager)
