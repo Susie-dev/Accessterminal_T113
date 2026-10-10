@@ -198,6 +198,65 @@ virtual，无法继承覆盖，因此用**链接期替身** `tests/fake_fingerpr
 timeout 不会再调用 lambda。**那句注释描述的 use-after-free 在当前结构下
 无法发生**，该行属于防御性写法。已在测试里如实标注"不具区分度"。
 
+### 不可达槽与"平行实现"：为死代码写测试的陷阱
+
+第 23 轮审计发现：`FingerprintManager::startEnroll(int)` 有完整实现、有挂起
+守卫、有分步状态机，第 21 轮我还为它写了 **26 个单元测试并全部通过** ——
+但它在整个工程里**没有任何调用者**，也不是任何 connect 的目标。
+
+现场真正跑的指纹注册是 `Form_finger` 里那套**内联**状态机
+（`startFingerRegisterStep()` + `doFingerCollect()`），它直接调
+`buildPacket/sendPacket/readPacket`，完全绕过 `FingerprintManager`。
+
+**这是"有测试 ≠ 被测到"的升级版**：不是断言没落在输出上，而是**被测对象
+根本不在执行路径上**。26 个绿灯与现场行为毫无关系。
+
+两份实现还**并不等价**（实测抽取出来的序列）：
+
+| | 轮询探手指 | 采集前再发 GET_IMAGE | GEN_CHAR | REG_MODEL | STORE_CHAR |
+| --- | --- | --- | --- | --- | --- |
+| A `startEnroll`（**无调用者**） | — | 是（500ms） | 是 | 是 | 是 |
+| B `Form_finger`（**现场执行**） | 是（500ms） | 是（2000ms） | 是 | 是 | 是 |
+
+B 比 A 多一轮由定时器发出的 `GET_IMAGE` 探手指。B 与 baseline 的
+`form_finger.cpp` **逐字节一致**（两处各 9 个 `append`、命令序列与
+`readPacket` 超时完全相同），所以 B 才是必须守住的契约。
+
+**为什么 B 没有单元测试**：它是 UI 类，`startFingerRegisterStep` 要经由
+`parentWidget()` 上溯到 `Widget` 才能拿到 `fingerprint()`，还要真实的
+`QTimer` 与提示音资源。给它造夹具比被测代码本身还复杂，而且会**再造一份
+平行实现**——正是本轮要消除的问题。因此改用**静态契约检查**把它的线上字节
+钉住（与"协议常量必须被钉住"同一思路）。
+
+`check_live_fingerprint_enroll_sequence_is_pinned` 按源码顺序抽取
+`append((char)…)` 的常量与 `readPacket(超时)`，与内置期望序列逐一比对：
+
+```
+0x01,500 | 0x01,2000 | 0x02,<var>,2000 | 0x05,2000 | 0x06,1,<var>,<var>,2000
+ 探手指      采集         生成特征           合并         存储
+```
+
+三个对照变异全部被抓：轮询超时 500→999、`GET_IMAGE` 字节 0x01→0x77、
+`STORE_CHAR` 的 BufferID 1→2。
+
+#### 全工程不可达槽清单
+
+`check_declared_slot_is_reachable` 报出 3 个（**警告级**，因为无法排除
+"刻意保留的公开 API"与跨仓库调用）：
+
+| 槽 | 说明 |
+| --- | --- |
+| `FingerprintManager::startEnroll` | 现场走 `Form_finger` 内联实现，这条永不被调用 |
+| `Widget::onFingerprintEnroll` | 对应 `FingerprintManager::enrollResult`，而该信号只在 `startEnroll` 里发射 → 永不触发 |
+| `Widget::onFingerprintIdentify` | `identifyResult` 已被改成 lambda 连接，这个槽从未接线 |
+
+三者**baseline 同样存在**（baseline `widget.cpp:227` 那行 connect 是被注释掉的，
+`:237` 的 `enrollResult` 连接同样指向一条死路），因此属**继承死代码**，
+重构并未引入。本轮不改行为，只把它们**显式标注出来**并加自动化告警。
+
+必须排除 `on_<对象名>_<信号>()`：它们由 `connectSlotsByName` 自动接线，
+否则会把全部按钮槽误报成死代码（本工程有 5 个这样的槽）。
+
 ### 指纹应答的包标识校验缺口（已知偏差，已告警未修）
 
 同一个 `fingerprint_hailin.cpp` 里的解析路径判据**不一致**：
@@ -402,7 +461,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下二十九条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下三十一条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -1222,7 +1281,7 @@ python3 tools/verify.py . ../Accessterminal_desktop
 > **已加载的模块**后才真正生效。这正是必须做故障注入的理由——**自检脚本自己
 > 也会骗人**。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述二十九条请以
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述三十一条请以
 `verify.py` 的结果为准。
 
 ---
@@ -1343,6 +1402,32 @@ spy 里拿到的是 `Unknown` / `nullptr`，**断言失败的样子像被测代�
 现由 `check_signalspy_types_are_registered` 强制，自检见
 `tools/verify_signalspy_metatype.py`（4/4）。
 
+### 30. 有测试 ≠ 被测到：先确认被测代码在不在执行路径上
+
+第 21 轮给 `FingerprintManager::startEnroll()` 写了 26 个用例并全部通过，
+第 23 轮才发现它在整个工程里**没有任何调用者** —— 现场跑的是 `Form_finger`
+里另一套内联状态机。这是"有测试 ≠ 被测到"的升级版：不是断言没落在输出上，
+而是**被测对象根本不在执行路径上**。26 个绿灯与现场行为毫无关系，而且两份
+实现**并不等价**（现场那套多一轮 `GET_IMAGE` 探手指）。
+
+规则：为一个函数写测试之前，先确认它有生产调用者（或作为 connect 目标）。
+`check_declared_slot_is_reachable` 现在会对"既无调用者、也不是 connect 目标"
+的槽告警。
+
+### 31. 无法用单元测试覆盖的产线路径，用静态契约检查钉住它的线上字节
+
+`Form_finger` 的内联注册流程无法用单元测试覆盖（UI 类，需
+`parentWidget()` 上溯到 `Widget` 才能拿到串口句柄，还要真实 `QTimer` 与
+提示音；造夹具比被测代码还复杂，且会**再造一份平行实现**——正是第 30 条要
+消除的问题）。
+
+但它的命令字节是**指纹模块的硬契约**，不能没人守。做法是静态抽取
+`append((char)…)` 的常量与 `readPacket(超时)`，与内置期望序列比对：
+`check_live_fingerprint_enroll_sequence_is_pinned`。
+
+这与"协议常量必须被测试钉住"（第 17 条）是同一思路的延伸：**能用运行时
+测试就用运行时测试，不能用就用静态契约，但绝不能没人守**。
+
 ## 开发约定
 
 - **标准**：C++11（不可使用 C++17 的 inline 变量等特性）
@@ -1371,7 +1456,9 @@ python3 tools/check_signatures.py .
 #     check_nonblock_pcm_handles_eagain /
 #     check_gated_wire_paths_have_resume_test /
 #     check_fingerprint_ack_tag_is_validated /
-#     check_signalspy_types_are_registered / check_narrowing_cast_of_config
+#     check_signalspy_types_are_registered /
+#     check_declared_slot_is_reachable /
+#     check_live_fingerprint_enroll_sequence_is_pinned / check_narrowing_cast_of_config
 #     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
@@ -1389,6 +1476,7 @@ python3 tools/verify_nonblock_pcm.py .
 python3 tools/verify_gated_resume.py .
 python3 tools/verify_fp_ack_tag.py .
 python3 tools/verify_signalspy_metatype.py .
+python3 tools/verify_dead_slot.py .
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
 #     含「原实现对照」与随机模糊测试；无需编译即可验证定帧逻辑）
