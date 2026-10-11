@@ -37,6 +37,21 @@ int g_sendFailFirst = 0;
 /// **改动生产头文件**，而本替身的设计前提就是"生产代码零改动"。
 QSet<const HailinFingerprint*> g_openDevices;
 
+/// 校验和：自下标 6 起累加到末尾（不含 0xEF01 包头与 4 字节设备地址）。
+///
+/// 单独抽成函数、而不是在 buildFrame() 里再内联一份循环，是为了与生产
+/// `HailinFingerprint::buildPacket()` 保持**同构**：生产那边现在也是调用
+/// `calcChecksum()`。否则替身与生产又会各自内联一份校验和循环，两份拷贝
+/// 可以各自漂移（`[fake-wire]` 规则正是盯着这件事）。
+quint16 checksumOf(const QByteArray& pkt)
+{
+    quint16 sum = 0;
+    for (int i = 6; i < pkt.size(); ++i) {
+        sum = static_cast<quint16>(sum + static_cast<quint8>(pkt.at(i)));
+    }
+    return sum;
+}
+
 /// 与真实 buildPacket() 完全一致（下标 6 起累加，不含包头与设备地址）。
 QByteArray buildFrame(const QByteArray& payload)
 {
@@ -52,10 +67,7 @@ QByteArray buildFrame(const QByteArray& payload)
     pkt.append((char)(pktLen >> 8));
     pkt.append((char)(pktLen & 0xFF));
     pkt.append(payload);
-    quint16 sum = 0;
-    for (int i = 6; i < pkt.size(); ++i) {
-        sum = static_cast<quint16>(sum + static_cast<quint8>(pkt.at(i)));
-    }
+    const quint16 sum = checksumOf(pkt);
     pkt.append((char)(sum >> 8));
     pkt.append((char)(sum & 0xFF));
     return pkt;
@@ -130,10 +142,7 @@ void pushAck(const QByteArray& payload)
     pkt.append((char)(pktLen >> 8));
     pkt.append((char)(pktLen & 0xFF));
     pkt.append(payload);
-    quint16 sum = 0;
-    for (int i = 6; i < pkt.size(); ++i) {
-        sum = static_cast<quint16>(sum + static_cast<quint8>(pkt.at(i)));
-    }
+    const quint16 sum = checksumOf(pkt);
     pkt.append((char)(sum >> 8));
     pkt.append((char)(sum & 0xFF));
     g_pending.append(pkt);
@@ -195,10 +204,7 @@ void pushFrameWithTag(quint8 tag, const QByteArray& payload)
     pkt.append((char)(pktLen >> 8));
     pkt.append((char)(pktLen & 0xFF));
     pkt.append(payload);
-    quint16 sum = 0;
-    for (int i = 6; i < pkt.size(); ++i) {
-        sum = static_cast<quint16>(sum + static_cast<quint8>(pkt.at(i)));
-    }
+    const quint16 sum = checksumOf(pkt);
     pkt.append((char)(sum >> 8));
     pkt.append((char)(sum & 0xFF));
     g_pending.append(pkt);
@@ -306,10 +312,7 @@ QByteArray HailinFingerprint::readPacket(int timeoutMs)
 
 quint16 HailinFingerprint::calcChecksum(const QByteArray& pkt)
 {
-    quint16 sum = 0;
-    for (int i = 6; i < pkt.size(); ++i) {
-        sum = static_cast<quint16>(sum + static_cast<quint8>(pkt.at(i)));
-    }
+    const quint16 sum = checksumOf(pkt);
     return sum;
 }
 

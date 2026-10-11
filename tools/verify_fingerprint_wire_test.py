@@ -6,13 +6,16 @@
 
 这里注入的都是**真实可能被写错**的报文契约点：
   1. 校验和起始下标 6 -> 0（少减包头与地址）
-  2. 长度字段 = payload+2 -> payload（漏掉校验和 2 字节）
-  3. 长度字段大端 -> 小端
-  4. 校验和大端 -> 小端
-  5. 包头 0xEF01 -> 0xEF02
-  6. 广播地址改成 0x00000000
+  2. buildPacket() 不再调用唯一的 calcChecksum()（重复实现回归 / 校验和变 0）
+  3. 长度字段 = payload+2 -> payload（漏掉校验和 2 字节）
+  4. 长度字段大端 -> 小端
+  5. 校验和大端 -> 小端
+  6. 包头 0xEF01 -> 0xEF02
   7. 包标识 PKT_CMD 0x01 -> 0x02
-  8. 校验和不写入（只留 payload 末尾对齐错误）
+
+第 31 轮起：`buildPacket()` 不再内联累加循环，而是调用 `calcChecksum()`。
+于是第 25 轮那条"（已知不可区分·死代码）"变异**变成了可区分** —— 因为
+被改的那份现在是唯一生效的实现。本夹具据此把它转成正常的致命变异。
 """
 import io
 import os
@@ -46,36 +49,25 @@ ENV['PATH'] = (os.path.join(MSYS, 'mingw64', 'bin') + os.pathsep
                + os.path.join(MSYS, 'usr', 'bin') + os.pathsep + ENV['PATH'])
 
 MUTATIONS = [
-    # 注意：`for (int i = 6; i < pkt.size(); ++i) sum += (quint8)pkt[i];`
-    # 在文件里出现**两次**（buildPacket 与 calcChecksum 各一处），
-    # 故必须用更长的上下文把锚点收窄到 buildPacket 里的那一处。
-    # 夹具的不唯一性自证（第 24 轮加的）正是在这里救了场。
-    ("校验和起始下标 6 -> 0（仅 buildPacket）", [
-        ("""    quint16 sum = 0;
-    // 校验和从包标识字段开始累加到 payload 末尾，不包含 0xEF01 包头和设备地址。
-    // 开始循环处理满足条件的数据或状态。
-    for (int i = 6; i < pkt.size(); ++i) sum += (quint8)pkt[i];""",
-         """    quint16 sum = 0;
-    // 变异：从下标 0 起算
-    for (int i = 0; i < pkt.size(); ++i) sum += (quint8)pkt[i];""")]),
-
-    # 同一处契约的**另一半**：只改 buildPacket 而不改 calcChecksum 时，
-    # 两者会产生不同的校验和 —— 这条专门检测"两份实现分叉"。
-    # 【已知不可区分 —— 第 25 轮实测：死代码】
-    # calcChecksum() 在生产代码里**零调用者**（buildPacket 自己内联了同一个
-    # 累加循环，校验和逻辑在同一文件里有两份）。baseline
-    # （terminal/smartpronew/HailinFingerprint.cpp）同样零调用者 —— 这是
-    # **继承来的**，不是重构引入的。改一个死函数不影响任何行为，因此该变异
-    # 不可能被任何运行时测试区分。如实记录，不假装它有效。
-    ("（已知不可区分·死代码）calcChecksum 起始下标 6 -> 0", [
+    # 第 31 轮起：buildPacket() 不再内联累加循环，而是 `sum = calcChecksum(pkt)`。
+    # 故"起始下标"这一处变异必须打到**唯一实现** calcChecksum() 身上。
+    ("校验和起始下标 6 -> 0（calcChecksum，唯一实现）", [
         ("""    quint16 sum = 0;
     // 开始循环处理满足条件的数据或状态。
     for (int i = 6; i < pkt.size(); ++i) sum += (quint8)pkt[i];
     // 返回当前函数的执行结果或结束函数。
     return sum;""",
          """    quint16 sum = 0;
+    // 变异：从下标 0 起算
     for (int i = 0; i < pkt.size(); ++i) sum += (quint8)pkt[i];
     return sum;""")]),
+
+    # 同一处契约的另一半：生产 buildPacket() 必须**调用**这个辅助函数。
+    # 若有人把它改回内联（重复实现回归），[fake-wire] 与 [dup-checksum]
+    # 都会失败；下面这条直接从调用点入手，钉住"确实在用它"。
+    ("buildPacket 不再调用 calcChecksum（改回内联 / 直接用 0）", [
+        ("quint16 sum = calcChecksum(pkt);",
+         "quint16 sum = 0; // 变异：不再复用唯一实现")]),
 
     ("长度字段漏掉校验和的 2 字节", [
         ("quint16 pktLen = payload.size() + 2; // 包长度=payload+校验和",

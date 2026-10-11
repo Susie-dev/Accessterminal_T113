@@ -31,6 +31,9 @@ TF = os.path.join('tests', 'test_face_manager.cpp')
 CM = os.path.join('tests', 'CMakeLists.txt')
 FX = os.path.join('tools', 'verify_face_manager_test.py')
 CFG = os.path.join('src', 'config', 'app_config.cpp')
+# 阈值的**真实**夹取在头文件的访问器里（第 31 轮修正：原夹具只改 .cpp，
+# 而 .cpp 里根本没有夹取，规则第一版也因此误报"没有任何范围约束"）。
+CFG_H = os.path.join('src', 'config', 'app_config.h')
 
 
 def run_in(root):
@@ -79,12 +82,17 @@ CASES = [
     ('对照：加无关注释',
      patch(TF, 'QTEST_MAIN(TestFaceManager)', '// 无关注释\nQTEST_MAIN(TestFaceManager)'),
      'pass'),
-    ('对照：给阈值加范围约束（告警应消失）',
-     patch(CFG, '    m_faceConfidenceThreshold = 90.0;',
-           '    m_faceConfidenceThreshold = 90.0;\n'
-           '    // 约束\n    (void)0;\n'
-           '    m_faceConfidenceThreshold = qBound(1.0, m_faceConfidenceThreshold, 1000.0);'),
+    # 告警的判据现在是"上限大到形同虚设"，不是"有没有 clamp 字样"。
+    # 故这条对照把上限从 1e9 收到 1000 —— 告警才应该消失。
+    ('对照：把上限收到 1000（告警应消失）',
+     patch(CFG_H, 'clampDouble(m_faceConfidenceThreshold, 0.0, 1e9)',
+           'clampDouble(m_faceConfidenceThreshold, 0.0, 1000.0)'),
      'nowarn'),
+    # 真阳性：连夹取都去掉，必须告警（原隐患的措辞）。
+    ('去掉夹取（应告警）',
+     patch(CFG_H, 'double faceConfidenceThreshold() const { return clampDouble(m_faceConfidenceThreshold, 0.0, 1e9); }',
+           'double faceConfidenceThreshold() const { return m_faceConfidenceThreshold; }'),
+     'warn'),
 ]
 
 problems = []
@@ -108,9 +116,12 @@ for name, mutate, want in CASES:
         elif want == 'nowarn':
             ok = len(w) == 0 and len(f) == 0
         else:
+            # 'pass' 与 'warn' 都要求"仍然有告警且数量与基线一致"，
+            # 区别只在语义：'warn' 是"这条隐患本就该继续告警"。
             ok = len(f) == 0 and len(w) == len(w0)
         if ok:
             print('  %-38s %s ✓' % (name, {'fail': '失败', 'pass': '通过',
+                                           'warn': '告警(预期)',
                                            'nowarn': '告警消失'}[want]))
         else:
             print('  %-38s *** 期望 %s，实得 失败=%d 告警=%d'

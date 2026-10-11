@@ -396,10 +396,11 @@ QByteArray HailinFingerprint::buildPacket(const QByteArray& payload) {
     // 执行本行语句完成对应变量、对象或业务状态处理。
     pkt.append(payload);
     // 执行本行语句完成对应变量、对象或业务状态处理。
-    quint16 sum = 0;
     // 校验和从包标识字段开始累加到 payload 末尾，不包含 0xEF01 包头和设备地址。
-    // 开始循环处理满足条件的数据或状态。
-    for (int i = 6; i < pkt.size(); ++i) sum += (quint8)pkt[i];
+    // 复用 calcChecksum()：同一份累加逻辑在文件里只能有一处实现。
+    // 原先此处内联了与 calcChecksum() 逐字节相同的循环，两份拷贝可各自漂移
+    // （实测：只改死的那份，18 个指纹用例全部照常通过）。现改为唯一实现。
+    quint16 sum = calcChecksum(pkt);
     // 执行本行语句完成对应变量、对象或业务状态处理。
     pkt.append((char)(sum >> 8));
     // 执行本行语句完成对应变量、对象或业务状态处理。

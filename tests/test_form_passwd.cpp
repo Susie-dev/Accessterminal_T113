@@ -342,7 +342,7 @@ void TestFormPasswd::backspaceRemovesTwoDigitsPerPress_documentsInheritedDefect(
     // 人员会觉得更难用），必须由人确认。因此本测试把**现状**钉住：
     // 一旦有人改了行为，这条会红，提醒他这是有意变更而不是顺手改的。
     //
-    // 已登记在 README 的"已知限制"里，与 refstop、calcChecksum 等并列。
+    // 已登记在 README 的"已知限制"里，与 refstop 等并列。
     Form_passwd form;
     QSignalSpy spy(&form, &Form_passwd::passwordEntered);
 

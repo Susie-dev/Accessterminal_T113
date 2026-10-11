@@ -2854,6 +2854,41 @@ def check_fake_fingerprint_builds_same_bytes(root, src_root):
             k += 1
         return text[j:k + 1]
 
+    def _helper_body(text):
+        """找出**含校验和累加循环**的那个函数体 —— 刻意不靠函数名。
+
+        名称无关是有意为之：生产叫 `calcChecksum`、替身叫 `checksumOf`，
+        故障注入里还可能改名。按名字找会制造两类误报 —— 无害改名被当成
+        "抽取失败"，或参数改名被当成报文漂移（故障注入实测抓到过）。
+
+        判据必须同时要求"下标循环"**和**"累加"，只要求前者会误命中
+        `readPacket()` 里那个排队循环
+        （`for (int i = 1; i < frames.size(); ++i) m_pendingFrames.append(...)`）——
+        实测第一版正是这样抽错了函数，报出一堆假的"漂移"。
+        """
+        loop = _re.compile(r"for\s*\(\s*int\s+\w+\s*=\s*\d+\s*;"
+                           r"\s*\w+\s*<\s*\w+\.size\(\)\s*;[^)]*\)")
+        # 累加形态：`x += (quint8)y[...]` 或
+        # `x = static_cast<quint16>(x + static_cast<quint8>(y.at(...)))`
+        accum = _re.compile(r"\+=\s*\(?\s*quint8|"
+                            r"\+\s*static_cast<quint8>")
+        for m in _re.finditer(r"([A-Za-z_]\w*)\s*\([^;{]*?\)\s*"
+                              r"(?:const\s*)?\{", text):
+            j = m.end() - 1
+            depth, k = 0, j
+            while k < len(text):
+                if text[k] == "{":
+                    depth += 1
+                elif text[k] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            body = text[j:k + 1]
+            if loop.search(body) and accum.search(body):
+                return body
+        raise ValueError("找不到含校验和累加循环的函数体")
+
     def _ops(body):
         out = []
         for m in _re.finditer(
@@ -2867,7 +2902,18 @@ def check_fake_fingerprint_builds_same_bytes(root, src_root):
             # static_cast<quint16>(x) 与 x 语义等价（payload 远小于 65536）
             e = " ".join(m.group(1).split())
             e = _re.sub(r"static_cast<quint16>\s*\(\s*(.*?)\s*\)$", r"\1", e)
-            out.append("LEN=" + e)
+            # 校验和现在由**共用的辅助函数**计算，生产/替身各自给它的命名不同
+            # （生产 calcChecksum()、替身匿名命名空间的 checksumOf()），故把
+            # 任何 `标识符(单个标识符)` 形态的赋值归一成一个记号。累加范围本身
+            # （自下标 6 起算）改由下面的辅助函数体比对来守 —— 否则把范围挪进
+            # 辅助函数后，这一段契约就没人盯了。
+            #
+            # 刻意放宽到"任意函数名"：硬编码 calcChecksum|checksumOf 会在替身
+            # 改名时把一次无害重命名误报成漂移（故障注入实测抓到过这一点）。
+            if _re.fullmatch(r"[A-Za-z_]\w*\s*\(\s*[A-Za-z_]\w*\s*\)", e):
+                out.append("SUM=HELPER(pkt)")
+            else:
+                out.append("LEN=" + e)
         for m in _re.finditer(
                 r"for\s*\(\s*int\s+\w+\s*=\s*(\d+)\s*;[^;]*;\s*([^)]*)\)",
                 body):
@@ -2880,6 +2926,14 @@ def check_fake_fingerprint_builds_same_bytes(root, src_root):
         fs = _strip(read(fake))
         po = _ops(_body(ps, "HailinFingerprint::buildPacket("))
         fo = _ops(_body(fs, "QByteArray buildFrame("))
+        # 校验和的**累加范围**已随去重挪进共用的辅助函数体里。只比
+        # buildPacket 与 buildFrame 的话，这一段契约就没人盯了 —— 有人把范围
+        # 只改了一边，上面那轮照样全绿。故这里再独立比一次辅助函数体。
+        #
+        # 按**内容**（含累加循环）定位，不按函数名：生产叫 calcChecksum、
+        # 替身叫 checksumOf，改名不该被误报成漂移。
+        pcb = _ops(_helper_body(ps))
+        fcb = _ops(_helper_body(fs))
     except (ValueError, OSError) as exc:
         fail("[fake-wire] 无法抽取报文构造实现做比对: %s" % exc)
         return
@@ -2895,26 +2949,38 @@ def check_fake_fingerprint_builds_same_bytes(root, src_root):
                      "单元测试只跑替身，看不到生产实现已漂移 —— 真机报文会错，"
                      "而所有指纹测试仍然全绿。" % (i, a, b))
 
+    if pcb != fcb:
+        fail("[fake-wire] 校验和辅助函数体已经漂移：生产 "
+             "HailinFingerprint::calcChecksum() = %r，替身 checksumOf() = %r。"
+             "累加范围（自下标 6 起算、不含 0xEF01 包头与 4 字节设备地址）"
+             "是报文契约的一部分，两份实现必须一致。" % (pcb, fcb))
+
 
 def check_fingerprint_checksum_logic_is_not_duplicated(root, src_root):
     r"""
-    校验和逻辑在同一个文件里**有两份**，且其中一份是死代码 —— 必须显式记录。
+    校验和累加逻辑在同一个文件里**只能有一份**，且那一份必须**真的被调用**。
 
+    背景（第 25 轮 → 第 31 轮）
+    --------------------------
     第 25 轮实测：`HailinFingerprint::calcChecksum()` 在生产代码里**零调用者**，
     而 `buildPacket()` 自己内联了同一个累加循环：
 
         for (int i = 6; i < pkt.size(); ++i) sum += (quint8)pkt[i];
 
     实测 baseline（`terminal/smartpronew/HailinFingerprint.cpp`）同样零调用者，
-    所以这是**继承来的**，不是重构引入的缺陷，本轮不改行为。
+    是**继承来的**。当时只告警，因为"删死代码还是让它被调用"属产品决策。
 
-    但它是一个真实的可维护性隐患：两份拷贝可以各自漂移。第 25 轮的故障注入
-    实测证实了后果 —— 只把 `calcChecksum` 的起始下标从 6 改成 0，**18 个
-    指纹用例全部照常通过**（因为没人调用它）；而若有人"顺手修好"这个死函数
-    并开始调用它，报文校验和就会与 `buildPacket()` 不一致。
+    第 31 轮取了后者：`buildPacket()` 改为调用 `calcChecksum()`，重复消除，
+    死代码同时消失。本规则随之从"告警记录"升级为**强制断言** ——
 
-    本规则只做**告警并要求显式记录**，不改变行为（改它是否属于"修缺陷"需要
-    产品决策）。已有的 buildPacket 单元测试钉住了实际生效的那一份契约。
+      - 累加循环在文件里出现 **>= 2 次**：重复实现又回来了 -> fail；
+      - 循环只有一份，但 `calcChecksum()` **零调用者**：它又退化成死代码
+        -> fail（这正是第 25 轮那个"看起来有、实际没有"的防线）。
+
+    为什么必须断言而不是继续告警：第 25 轮量的后果是**只改死的那份**时
+    18 个指纹用例全部照常通过。现在改的是唯一生效的那份，故障注入（
+    `tools/verify_fingerprint_wire_test.py` 的「calcChecksum 起始下标 6 -> 0」）
+    已从"已知不可区分"变成能被抓到 —— 这条规则钉住的就是那个前提。
     """
     import re as _re
 
@@ -2922,10 +2988,13 @@ def check_fingerprint_checksum_logic_is_not_duplicated(root, src_root):
     if not os.path.exists(prod):
         return
     text = read(prod)
-    loop = "for (int i = 6; i < pkt.size(); ++i) sum += (quint8)pkt[i];"
-    n = text.count(loop)
-    if n < 2:
-        return
+
+    # 匹配累加循环本体，容忍 pkt[i] / pkt.at(i) 与强制转换的空格差异。
+    loop_re = _re.compile(
+        r"for\s*\(\s*int\s+\w+\s*=\s*(\d+)\s*;\s*\w+\s*<\s*\w+\.size\(\)\s*;"
+        r"\s*\+\+\w+\s*\)\s*\w+\s*\+=\s*\(?\s*quint8\s*\)?\s*\w+"
+        r"(?:\.at\(|\s*\[\s*)\w+\s*\]?\s*\)?\s*;")
+    loops = loop_re.findall(text)
 
     # calcChecksum 是否有调用者？（定义行本身不算）
     callers = 0
@@ -2941,13 +3010,23 @@ def check_fingerprint_checksum_logic_is_not_duplicated(root, src_root):
                         "calcChecksum")[0]:
                     continue      # 头文件里的声明
             callers += 1
-    if callers == 0:
-        warn("[dup-checksum] src/hal/fingerprint_hailin.cpp 里校验和累加循环出现 "
-             "%d 次，但 HailinFingerprint::calcChecksum() **零调用者** —— "
-             "第二份是死代码。baseline 亦然（继承而来，本轮不改行为）。"
-             "隐患：两份拷贝可各自漂移；故障注入实测「只改死的那份」时 18 个"
-             "指纹用例全部照常通过。若将来启用它，必须与 buildPacket() 的"
-             "累加范围保持一致（自下标 6 起算、不含包头与设备地址）。" % n)
+
+    if len(loops) >= 2:
+        fail("[dup-checksum] src/hal/fingerprint_hailin.cpp 里校验和累加循环又"
+             "出现了 %d 次 —— 重复实现回来了。第 25 轮实测：两份拷贝会各自漂移，"
+             "且「只改没被调用的那份」时 18 个指纹用例全部照常通过。同一份校验和"
+             "逻辑只能有一处实现（第 31 轮已把 buildPacket() 改为调用 "
+             "calcChecksum()）。" % len(loops))
+        return
+
+    if len(loops) == 1 and callers == 0:
+        fail("[dup-checksum] 校验和累加循环只剩一份，但 "
+             "HailinFingerprint::calcChecksum() **零调用者** —— 它又退化成了"
+             "死代码，成了一条『看起来有、实际没有』的防线。第 31 轮起 "
+             "buildPacket() 必须调用它（消除重复的同时保证那份实现真的生效）。")
+
+
+
 
 
 
@@ -3281,10 +3360,19 @@ def check_face_gate_hazard_is_documented(root, src_root):
 
     关于阈值的 warn
     ---------------
-    探针证实门禁安全**完全取决于**该阈值，而它只被读取、**没有任何范围
-    约束**（app_config.cpp 里 qBound/clamp 调用总数为 0）。配置成 1e9 会让
-    任何陌生人像都判"通过"，门锁形同虚设。这不是崩溃类缺陷，故只告警；
-    是否加约束属行为变化，需要单独决定。
+    探针证实门禁安全**完全取决于**该阈值。第 29 轮第一版规则只搜
+    `src/config/app_config.cpp` 里的 `qBound|clamp` 子串，于是**误报**了
+    "没有任何范围约束" —— 真正的夹取在 `app_config.h` 的访问器里：
+
+        double faceConfidenceThreshold() const
+        { return clampDouble(m_faceConfidenceThreshold, 0.0, 1e9); }
+
+    第 31 轮改为读头文件、解析出实际的上下限，并按**真实**情况告警：
+      - 访问器完全没夹取          -> warn（原隐患）；
+      - 夹了，但上限大到形同虚设
+        （如 1e9）                 -> warn（新的、更准确的措辞）。
+    配置成 1e9 会让任何陌生人像都判"通过"，门锁形同虚设；把上限收到
+    合理值（如 1000）属行为变化，仍需单独决定，故仍只告警。
     """
     impl = os.path.join(src_root, "managers", "face_manager.cpp")
     if not os.path.exists(impl):
@@ -3331,20 +3419,47 @@ def check_face_gate_hazard_is_documented(root, src_root):
         fail("[face-gate] 缺少 tools/verify_face_manager_test.py —— 没有故障注入"
              "就无法证明这些门禁断言**真的会失败**。不失败的回归测试没有价值。")
 
-    # 阈值没有范围约束 -> 告警（安全相关，但属行为变化，需单独决定）。
-    cfg = os.path.join(src_root, "config", "app_config.cpp")
-    if os.path.exists(cfg):
-        ctext = read(cfg)
-        if "faceConfidenceThreshold" in ctext:
-            clamped = re.search(
-                r"qBound|std::clamp|std::min|std::max|qMax|qMin", ctext)
-            if not clamped:
-                warn("[face-gate] behavior.face_confidence_threshold 没有任何范围"
-                     "约束，而探针证实**门禁安全完全取决于它**（单 label 时"
-                     "predictedLabel == 1 恒真）。配置成 1e9 会让任何陌生人像都"
-                     "判『通过』，门锁形同虚设；误配置成 900（少写一个 0）会"
-                     "静默失去门禁作用。是否加约束属行为变化，需单独决定 —— "
-                     "当前仅告警。")
+    # 阈值范围约束 -> 告警（安全相关，但收紧上限属行为变化，需单独决定）。
+    #
+    # 第 29 轮第一版只搜 app_config.cpp 的 `qBound|clamp` 子串，把
+    # 「夹取写在 app_config.h 的访问器里」误报成「没有任何范围约束」。
+    # 现在读头文件、解析出真实的上下限，只在**确实有问题**时告警：
+    # 没夹取，或上限大到形同虚设（1e9 允许任何陌生人脸通过）。
+    cfg_h = os.path.join(src_root, "config", "app_config.h")
+    cfg_cpp = os.path.join(src_root, "config", "app_config.cpp")
+    if os.path.exists(cfg_h) and "faceConfidenceThreshold" in read(cfg_h):
+        htext = read(cfg_h)
+        m = re.search(
+            r"faceConfidenceThreshold\s*\(\s*\)\s*const\s*\{[^}]*?"
+            r"clamp(?:Int|Double)\s*\([^,]+,\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
+            htext)
+        # 上限大小顺带看一眼 .cpp（有些实现把 clamp 放在那里）。
+        ctext = read(cfg_cpp) if os.path.exists(cfg_cpp) else ""
+
+        def _no_upper_bound(expr):
+            """上限是否大到形同虚设（1e9 / 1e12 / DBL_MAX ...）。"""
+            e = expr.strip()
+            mm = re.match(r"^1[eE](\d+)$", e)
+            if mm:
+                return int(mm.group(1)) >= 6
+            return e.replace(" ", "") in ("DBL_MAX", "std::numeric_limits<double>::max()")
+
+        if m is None and not re.search(r"qBound|std::clamp|std::min|std::max"
+                                       r"|qMax|qMin", ctext):
+            warn("[face-gate] behavior.face_confidence_threshold 没有任何范围"
+                 "约束，而探针证实**门禁安全完全取决于它**（单 label 时"
+                 "predictedLabel == 1 恒真）。配置成 1e9 会让任何陌生人像都"
+                 "判『通过』，门锁形同虚设；误配置成 900（少写一个 0）会"
+                 "静默失去门禁作用。是否加约束属行为变化，需单独决定 —— "
+                 "当前仅告警。")
+        elif m is not None and _no_upper_bound(m.group(2)):
+            warn("[face-gate] behavior.face_confidence_threshold 虽然做了夹取"
+                 "（%s），但**上限 %s 大到形同虚设** —— 而探针证实门禁安全"
+                 "完全取决于它（单 label 时 predictedLabel == 1 恒真）。"
+                 "配置成 1e9 会让任何陌生人像都判『通过』，门锁形同虚设；"
+                 "误配置成 900（少写一个 0）也会静默失去门禁作用。把上限收到"
+                 "合理区间属行为变化，需单独决定 —— 当前仅告警。"
+                 % (m.group(0).split("{")[-1].strip(), m.group(2).strip()))
 
 
 
