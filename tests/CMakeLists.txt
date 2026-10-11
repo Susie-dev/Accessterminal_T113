@@ -46,7 +46,7 @@ else()
                            "${CMAKE_CURRENT_LIST_DIR}/../src" ABSOLUTE)
 endif()
 
-find_package(Qt5 5.12 REQUIRED COMPONENTS Core Test Gui Network SerialPort)
+find_package(Qt5 5.12 REQUIRED COMPONENTS Core Test Gui Network SerialPort Widgets)
 
 # ---------------------------------------------------------------------------
 # 协议契约测试
@@ -556,3 +556,77 @@ target_link_options(t113_test_v4l2_camera PRIVATE
 )
 
 add_test(NAME t113_v4l2_camera COMMAND t113_test_v4l2_camera)
+
+# ---------------------------------------------------------------------------
+# 密码输入窗体（src/ui/form_passwd.cpp）—— 本工程**第一个 Qt Widgets 测试目标**
+#
+# 为什么值得测：它是真实门禁的密码录入路径，而且是"密码不得进日志"这条安全
+# 性质的唯一现场。此前该性质**只由一条静态文本规则**（check_no_secret_in_logs）
+# 守着，而那条规则自己写着"只做词法判定，不做数据流分析"。于是只要换一种写法
+# （先赋给临时变量再打印、或打印拼接结果），静态规则看不出来，而没有任何行为
+# 测试会拦它。本测试改成：真的把按键点下去，用 qInstallMessageHandler 捕获
+# **实际日志输出**，再断言日志里不含刚输入的密码。这比静态规则强，因为它不
+# 关心密码"怎么"漏出去。
+#
+# 这是第一个 Widgets 目标，写之前用探针（%TEMP%\probe35\）量清了三件有风险的
+# 事：uic 能处理真实 form_passwd.ui；QT_QPA_PLATFORM=offscreen 下 QApplication
+# 能起来且 QTest::mouseClick 真能触发 clicked；按钮文本恰好是数字（否则
+# btn->text() 拼出的密码是错的）。
+#
+# 替身只替换两条**不影响密码路径**的东西：
+#   - tests/shadows/ui/widget.h  ── 真 ui/widget.h 会拖进 OpenCV + 整个主程序
+#     门面（十几个管理器、ui_widget.h）。
+#   - tests/shadows/managers/audio_manager.h ── 真 AudioManager 会
+#     QtConcurrent::run 去开 ALSA 放音，慢且依赖声卡。
+#
+# 两条都做成**影子头**（替换路径，而不是另起假文件名）：这样 form_passwd.cpp
+# 里原有的 `#include "ui/widget.h"` / `#include "managers/audio_manager.h"`
+# 一个字都不用改就命中替身。AudioManager 必须也走影子头，否则它会同时看到真
+# 头与假头，报 "redefinition of 'class AudioManager'"（第 35 轮实测）。
+#
+# 两个影子头都带 Q_OBJECT，**必须显式列进源列表**让 AUTOMOC 处理，否则链接期
+# 报 undefined reference to ...::staticMetaObject（实测：只放进 include 目录
+# 不够，AUTOMOC 不看 include 目录）。这也是第 35 轮的实测结论之一。
+# ---------------------------------------------------------------------------
+qt5_wrap_ui(T113_FORM_PASSWD_UIS
+    ${ACCESSTERMINAL_SRC_ROOT}/ui/form_passwd.ui
+)
+
+add_executable(t113_test_form_passwd
+    test_form_passwd.cpp
+    # 影子头必须列进来，AUTOMOC 才会为它们生成元对象
+    ${CMAKE_CURRENT_LIST_DIR}/shadows/ui/widget.h
+    ${CMAKE_CURRENT_LIST_DIR}/shadows/managers/audio_manager.h
+    ${ACCESSTERMINAL_SRC_ROOT}/ui/form_passwd.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/config/app_config.cpp
+    ${T113_FORM_PASSWD_UIS}
+)
+
+# BEFORE：影子 ui/widget.h 与 managers/audio_manager.h 必须排在真头之前命中。
+target_include_directories(t113_test_form_passwd BEFORE PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/shadows
+)
+
+target_include_directories(t113_test_form_passwd PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_BINARY_DIR}                   # ui_form_passwd.h（uic 产物）
+)
+
+target_compile_definitions(t113_test_form_passwd PRIVATE
+    ACC_FORM_PASSWD_TEST
+)
+
+target_link_libraries(t113_test_form_passwd PRIVATE
+    Qt5::Core
+    Qt5::Test
+    Qt5::Gui
+    Qt5::Widgets
+)
+
+add_test(NAME t113_form_passwd COMMAND t113_test_form_passwd)
+
+# 无显示器环境（CI、交叉编译后的板子、SSH）也要能跑：offscreen 平台插件。
+# 测试自身在 initTestCase() 里也会兜底设置，这里设是为了让 ctest 直接跑也稳。
+set_tests_properties(t113_form_passwd PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+)

@@ -94,7 +94,7 @@ cmake --build /tmp/t113-tests
 ctest --test-dir /tmp/t113-tests --output-on-failure
 ```
 
-当前 15 个目标：`t113_protocol`（协议编解码）、`t113_fingerprint_parser`
+当前 16 个目标：`t113_protocol`（协议编解码）、`t113_fingerprint_parser`
 （指纹帧解析）、`t113_app_config`（配置读取与夹取）、`t113_audio_manager`
 （提示音播放，用假 ALSA 注入设备错误）、`t113_audio_sender`（UDP 12345
 上行音频）、`t113_audio_receiver`（UDP 12345 下行播放）、`t113_video_push`
@@ -106,7 +106,8 @@ ctest --test-dir /tmp/t113-tests --output-on-failure
 `t113_gpio`（物理门锁/补光那条线，用可编程假 libgpiod）、
 `t113_face_manager`（人脸门禁，链接真实 LBPH；**缺 OpenCV face 模块时
 自动跳过**）、`t113_v4l2_camera`（画面源头，用可编程假 syscall 层 +
-`-Wl,--wrap`）。
+`-Wl,--wrap`）、`t113_form_passwd`（密码输入窗体，**唯一的 Qt Widgets
+目标**，用影子 `Widget`/`AudioManager` 驱动真实按钮点击并捕获真实日志）。
 
 注意最后两个目标的取向**相反**，这是刻意的：
 `t113_fingerprint_manager` 用替身替换 `fingerprint_hailin.cpp`，
@@ -227,9 +228,11 @@ gcov 数据里：
 | `src/hal/gpio.cpp` | 105 |
 | `src/managers/face_manager.cpp` | 52 |
 | `src/ui/form_call.cpp` | 46 |
-| `src/ui/form_passwd.cpp` | 85 |
 | `src/managers/password_manager.cpp` | 19 |
 | 其余头文件与 `main.cpp` | — |
+
+（`src/ui/form_passwd.cpp` 第 35 轮已接进 `t113_test_form_passwd`，故已从此表
+移出；见下文更新后的数字。）
 
 **数字正确、口径错误，比没有数字更危险** —— 它会让人停止寻找缺口。
 
@@ -250,33 +253,44 @@ gcov 数据里：
 分子 714 -> 823，已测文件百分比 73.7% -> 77.0%，分母 2609 -> 2343，
 真实总覆盖率 **27.4% -> 35.1%**。
 
+第 35 轮把 `form_passwd.cpp`（46 行）接进 `t113_test_form_passwd` 后：
+分子 823 -> 918，已测文件百分比 77.0% -> 78.2%，分母 2343 -> 2335（该文件
+46 行从"未测"挪进"已测"，未测侧同时少了它原先的近似行数），
+真实总覆盖率 **35.1% -> 39.3%**。该文件自身覆盖率 **97.8%**（46 行覆盖 45）。
+
 这正是"分母必须一起报"的价值：只报已测文件百分比的话，**做对了事数字反而
 变难看**，会诱导人不去补齐未测文件。）
 
 #### 已测文件的明细与未覆盖行
 
-被测到的文件覆盖度相当高（1069 行中 823 行，77.0%）：
+被测到的文件覆盖度相当高（1174 行中 918 行，78.2%）：
 
 | 文件 | 可执行行 | 覆盖 | 覆盖率 |
 | --- | --- | --- | --- |
-| `src/config/app_config.cpp` | 88 | 88 | 100% |
-| `src/config/app_config.h` | 18 | 18 | 100% |
-| `src/core/media/audio_sender_thread.cpp` | 46 | 46 | 100% |
-| `src/core/net/signaling_client.cpp` | 58 | 58 | 100% |
-| `src/managers/face_manager.cpp` | 28 | 28 | 100% |
+| `src/config/app_config.cpp` | 89 | 89 | 100% |
+| `src/config/app_config.h` | 22 | 22 | 100% |
+| `src/core/media/audio_sender_thread.cpp` | 51 | 51 | 100% |
+| `src/core/net/signaling_client.cpp` | 61 | 61 | 100% |
+| `src/core/vision/v4l2_camera.cpp` | 68 | 68 | 100% |
+| `src/managers/face_manager.cpp` | 29 | 29 | 100% |
 | `src/managers/password_manager.cpp` | 10 | 10 | 100% |
-| `src/core/vision/v4l2_camera.cpp` | 63 | 62 | 98.4% |
-| `src/managers/audio_manager.cpp` | 64 | 63 | 98.4% |
-| `src/core/media/audio_receiver_thread.cpp` | 84 | 81 | 96.4% |
-| `src/core/net/protocol.h` | 54 | 52 | 96.3% |
-| `src/hal/fingerprint_frame_parser.h` | 41 | 39 | 95.1% |
-| `src/core/media/video_push_thread.cpp` | 30 | 28 | 93.3% |
-| `src/managers/fingerprint_manager.cpp` | 125 | 114 | 91.2% |
-| `src/hal/gpio.cpp` | 44 | 39 | 88.6% |
-| `src/core/media/camera_preview_server.cpp` | 50 | 44 | 88.0% |
-| `src/hal/fingerprint_hailin.cpp` | 256 | 43 | 16.8% |
+| `src/managers/audio_manager.cpp` | 69 | 68 | 98.6% |
+| `src/ui/form_passwd.cpp` | 46 | 45 | 97.8% |
+| `src/core/net/protocol.h` | 58 | 56 | 96.6% |
+| `src/hal/fingerprint_frame_parser.h` | 50 | 48 | 96.0% |
+| `src/core/media/audio_receiver_thread.cpp` | 93 | 89 | 95.7% |
+| `src/core/media/video_push_thread.cpp` | 31 | 29 | 93.5% |
+| `src/hal/gpio.cpp` | 50 | 45 | 90.0% |
+| `src/managers/fingerprint_manager.cpp` | 128 | 115 | 89.8% |
+| `src/core/media/camera_preview_server.cpp` | 52 | 45 | 86.5% |
+| `src/hal/fingerprint_hailin.cpp` | 262 | 43 | 16.4% |
 
-> `fingerprint_hailin.cpp` 的 16.8% 是**可解释的**：285 行里有 204 行位于
+（另有 5 个单行头文件各 1 行、100%，未列入本表；合计正好 1174 行 / 918 行。
+本表是第 35 轮 `tools/run_coverage.sh` 的**实测值** —— 第 30 轮之后列过的数字
+已经漂移（新接了文件、行号也随之变化），所以**每次引用覆盖率都要重新跑一遍**，
+不要抄旧数字。）
+
+> `fingerprint_hailin.cpp` 的 16.4% 是**可解释的**：262 行里有 195 行位于
 > `autoIdentify`/`autoEnroll`/`cancel`/`stepRegister`/`stepIdentify` 这些
 > **零调用者**的方法内（baseline 同样如此，属继承死代码），不是"该测没测"。
 
@@ -456,6 +470,47 @@ L188  emit identifyResult(false, -1, 0, "指纹识别失败");
 实测效果（同一口径）：`fingerprint_manager.cpp` 可达未测 **6 → 1** 行
 （剩下那行 L107 是已记录为无法确定性复现的竞态），已测文件覆盖 714 → **719**
 行，真实总覆盖率 27.4% → **27.6%**。
+
+#### 第 35 轮：`form_passwd.cpp` 唯一的未覆盖行是**逻辑不可达**
+
+`form_passwd.cpp` 接进测试后 46 行覆盖 45（97.8%），剩下一行是 L171：
+
+```cpp
+void Form_passwd::playKeySound(const QString& path)
+{
+    QWidget* mainWin = getMainWidget();      // 沿父链找第一个 Widget
+    if (mainWin) {
+        auto widget = qobject_cast<class Widget*>(mainWin);
+        if (widget) { widget->audioManager()->playAsync(path); }
+        else { qDebug() << "[passwd] mainWin is not Widget*"; }   // <- L171
+    } else { qDebug() << "[passwd] mainWin is nullptr"; }
+}
+```
+
+L171 **不可达**，而且是**逻辑上**不可达，不是"没人接线"。
+`getMainWidget()` 的循环条件就是
+`while (w && !qobject_cast<class Widget*>(w))` —— 它**只在 `qobject_cast`
+成功时才返回非空**：
+
+```cpp
+QWidget* Form_passwd::getMainWidget() {
+    QWidget* w = parentWidget();
+    while (w && !qobject_cast<class Widget*>(w)) w = w->parentWidget();
+    return w;      // 返回非空  =>  w 必然已经是 Widget*
+}
+```
+
+于是 `playKeySound` 里对同一指针再 `qobject_cast` 一次**必然成功**，`else`
+分支永远走不到。这与上面"零调用者"的不可达**成因不同**（那是基线没接线），
+但同样不是待办 —— 要覆盖它，只能构造一个"`qobject_cast` 两次结果不同"的
+对象，那在 Qt 的元对象系统里不可能发生。
+
+> 保留它（不删）是对的：真 `Widget` 与影子 `Widget` 的类型关系在产线/测试
+> 下不同，删掉这个分支等于放弃对"父链上存在非 `Widget` 的 QWidget"这种
+> 退化情形的防御。判断为不可达只影响**覆盖率口径**，不影响代码本身。
+
+其余 10 个"从未被任何测试目标链接"的产线文件（`widget.cpp`、`form_finger.cpp`、
+`form_call.cpp`、`main.cpp` 等）仍未接入，见上文表格 —— 那是下一批待办。
 
 #### 故障注入夹具本身也暴露了两个问题
 
@@ -810,6 +865,65 @@ B 比 A 多一轮由定时器发出的 `GET_IMAGE` 探手指。B 与 baseline �
 静态检查则报 **WARNING**（`[fp-ack-tag]`，共 7 处），不报失败。
 自检见 `tools/verify_fp_ack_tag.py`（3/3）。
 
+### 密码输入窗体：第一个 Qt Widgets 测试目标，以及"密码不进日志"的行为证明
+
+`src/ui/form_passwd.cpp` 是门口机**真实门禁的密码录入路径**，也是"密码不得进
+日志"这条安全性质的唯一现场。此前该性质**只由一条静态文本规则**
+（`check_no_secret_in_logs`）守着，而那条规则自己就写着"只做词法判定，不做
+数据流分析"。于是换一种写法就能绕过：
+
+```cpp
+const QString leakTmp = inputBuffer;
+qDebug() << "[passwd] len-ok tmp=" << leakTmp;   // 静态规则看不出
+```
+
+第 35 轮故障注入实测确认：上面这种写法确实躲得过静态规则，而当时**没有任何
+行为测试**会拦它。
+
+新增测试目标 `t113_test_form_passwd`（`tests/test_form_passwd.cpp`，24 个
+用例），做法是**真的把按键点下去**，用 `qInstallMessageHandler` 捕获**实际
+日志输出**，再断言日志里不含刚输入的密码。这比静态规则强：它不关心密码是
+"怎么"漏出去的，只要出现在日志里就红。
+
+这是本工程**第一个 Qt Widgets 测试目标**。写它之前先用探针
+（`%TEMP%\probe35\`）量清了三件有风险的事：
+
+1. `uic` 能处理真实的 `form_passwd.ui`（无 `customwidget`、无 `<connections>`）；
+2. 无显示器时 `QT_QPA_PLATFORM=offscreen` 下 `QApplication` 能起来，
+   `QTest::mouseClick` 真能触发 `clicked`；
+3. `btn0..btn9` 的文本恰好等于那一位数字 —— 否则 `inputBuffer += btn->text()`
+   拼出来的密码就是错的（0-9 全部核对）。
+
+替换了什么、没替换什么：
+
+| 用真的 | 用替身 |
+|---|---|
+| `form_passwd.cpp` / `form_passwd.ui`（真 uic） | `Widget`（`tests/shadows/ui/widget.h`） |
+| `AppConfig`（真配置类） | `AudioManager`（`tests/shadows/managers/audio_manager.h`） |
+| `QPushButton` 与真实信号槽连接、密码信号载荷 | — |
+
+两条替身只影响**提示音**这一条支路，不影响密码路径。替身的意义在于：真
+`ui/widget.h` 会拖进 `<opencv2/core.hpp>`、`<opencv2/objdetect.hpp>` 与整个
+主程序门面；真 `AudioManager::playAsync()` 会 `QtConcurrent::run` 去真的开
+ALSA 播放 `/tmp/pcm/beep.pcm`（慢、依赖声卡、文件通常不存在）——那正是要
+消灭的"在我这儿能跑"。
+
+安全性质之外，本目标还覆盖：按键拼装顺序、`OK` 只提交一次、提交后清空缓冲、
+8 位上限、空缓冲不发信号、退格、`NoFocus`、以及**提示音路径来自 `AppConfig`**
+（跟随配置而不是散落字面量）。
+
+故障注入自检见 `tools/verify_form_passwd_test.py`：**16 个变异全部被抓到**
+（含 7 种"换写法把密码弄进日志"，其中 3 种静态规则看不出），3 个对照不误报。
+这是本轮最有价值的一组变异 —— 它保住的是门禁密码。
+
+静态契约由 `check_form_passwd_contract_is_pinned` 钉住，
+自检见 `tools/verify_form_passwd_rule.py`（9 个变异全抓到，2 个对照不误报）。
+
+> 已知继承缺陷：点一次"退格"会删**两位**（`uic` 的 `connectSlotsByName` 与
+> 显式 `connect` 叠加，槽被连了两遍）。`baseline` 亦然，属继承而来。
+> 本轮**不修**（改变"退格删几位"是用户可感知的行为变化），改为用特征化测试
+> 钉住现状。详见约定第 58 条。
+
 ### 主机端编译验证（无 ALSA/libgpiod 的开发机可用）
 
 ALSA 与 libgpiod 是 Linux 专有接口，Windows/macOS 开发机上装不了；但没有
@@ -996,7 +1110,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下五十四条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下六十条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -2361,6 +2475,160 @@ except Exception:
 CMake 则先把目标块切出来（`add_executable(...)` / `target_link_options(...)`
 的括号内容），在块内查名字，而不是整文件查子串。
 
+### 55. 影子头里的类一旦被 `qobject_cast`，就必须带 `Q_OBJECT` 并进源列表
+
+第 35 轮为**第一个 Qt Widgets 测试目标**（`t113_test_form_passwd`）做影子
+`Widget` 时，两个方向都实测了一遍：
+
+| 做法 | 结果 |
+|---|---|
+| 影子 `class Widget` **不带** `Q_OBJECT` | **编译失败**：`qobject.h:522:5: static assertion failed: qobject_cast requires the type to have a Q_OBJECT macro` |
+| 带 `Q_OBJECT`，但只放进 `target_include_directories` | **链接失败**：`undefined reference to Widget::staticMetaObject` |
+| 带 `Q_OBJECT` **且**列进 `add_executable` 源列表 | 通过 ✓ |
+
+两条都要记住：
+
+1. Qt 5.15 的 `qobject_cast` 对没有 `Q_OBJECT` 的类型是**静态断言**拒绝的，
+   **不会**退回 `dynamic_cast`。这不是运行期失败，是编译期硬错。
+2. **AUTOMOC 不看 include 目录**。只把影子头放进 include 路径，`moc` 不会
+   处理它，`staticMetaObject` 就没有定义。必须把影子头**显式写进**
+   `add_executable(...)` 的源列表。
+
+这与第 33 轮定下的"影子头不要带 `Q_OBJECT`"**并不矛盾** —— 那条规则的适用
+前提是"影子类**从不**成为 `qobject_cast` 的目标"。一旦被测代码对它做
+`qobject_cast`（本轮的 `form_passwd.cpp` 就沿父链
+`qobject_cast<class Widget*>(w)` 找主窗口），就必须反过来。
+
+同一个坑还有第三个面：影子头用**路径替换**（文件名叫 `ui/widget.h`）而不是
+另起假文件名。第一版把 `AudioManager` 做成 `fake_audio_manager.h`，而
+`form_passwd.cpp` 自己 `#include "managers/audio_manager.h"`，于是编译器看到
+**两个** `class AudioManager`：`redefinition of 'class AudioManager'`。
+替身必须放在**影子路径**（`tests/shadows/managers/audio_manager.h`）上，让
+同一路径只有一份定义。这也正是影子头机制相对"假文件名"的优势：替换的是
+**路径**，被测代码一个字都不用改。
+
+### 56. "不含连续 N 位"对**逐位泄露**没有判别力
+
+第一版的"逐位日志不泄露密码"断言写成"日志里不含输入串的连续 4 位"。
+故障注入实测：把
+
+```cpp
+qDebug() << "[passwd] 数字键按下";                      // 安全
+qDebug() << "[passwd] key" << btn->text();              // 逐位泄露密码！
+```
+
+从前者改成后者，该断言**照样通过** —— 2/2 漏报。
+
+原因：QTest 的每条消息前缀会把相邻两位数字切开。
+
+```
+QDEBUG : TestFormPasswd::typingLogs...() [passwd] key 9
+QDEBUG : TestFormPasswd::typingLogs...() [passwd] key 8
+```
+
+两位之间隔着测试名与级别前缀，输入的密码**永远不会**在日志里连续出现。断言
+在，却什么都没验证（第 50 条）。
+
+有判别力的性质是**差分**：日志内容不该取决于按了**哪几个**数字。取两个等长、
+且**不共用任何数字**的密码各跑一遍，只保留被测代码自己打出的行，归一化后
+**逐字节比较**：
+
+```cpp
+QVERIFY2(logA == logB, ...);        // logA 来自 "99999999"
+                                    // logB 来自 "11111111"
+```
+
+这个性质与日志格式、前缀、间隔都无关，排版怎么变都不会失效。同时先断言两个
+密码不共用数字（否则差分本身退化），并断言两份日志都非空（否则"相同"是因为
+都是空串，又是真空成立）。
+
+教训：**泄露的判别式是"输出是否随秘密变化"，不是"输出里有没有秘密的连续
+片段"。** 后者对逐位、逐段、编码后等泄露形态一律无效。
+
+### 57. 崩溃会掩盖后续用例 —— 越界索引前必须先查边界
+
+`QSignalSpy::at(i)` 越界在 Release 下是**未定义行为**。第 35 轮故障注入实测：
+把 `emit passwordEntered(inputBuffer)` 删掉之后，多处 `spy.at(0).at(0)` 直接让
+进程以 `0xC0000005`（访问冲突）结束。
+
+危害不是"崩了"（那也算抓到了），而是**诊断信息退化**：崩溃终止整个测试二进制，
+后面所有用例都跑不到，输出里只剩一个崩溃码，没有哪条断言失败的说明；同时让
+`rc` 与 `FAIL` 行数**不再一致**（实测 `rc=3221225477` 配 5 条 FAIL 行），
+第 52 条那个交叉校验也跟着失效。
+
+修法：加一个带边界检查的取值辅助函数，越界返回空串。
+
+```cpp
+QString payloadAt(const QSignalSpy& spy, int i)
+{
+    if (i < 0 || i >= spy.count()) return QString();
+    const QList<QVariant> args = spy.at(i);
+    return args.isEmpty() ? QString() : args.at(0).toString();
+}
+```
+
+这样变异后每条用例都能干净地报"期望 X，实际空"，`rc` 重新等于 `FAIL` 行数。
+
+### 58. uic 的 `connectSlotsByName` 会和显式 `connect` **叠加**，不是覆盖
+
+第 35 轮写窗体测试时发现的**继承缺陷**：点一次"退格"会删掉**两位**。
+
+根因（探针实测区分了两种可能）：
+
+* `uic` 生成的 `setupUi()` 末尾调用 `QMetaObject::connectSlotsByName(this)`，
+  它按**命名约定**自动连接：槽名形如 `on_<对象名>_<信号名>` 就自动接上。
+* 而 `form_passwd.cpp` 的构造函数**又显式** `connect` 了一次同名槽。
+
+于是同一个槽被连了**两遍**，一次点击执行两次。
+
+| 探针 | `clicked` 发射次数 | 槽执行次数 |
+|---|---|---|
+| `btnbck->click()` | 1 | **2** |
+| `btnok->click()` | 1 | **2** |
+| 对照：普通按钮 | 1 | — |
+
+信号只发一次、槽跑两次，因此确定是**双重连接**，而不是鼠标事件送了两遍。
+
+`baseline` 同样如此（`form_passwd.cpp:42` 就是显式 connect，且 `.ui` 里没有
+`<connections>` 块，uic 一定走 `connectSlotsByName`），属**继承而来**，不是
+重构引入。
+
+**本轮不修**：改变"退格删几位"是用户可感知的行为变化，属产品决策，硬约束要求
+行为逐字节兼容。改为写一条**特征化测试**把现状钉住：
+`backspaceRemovesTwoDigitsPerPress_documentsInheritedDefect`。它先断言
+`clicked` 只发一次（确认双重连接确实存在），再断言删两位。若有人改了行为，
+这条会红，提醒他这是有意变更。同时
+`okIsIdempotentDespiteDoubleConnection` 钉住一个**侥幸**："确定"键也被连了
+两遍，但靠 `if (!inputBuffer.isEmpty())` 恰好幂等，密码只提交一次 —— 若哪天
+把这个判断去掉，门锁会被驱动两次。
+
+一般教训：**`on_<对象名>_<信号名>` 这个名字一旦用了，就等于同时声明了"手工
+接线"和"约定接线"两次。** 两者叠加且静默，不跑起来看不出来。其余界面（
+`form_finger` / `form_call` / `form_passwd.ui` 里的其它按钮）都要按这个思路
+复核。
+
+### 59. 影子头要连"依赖链上游"一起替，否则真头会从别处被包含进来
+
+第 35 轮第一版只替了 `ui/widget.h`，而 `form_passwd.cpp` 第 10 行自己
+`#include "managers/audio_manager.h"`（真头）。因为 `ACCESSTERMINAL_SRC_ROOT`
+在 include 路径里，真头照样被找到，于是编译器看到两个 `class AudioManager`。
+
+教训：**只要被测源文件直接包含了某个类型，替身就必须替换那个类型的头文件
+路径本身**，而不是在别处提供一个同名类。检查方法很直接：看被测 `.cpp` 的
+`#include` 列表，逐个确认哪些必须替（会拖重依赖/碰硬件的），**每一个都要有
+对应的影子路径**。
+
+### 60. 用"用例定义"而不是"标识符出现过"来确认测试还在
+
+`check_form_passwd_contract_is_pinned` 第一版查
+`"logCapturePipelineWorks" not in text`。故障注入实测：把该用例的**定义改名**
+之后规则**仍然通过** —— 因为这个名字还出现在声明里，以及**另一个用例的报错
+文案**里（`"正对照见 logCapturePipelineWorks"`）。
+
+修法：查**定义**形态，即 `TestFormPasswd::logCapturePipelineWorks\s*\(`。
+这与第 51 条（用词元边界而不是子串）是同一条：确认一个符号**存在且可用**，
+要匹配它的定义点，不是它任意一次被提及。
+
 ## 开发约定
 
 - **标准**：C++11（不可使用 C++17 的 inline 变量等特性）
@@ -2420,6 +2688,10 @@ python3 tools/verify_gpio_test.py .
 python3 tools/verify_gpio_rule.py .
 python3 tools/verify_face_manager_test.py .
 python3 tools/verify_face_gate_rule.py .
+python3 tools/verify_v4l2_test.py .
+python3 tools/verify_v4l2_rule.py .
+python3 tools/verify_form_passwd_test.py .
+python3 tools/verify_form_passwd_rule.py .
 # 自检脚本必须在**不带 PYTHONIOENCODING** 的 GBK 控制台下也安全
 # （第 25 轮的教训：带 utf-8 测会掩盖真因，绿色是假的）
 env -u PYTHONIOENCODING python3 tools/verify_signaling_client_test.py .
@@ -2431,6 +2703,10 @@ env -u PYTHONIOENCODING python3 tools/verify_gpio_test.py .
 env -u PYTHONIOENCODING python3 tools/verify_gpio_rule.py .
 env -u PYTHONIOENCODING python3 tools/verify_face_manager_test.py .
 env -u PYTHONIOENCODING python3 tools/verify_face_gate_rule.py .
+env -u PYTHONIOENCODING python3 tools/verify_v4l2_test.py .
+env -u PYTHONIOENCODING python3 tools/verify_v4l2_rule.py .
+env -u PYTHONIOENCODING python3 tools/verify_form_passwd_test.py .
+env -u PYTHONIOENCODING python3 tools/verify_form_passwd_rule.py .
 bash tools/run_coverage.sh
 
 # 2c. 指纹串口帧解析算法（把 header 里的算法照搬为 Python 独立执行，
@@ -2486,3 +2762,18 @@ cmake -S tests -B /tmp/t113-tests -G Ninja && cmake --build /tmp/t113-tests \
 - 人脸识别使用 LBPH，光照变化下准确率有限；建议配合补光灯使用。
 - `zeng_sim.onnx` 为历史遗留模型，当前代码未使用（已在 `.gitignore` 中排除，
   仅保留在 `deploy/vendor/` 备查）。
+- **密码窗体"退格"一次删两位（继承缺陷，未修）**：`uic` 生成的
+  `setupUi()` 会调 `QMetaObject::connectSlotsByName(this)`，按命名约定把
+  `on_btnbck_clicked` / `on_btnok_clicked` 自动接上；而 `form_passwd.cpp`
+  又显式 `connect` 了一次，槽被连两遍。信号只发一次、槽执行两次（探针实测）。
+  `baseline` 同样如此，属继承而来。**本轮不修**：改变"退格删几位"是用户可
+  感知的行为变化，硬约束要求行为逐字节兼容，属产品决策。现状已由特征化测试
+  `backspaceRemovesTwoDigitsPerPress_documentsInheritedDefect` 钉住，
+  `okIsIdempotentDespiteDoubleConnection` 另钉住"确定"键靠
+  `!inputBuffer.isEmpty()` 恰好幂等（若去掉该判断，门锁会被驱动两次）。
+  详见约定第 58 条。若要修，正确做法是**删掉显式 `connect`**（保留 uic 的
+  约定接线），并同步更新那两条测试与本节。
+- `Widget::on_btnpsswd_clicked` 等其余 `form_*` 窗体存在**同类风险**：凡槽名
+  符合 `on_<对象名>_<信号名>` 且又被显式 `connect`，都会叠加。本轮只对
+  `form_passwd.cpp` 做了行为验证（它有了 Widgets 测试目标）；其余窗体尚未
+  逐个实测。按第 58 条的思路排查即可。

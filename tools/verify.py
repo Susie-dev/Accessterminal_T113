@@ -3429,6 +3429,256 @@ def check_fault_harnesses_classify_crashes_correctly(root, src_root):
              "crashed = returncode != 0 and not failed。")
 
 
+def strip_comments_and_strings_cmake(text):
+    r"""
+    挖掉 CMake 文件的注释，但**保留字符串字面量**。
+
+    为什么不能直接用 `strip_comments_and_strings()`：那个函数是给 C++ 写的，
+    它会把字符串内容清空（`"fake_serial_port"` -> `""`），而 CMake 里几乎
+    所有有意义的参数（路径、目标名、宏名）都是带引号的字符串 —— 清空后什么
+    都匹配不到，规则会**恒假**。第 35 轮第一版就踩了这个：影子头路径写在
+    `"${CMAKE_CURRENT_LIST_DIR}/shadows/ui/widget.h"` 里，用 C++ 版剥离后
+    连 `shadows` 这个词都没了。
+
+    这里只处理 `#` 行注释。CMake 没有块注释，字符串里出现的 `#` 需要排除 ——
+    用一个"跳过引号内内容"的扫描器，而不是朴素正则（`#` 在字符串里出现时
+    朴素正则会把后半行误删，正是第 51 条"别用子串"的翻版）。
+    """
+    out = []
+    for line in text.split("\n"):
+        in_str = False
+        cut = None
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if ch == '"':
+                # 处理 \" 转义
+                bs = 0
+                j = i - 1
+                while j >= 0 and line[j] == "\\":
+                    bs += 1
+                    j -= 1
+                if bs % 2 == 0:
+                    in_str = not in_str
+            elif ch == "#" and not in_str:
+                cut = i
+                break
+            i += 1
+        out.append(line if cut is None else line[:cut])
+    return "\n".join(out)
+
+
+def _cmake_call_containing(text, command, marker):
+    """返回 CMake 里**包含 marker** 的那个 `<command>(...)` 调用的完整原文。
+
+    为什么要这个而不是一条正则：第 34 轮加 `desktop_test_call_session` 时，
+    影子头的 `BEFORE` 检查立刻**变成了假绿** —— 原来的正则
+    `target_include_directories\\s*\\(\\s*\\w+\\s+BEFORE\\b` 会匹配**任意**
+    带 BEFORE 的目标，于是把 serial_light 那个 BEFORE 删掉后，新目标的
+    BEFORE 仍然让正则命中，规则静默失效。
+
+    正确做法是"先把**包含该影子头目录**的那次调用框出来，再在这个调用内部
+    检查"。括号按深度配对（CMake 的调用里可以嵌套括号）。
+    找不到就返回 None，让调用方报"规则自身需修复"而不是假通过。
+    """
+    for m in re.finditer(re.escape(command) + r"\s*\(", text):
+        i = m.end() - 1  # 指向 '('
+        depth = 0
+        for j in range(i, len(text)):
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    call = text[m.start():j + 1]
+                    if marker in call:
+                        return call
+                    break
+    return None
+
+
+def check_form_passwd_contract_is_pinned(root, src_root):
+    r"""
+    密码输入窗体（`src/ui/form_passwd.cpp`）必须由**运行期测试**守住，而且
+    该测试的日志断言必须有**判别力**。
+
+    背景（第 35 轮）
+    ---------------
+    `Form_passwd` 是门口机真实门禁的密码录入界面，也是"密码不得进日志"这条
+    安全性质的唯一现场。此前该性质**只由一条静态文本规则**
+    （`check_no_secret_in_logs`）守着，而那条规则自己就写着"只做词法判定，
+    不做数据流分析"。于是只要换一种写法就能绕过：
+
+        const QString leakTmp = inputBuffer;
+        qDebug() << "len-ok tmp=" << leakTmp;        // 静态规则看不出
+
+    第 35 轮用故障注入实测：上面这种写法确实躲得过静态规则，而当时**没有任何
+    行为测试**会拦它。补上运行期测试后抓到了。
+
+    本规则钉住四件事：
+      1. 测试目标 `t113_test_form_passwd` 存在，且真的接进了 tests/CMakeLists.txt；
+      2. 日志捕获有**阳性对照**（否则"日志里没有密码"是真空成立）；
+      3. 日志断言是**差分**形式，不是"不含连续 N 位"这种无判别力写法；
+      4. 故障注入夹具 `tools/verify_form_passwd_test.py` 在。
+
+    第 3 条是本轮踩到的真实教训，值得单独说明。第一版的逐位断言写成
+    "日志里不含输入串的连续 4 位"。故障注入实测：把
+    `qDebug() << "[passwd] 数字键按下"` 改成 `qDebug() << "... key" << btn->text()`
+    （即**逐位泄露密码**）之后，该断言**照样通过**——2/2 漏报。
+
+    原因是日志被 QTest 的每条消息前缀切开：
+
+        QDEBUG : TestFormPasswd::typingLogs...() [passwd] key 9
+        QDEBUG : TestFormPasswd::typingLogs...() [passwd] key 8
+
+    两位数字之间隔着测试名与前缀，输入的密码**永远不会**在日志里连续出现。
+    所以"不含连续子串"对逐位泄露毫无判别力。
+
+    有判别力的性质是**差分**：日志内容不该取决于按了**哪几个**数字。取两个
+    等长且不共用任何数字的密码各跑一遍，归一化后逐字节比较即可 —— 与日志
+    格式、前缀、间隔都无关，因此排版怎么变都不会失效。
+
+    能力边界：这是形态检查，**不能**替代真跑一次。它与
+    `tools/verify_form_passwd_test.py` 的故障注入互补。
+    """
+    tests_dir = os.path.join(root, "tests")
+    tf = os.path.join(tests_dir, "test_form_passwd.cpp")
+    cm = os.path.join(tests_dir, "CMakeLists.txt")
+
+    if not os.path.exists(tf):
+        fail("[form-passwd] 缺少 tests/test_form_passwd.cpp —— 门口机密码录入"
+             "路径没有运行期测试。它的安全性质此前只由静态文本规则守着，"
+             "而那种规则不做数据流分析，经临时变量转一手就能绕过（第 35 轮"
+             "故障注入实测）。")
+        return
+
+    # 关键：本规则的所有匹配都跑在**注释被挖空**的文本上。
+    #
+    # 第 35 轮实测教训：第一版直接对原文做子串匹配，于是 7/9 个变异**假绿**。
+    # 原因是"守卫条件引用了被守卫内容里会出现的字符串"——
+    #   - `positive control` 的用例名在**CMake 注释**里也写着；
+    #   - `#error` 安全阀的说明文字在**影子头自己的文档注释**里反复出现，
+    #     把真指令删掉后注释里那几个字还在，`re.search(r"#\s*error")` 照样命中；
+    #   - `Q_OBJECT` 同理出现在影子头注释的解释里。
+    # 这是第 43 条教训（"守卫条件不能引用被守卫内容里会出现的字符串"）在
+    # 本轮的第 N 次复现。挖空注释与字符串后，匹配才对应**真实代码/指令**。
+    cm_raw = read(cm) if os.path.exists(cm) else ""
+    cm_code = strip_comments_and_strings_cmake(cm_raw)
+    text_code = strip_comments_and_strings(read(tf))
+
+    if os.path.exists(cm):
+        # 用**作用域内**匹配：先把含 test_form_passwd.cpp 的那次
+        # add_executable(...) 框出来，再在它内部找影子头。
+        # 否则随便哪个目标列了同名文件都会让检查通过（第 34 轮的教训：宽松正则
+        # 一旦有第二个同形目标就静默失效）。
+        exe_call = _cmake_call_containing(cm_code, "add_executable",
+                                          "test_form_passwd.cpp")
+        if exe_call is None:
+            fail("[form-passwd] tests/CMakeLists.txt 里找不到包含 "
+                 "test_form_passwd.cpp 的 add_executable() 调用 —— "
+                 "tests/test_form_passwd.cpp 没有接进构建，写了但不会跑。")
+        elif "shadows/ui/widget.h" not in exe_call:
+            fail("[form-passwd] tests/CMakeLists.txt 的 t113_test_form_passwd "
+                 "目标没有把影子头 shadows/ui/widget.h 列进 add_executable 的"
+                 "源列表。只把它放进 target_include_directories 是不够的 —— "
+                 "AUTOMOC 不看 include 目录，影子 Widget 的 Q_OBJECT 不会被"
+                 "处理，链接期报 undefined reference to "
+                 "Widget::staticMetaObject（第 35 轮实测）。")
+
+        inc_call = _cmake_call_containing(cm_code, "target_include_directories",
+                                          "shadows")
+        if inc_call is None:
+            fail("[form-passwd] tests/CMakeLists.txt 里找不到把 shadows 目录"
+                 "加进 include 路径的 target_include_directories() —— "
+                 "影子头不会被命中，测试会去用真 ui/widget.h（拖进 OpenCV）。")
+        elif "BEFORE" not in inc_call:
+            fail("[form-passwd] 影子头的 target_include_directories 没有 "
+                 "BEFORE —— 真 src/ui/widget.h 会先被找到，影子形同虚设。")
+
+        if "ACC_FORM_PASSWD_TEST" not in cm_code:
+            fail("[form-passwd] 测试目标没有定义 ACC_FORM_PASSWD_TEST —— "
+                 "影子头（tests/shadows/ui/widget.h、shadows/managers/"
+                 "audio_manager.h）的安全阀就是靠这个宏。未定义时影子头会 "
+                 "#error；若哪天有人把安全阀去掉，产线目标就可能拿到替身跑，"
+                 "而编译链接一切正常 —— 那是最危险的一类错误。")
+
+    # 2) 阳性对照：必须有"捕获管道确实工作"的**用例定义**（查代码，不查注释）。
+    #
+    #    这里查"用例定义"而不是"标识符出现过"：标识符还会出现在声明、
+    #    以及别的用例的报错文案里（"正对照见 logCapturePipelineWorks"）。
+    #    只查出现与否，把整个用例删掉后规则仍会命中别处的提及 —— 第 35 轮
+    #    故障注入实测的假绿之一。查定义才对得上"真的有一个这样的用例在跑"。
+    if not re.search(r"TestFormPasswd::logCapturePipelineWorks\s*\(",
+                     text_code):
+        fail("[form-passwd] test_form_passwd.cpp 缺少**阳性对照**用例定义"
+             "（TestFormPasswd::logCapturePipelineWorks）。若 "
+             "qInstallMessageHandler 没生效，所有『日志里不含密码』的断言会"
+             "一起假成立 —— 测试看着很严，实则零验证。"
+             "参照 test_serial_light.cpp 的同名做法。")
+
+    # 3) 差分断言：必须比较"两个不同输入"的日志，而不是查连续子串。
+    #    查的是**断言本体**（字符串字面量已被挖空，故用标识符 logA/logB
+    #    与它们的比较式来判定，避免"文案改了但逻辑没改"被误报）。
+    if not re.search(r"logA\s*==\s*logB", text_code):
+        fail("[form-passwd] test_form_passwd.cpp 的日志断言不是**差分**形式"
+             "（找不到 `logA == logB` 这样的比较）。第 35 轮实测：写成"
+             "『日志里不含连续 4 位』时，把日志改成逐位打印数字（即真的泄露"
+             "密码）该断言**照样通过**（2/2 漏报）—— 因为 QTest 的每条消息"
+             "前缀把相邻两位数字切开了，密码永远不会在日志里连续出现。"
+             "有判别力的写法是比较两个等长、不共用数字的密码各自产生的日志"
+             "（归一化后应逐字节相同）。")
+
+    # 4) 故障注入夹具必须在（证明这些断言真的会失败）。
+    fx = os.path.join(root, "tools", "verify_form_passwd_test.py")
+    if not os.path.exists(fx):
+        fail("[form-passwd] 缺少 tools/verify_form_passwd_test.py —— 没有故障"
+             "注入就无法证明这些安全断言**真的会失败**。不失败的回归测试"
+             "没有价值。")
+
+    # 5) 影子头安全阀必须在（防止产线误用替身）。
+    #    用 **C++ 版**剥离（挖 `//`、`/* */` 注释，但保留 `#error` 这类预处理
+    #    指令）：安全阀的说明文字在影子头文档注释里反复出现，直接查原文时
+    #    把真指令删掉也照样命中。注意这里**不能**用 CMake 版剥离 —— 它把 `#`
+    #    当注释起点，而 `#error` 正好以 `#` 开头，会把整条指令误删（第 35 轮
+    #    实测：换上 CMake 版后本检查对两个影子头恒报失败）。
+    for rel in (os.path.join("tests", "shadows", "ui", "widget.h"),
+                os.path.join("tests", "shadows", "managers",
+                             "audio_manager.h")):
+        p = os.path.join(root, rel)
+        if not os.path.exists(p):
+            fail("[form-passwd] 缺少影子头 %s —— 测试会改去用真头，而真 "
+                 "ui/widget.h 会拖进 OpenCV 与整个主程序门面。" % rel)
+            continue
+        if not re.search(r"#\s*error\b",
+                         strip_comments_and_strings(read(p))):
+            fail("[form-passwd] 影子头 %s 没有安全阀（缺 #error 预处理指令）。"
+                 "产线目标一旦误命中替身就会拿假实现跑，而编译链接一切正常 "
+                 "—— 必须用 ACC_FORM_PASSWD_TEST 把它挡住。" % rel)
+
+    # 6) 影子头必须带 Q_OBJECT。
+    #
+    # 第 35 轮双向实测：
+    #   - 不带 Q_OBJECT：`qobject_cast<class Widget*>` 在 Qt 5.15 直接
+    #     **编译失败**（qobject.h:522 静态断言），不会退回 dynamic_cast；
+    #   - 带 Q_OBJECT 但只放进 include 目录：链接期
+    #     undefined reference to Widget::staticMetaObject（见上面第 1 条）。
+    w = os.path.join(root, "tests", "shadows", "ui", "widget.h")
+    if os.path.exists(w):
+        if "Q_OBJECT" not in strip_comments_and_strings(read(w)):
+            fail("[form-passwd] 影子 ui/widget.h 缺少 Q_OBJECT。被测代码用 "
+                 "`qobject_cast<class Widget*>(w)` 沿父链找主窗口，而 Qt 5.15 "
+                 "对没有 Q_OBJECT 的类型是**静态断言**拒绝的"
+                 "（qobject.h:522），不退回 dynamic_cast —— 会直接编译失败"
+                 "（第 35 轮实测）。")
+
+    # 7) setparam 风格的"两处都要对"：影子 Widget 必须声明 audioManager()。
+    if os.path.exists(w):
+        if "audioManager()" not in strip_comments_and_strings(read(w)):
+            fail("[form-passwd] 影子 ui/widget.h 没有 audioManager() 访问器 "
+                 "—— form_passwd.cpp 的 playKeySound() 靠它取播放器，缺了就"
+                 "编译不过，测试会退化成『只看源码文本』而不是真的驱动提示音。")
+
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -3534,6 +3784,7 @@ def main():
     check_face_gate_hazard_is_documented(root, src_root)
     check_v4l2_camera_failure_paths_are_testable(root, src_root)
     check_fault_harnesses_classify_crashes_correctly(root, src_root)
+    check_form_passwd_contract_is_pinned(root, src_root)
     check_fake_fingerprint_builds_same_bytes(root, src_root)
     check_fingerprint_checksum_logic_is_not_duplicated(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)
