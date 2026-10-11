@@ -855,18 +855,25 @@ void Widget::updateFrame()
             const int w = small.width();
             const int h = small.height();
             // 二次检查：从提交到现在又过了一段时间，对象可能刚被销毁。
-            // invokeMethod 的上下文对象若已析构，调用会被安全忽略；
+            // 定时器挂在 ctx 上，ctx 析构时定时器一并销毁，闭包不会执行；
             // 这里显式判断是为了避免无谓地构造闭包。
             // 用 self.data() 显式取裸指针，避免依赖 QPointer 的隐式转换。
             if (self.isNull()) {
                 return;
             }
             Widget* ctx = self.data();
-            QMetaObject::invokeMethod(ctx, [self, qrects, w, h]() {
+            // 为什么不是 QMetaObject::invokeMethod(ctx, lambda, Qt::QueuedConnection)：
+            // 那个 **functor 重载是 Qt 5.10 才引入的**，而目标 SDK（Tina Linux）
+            // 常见 Qt 5.9~5.12，写 5.10+ 的 API 会让交叉编译直接失败。
+            // QTimer::singleShot(msec, context, functor) 这个上下文重载自
+            // Qt 5.4 起就有，语义等价：0 毫秒后在本对象所属线程执行，且
+            // ctx 先析构时该调用被取消（不会投递到已析构对象上）。
+            // tools/verify.py 的 [qt5] 规则守着这条边界。
+            QTimer::singleShot(0, ctx, [self, qrects, w, h]() {
                 if (!self.isNull()) {
                     self->onFaceDetectResult(qrects, w, h);
                 }
-            }, Qt::QueuedConnection);
+            });
         });
     }
 

@@ -383,7 +383,8 @@ def check_qt5_portability(root, src_root):
     目标 SDK（Tina Linux）常见为 Qt 5.9~5.12，而开发机可能是 5.15。
     仅在新版本存在的 API 会让交叉编译在旧 SDK 上失败，这里静态拦截。
     """
-    # 这些符号在 Qt 5.15 才引入，旧 SDK 上不存在。
+    # 这些符号晚于目标 SDK 的最低版本（Tina Linux 常见 Qt 5.9），
+    # 或属于 Qt 6；旧 SDK 上不存在。
     too_new = [
         (r'\bQAbstractSocket::errorOccurred\b',
          "QAbstractSocket::errorOccurred 需要 Qt 5.15+，"
@@ -397,6 +398,17 @@ def check_qt5_portability(root, src_root):
         (r'\bQProcess::errorOccurred\b',
          "QProcess::errorOccurred 需要 Qt 5.15+"),
         (r'\bQStringView\b', "QStringView 需要 Qt 5.10+，旧 SDK 可能没有"),
+        # functor 重载（模板形式）是 Qt 5.10 才加的；字符串重载自 Qt 5.0 就有。
+        # 判据是**第二个实参是不是字符串字面量**，而不是只看函数名 ——
+        # 否则会把合法的 invokeMethod(obj, "slot", ...) 一起报掉。
+        # 注意 strip_comments_and_strings() 会清空字面量内容但保留引号，
+        # 所以这里用 `"` 判定即可。
+        # 已声明的判别边界：第一个实参里含括号（如 static_cast<QObject*>(p)）
+        # 时不匹配 —— 本工程没有这种写法，宁可漏报也不误报。
+        (r'QMetaObject::invokeMethod\s*\(\s*[^,\n()]+,\s*'
+         r'(?!\s*(?:"|u8"|QStringLiteral|QLatin1String|QString\s*\(|QByteArrayLiteral))',
+         "QMetaObject::invokeMethod 的 functor 重载需要 Qt 5.10+，"
+         "Qt 5.9 上请改用 QTimer::singleShot(0, ctx, lambda)（自 Qt 5.4 起可用）"),
         (r'\bQMetaType::fromType\b', "QMetaType::fromType 需要 Qt 6"),
         (r'\bQAudioSink\b|\bQAudioSource\b', "QAudioSink/QAudioSource 是 Qt 6 API，Qt5 用 QAudioOutput/QAudioInput"),
         (r'\bQMediaPlayer::PlaybackState\b', "QMediaPlayer::PlaybackState 是 Qt 6 API，Qt5 用 QMediaPlayer::State"),
