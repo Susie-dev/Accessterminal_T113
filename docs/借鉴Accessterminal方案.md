@@ -359,6 +359,23 @@ Password, TempCode, Remote}`、唯一的 `unlock(userId, method, note)`、
 
 这一阶段同时是交接文档里【P0：真正的交叉编译与目标板验证】。
 
+> **实施记录（第 40 轮，已完成）** —— 四条纪律全部落地在 `deploy/build-t113.sh`
+> 与 `cmake/toolchain-t113.cmake` 里，并在本机 SDK 上端到端验证：
+> - SDK 预检：sysroot 存在且含 `lib/libc.so`、编译器 `-dumpmachine` 必须是
+>   `arm*musl*`、sysroot 内能找到 Qt5 的 CMake 配置、OpenCV 与
+>   libgpiod/ALSA 的头和库齐全 —— **任一不过就不开始编译**；
+> - 产物核验：`file` 断言 `ELF 32-bit ... ARM`、解释器必须是 musl、
+>   `readelf -d` 的每个 DT_NEEDED 都要能在 sysroot 中解析；
+> - 纯 ASCII 路径提示：SDK 路径含非 ASCII 时给出警告与软链建议
+>   （本机 SDK 路径含中文，CMake 这条路能过，但 qmake/moc 未必）。
+>
+> 实测：`source environment.sh && ./deploy/build-t113.sh` → 25 步编译链接全过，
+> 产物 `ELF 32-bit ARM / ld-musl-armhf.so.1 / stripped`，516,644 字节，
+> **依赖闭包 13/13 可解析**（`--as-needed` 正确丢弃了未使用的 Qt5Concurrent
+> 与 opencv_imgcodecs/videoio；libgpiod 是静态库故不在 DT_NEEDED 中）。
+> 顺带证伪一条旧担忧：本 SDK 是 Qt **5.12.9**，因此"5.10+ API 编不过"不成立；
+> 但 `[qt5]` 规则仍按 5.9 下限守着（换 SDK 时不至于翻车）。
+
 ---
 
 ## 四、每阶段统一门禁
