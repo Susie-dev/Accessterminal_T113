@@ -30,6 +30,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -135,7 +136,7 @@ MUT = [
 ]
 
 
-def main():
+def _run():
     if len(sys.argv) > 1:
         print("提示: 本脚本不需要参数，已忽略: %s" % " ".join(sys.argv[1:]))
 
@@ -188,6 +189,71 @@ def main():
     if problems:
         print("问题清单:", problems)
     return 1 if (problems or not same or rc != 0 or x) else 0
+
+
+# ---------------------------------------------------------------------------
+# 仓库级"正在改写源码"文件锁
+#
+# 为什么要锁：夹具是"原地改写源文件 → 跑校验 → 还原"，任何**读源码**的操作与
+# 它并发都会看到中间状态。第 40 轮实测：一边跑夹具、一边后台
+# `cmake --build && ctest`，构建把**变异后的** door_actuator.cpp 编进目标文件，
+# 于是 t113_door_actuator / t113_access_controller 双双 Failed，而串行重跑
+# 20/20 全过 —— 与第 37 轮"两个夹具互相踩"是同一类错误，只是这次踩的是构建。
+#
+# 锁名沿用既有两个 form_finger 夹具的 fi37_rewrite.lock，因此四个夹具之间也
+# 互斥；目录优先用 TEMP（Windows 惯例），没有就退到系统临时目录（Linux）——
+# 既有两个夹具直接读 os.environ['TEMP']，在 Linux 上会 KeyError，本夹具不重复
+# 那个跨平台问题。
+# ---------------------------------------------------------------------------
+LOCK = os.path.join(os.environ.get('TEMP') or tempfile.gettempdir(),
+                    'fi37_rewrite.lock')
+
+
+def _acquire_lock():
+    for _ in range(2):
+        try:
+            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, ('%d\n' % os.getpid()).encode('ascii'))
+            os.close(fd)
+            return True
+        except OSError:
+            try:
+                with io.open(LOCK, encoding='ascii') as fh:
+                    other = int(fh.read().strip())
+            except (OSError, ValueError):
+                other = None
+            alive = False
+            if other is not None:
+                try:
+                    os.kill(other, 0)
+                    alive = True
+                except OSError:
+                    alive = False
+            if alive:
+                return False
+            try:
+                os.remove(LOCK)
+            except OSError:
+                return False
+    return False
+
+
+def _release_lock():
+    try:
+        os.remove(LOCK)
+    except OSError:
+        pass
+
+
+def main():
+    if not _acquire_lock():
+        print("另一个夹具正在改写源码（%s）—— 请等它跑完再试" % LOCK)
+        print("（构建/ctest/verify.py 也不要与夹具并发：会读到变异后的源码）")
+        return 2
+    try:
+        return _run()
+    finally:
+        _release_lock()
 
 
 if __name__ == "__main__":
