@@ -699,3 +699,86 @@ add_test(NAME t113_form_call COMMAND t113_test_form_call)
 set_tests_properties(t113_form_call PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
 )
+
+# ---------------------------------------------------------------------------
+# 指纹注册窗体（src/ui/form_finger.cpp）—— 现场**真正执行**的注册状态机
+#
+# 为什么值得测：指纹注册在工程里有**两份**实现，
+#   A) FingerprintManager::startEnroll(int) —— 有测试、**零生产调用者**；
+#   B) Form_finger::startFingerRegisterStep() + doFingerCollect()
+#      —— 内联状态机，直接读写串口，**这才是现场执行的那条**。
+#
+# 第 23 轮的静态规则 check_live_fingerprint_enroll_sequence_is_pinned 已经把 B 的
+# **命令字节序列**钉住了（它的注释里就写着"B 无法用单元测试覆盖"）。但静态规则
+# 只能看文本，看不到三类真实缺陷：
+#
+#   1. **串口互斥没有成对恢复**：注册期间必须 setSuspended(true) 挂起常驻识别
+#      （两者抢同一个串口，会互为对方之应答）。退出/析构漏了恢复，后果是
+#      **门禁指纹识别永久失效**，而命令字节一个都没变 —— 静态规则看不出来。
+#   2. **轮询定时器泄漏**：回调里 readPacket() 是阻塞读且跑在 GUI 线程；退出时
+#      不停表，窗口隐藏后仍每 500ms 阻塞一次 GUI，把界面拖死。
+#   3. **延时后继步骤未被作废**：分步之间 QTimer::singleShot(1500) 进入下一步，
+#      用户在这 1.5 秒内退出时，仅停表不够（m_pollGeneration 就是为此存在）。
+#
+# 做法与第 35/36 轮一致：影子头替掉 Widget 与 AudioManager，串口用项目里**原有
+# 的**链接期替身 tests/fake_fingerprint_device.cpp（它的 buildPacket() 是真实
+# 算法逐字节拷贝，报文字节唯一的契约不能换）。
+#
+# **关键取向**：FingerprintManager 用**真实实现**。互斥开关 setSuspended() 的
+# 可观测效果（停表、恢复时重启识别）就在真实现里；换成替身，"有没有成对恢复"
+# 就退化成"替身自己记了一笔"（第 36 轮教训）。
+#
+# 注意：widget.h 里的指纹相关成员用 ACC_FORM_FINGER_TEST 圈起来了，因为
+# hal/fingerprint_hailin.h 会拉进 <QSerialPort>，只有本目标链接了
+# Qt5::SerialPort。不加宏会让 form_passwd / form_call 两个目标编译失败。
+# ---------------------------------------------------------------------------
+qt5_wrap_ui(T113_FORM_FINGER_UIS
+    ${ACCESSTERMINAL_SRC_ROOT}/ui/form_finger.ui
+)
+
+add_executable(t113_test_form_finger
+    test_form_finger.cpp
+    # 项目里原有的链接期串口替身（buildPacket 为真实算法）
+    fake_fingerprint_device.cpp
+    # 影子头必须列进来，AUTOMOC 才会为它们生成元对象
+    ${CMAKE_CURRENT_LIST_DIR}/shadows/ui/widget.h
+    ${CMAKE_CURRENT_LIST_DIR}/shadows/managers/audio_manager.h
+    ${ACCESSTERMINAL_SRC_ROOT}/ui/form_finger.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/config/app_config.cpp
+    # 真实指纹管理器：串口互斥语义在这里，不能用替身
+    ${ACCESSTERMINAL_SRC_ROOT}/managers/fingerprint_manager.cpp
+    # AUTOMOC：替身顶掉了 fingerprint_hailin.cpp，若不显式列出该头文件，
+    # moc 不会生成，链接期报 undefined reference to HailinFingerprint::* 信号
+    ${ACCESSTERMINAL_SRC_ROOT}/hal/fingerprint_hailin.h
+    ${T113_FORM_FINGER_UIS}
+)
+
+# BEFORE：影子 ui/widget.h 与 managers/audio_manager.h 必须排在真头之前命中。
+target_include_directories(t113_test_form_finger BEFORE PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/shadows
+)
+
+target_include_directories(t113_test_form_finger PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_LIST_DIR}                     # fake_fingerprint_device.h
+    ${CMAKE_CURRENT_LIST_DIR}/../tools/devstubs    # 串口桩
+    ${CMAKE_CURRENT_BINARY_DIR}                    # ui_form_finger.h（uic 产物）
+)
+
+target_compile_definitions(t113_test_form_finger PRIVATE
+    ACC_FORM_FINGER_TEST
+)
+
+target_link_libraries(t113_test_form_finger PRIVATE
+    Qt5::Core
+    Qt5::Test
+    Qt5::Gui
+    Qt5::Widgets
+    Qt5::SerialPort
+)
+
+add_test(NAME t113_form_finger COMMAND t113_test_form_finger)
+
+set_tests_properties(t113_form_finger PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+)

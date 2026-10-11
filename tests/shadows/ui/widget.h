@@ -50,8 +50,9 @@
 #ifndef ACCESSTERMINAL_T113_TESTS_SHADOWS_WIDGET_H
 #define ACCESSTERMINAL_T113_TESTS_SHADOWS_WIDGET_H
 
-#if !defined(ACC_FORM_PASSWD_TEST) && !defined(ACC_FORM_CALL_TEST)
-#  error "影子 ui/widget.h 只能用于测试；请在测试目标上定义 ACC_FORM_PASSWD_TEST 或 ACC_FORM_CALL_TEST"
+#if !defined(ACC_FORM_PASSWD_TEST) && !defined(ACC_FORM_CALL_TEST) \
+    && !defined(ACC_FORM_FINGER_TEST)
+#  error "影子 ui/widget.h 只能用于测试；请在测试目标上定义 ACC_FORM_PASSWD_TEST / ACC_FORM_CALL_TEST / ACC_FORM_FINGER_TEST"
 #endif
 
 #include <QString>
@@ -66,6 +67,18 @@
 // 真 `SignalingClient`（不是影子）：`notifyPeerStopSend()` 要真的把 stopsend
 // 写到 TCP 上，所以这里必须用真实实现。它的 .cpp 由测试目标直接链接。
 #include "core/net/signaling_client.h"
+
+// ---------------------------------------------------------------------------
+// 指纹注册窗体（t113_test_form_finger）需要的成员。
+//
+// **必须宏门控**（第 37 轮实测的编译失败）：`hal/fingerprint_hailin.h` 会拉进
+// `<QSerialPort>`，而只有本目标链接了 `Qt5::SerialPort`；form_passwd /
+// form_call 两个目标没有链接它，无条件包含会让那两个目标编译失败。
+// ---------------------------------------------------------------------------
+#ifdef ACC_FORM_FINGER_TEST
+#include "hal/fingerprint_hailin.h"
+#include "managers/fingerprint_manager.h"
+#endif
 
 /**
  * @brief `Widget` 的替身：只保留这两个窗体测试真正会走到的成员。
@@ -117,6 +130,48 @@ public:
     {
         m_signaling = client;
     }
+
+#ifdef ACC_FORM_FINGER_TEST
+    // ---- 指纹相关（与真 src/ui/widget.h 同签名）----
+    //
+    // 真实现（src/ui/widget.cpp:243 / :250-252）：
+    //     m_fingerprint        = new HailinFingerprint(cfg.fingerprintPort(), this);
+    //     m_fingerprintManager = new FingerprintManager(this);
+    //     m_fingerprintManager->setDevice(m_fingerprint);
+    //     m_nextFingerId       = cfg.fingerprintIdStart();
+    //
+    // 本替身不建真对象：指纹测试要自己控制"管理器先建、窗体后建"的**创建
+    // 顺序**（那正是 use-after-free 的成因），所以由夹具注入。
+
+    /// 与真 `Widget::fingerprint()` 同签名（真实现见 src/ui/widget.h:107）。
+    HailinFingerprint* fingerprint() const { return m_fingerprint; }
+
+    /// 与真 `Widget::fingerprintManager()` 同签名（真实现见 src/ui/widget.h:105）。
+    FingerprintManager* fingerprintManager() const { return m_fingerprintManager; }
+
+    /// 与真 `Widget::nextFingerId()` 同签名（真实现见 src/ui/widget.h:110）。
+    int nextFingerId() const { return m_nextFingerId; }
+
+    /// 与真 `Widget::incrementNextFingerId()` 同签名（src/ui/widget.h:111）。
+    ///
+    /// 真实现是 `++m_nextFingerId;`（并持久化到配置）。这里只改内存值 ——
+    /// 本测试只关心"注册成功后 ID 有没有前进"，不关心落盘。
+    void incrementNextFingerId() { ++m_nextFingerId; }
+
+    // ---- 测试用注入点 ----
+    void setFingerprintForTest(HailinFingerprint* dev) { m_fingerprint = dev; }
+    void setFingerprintManagerForTest(FingerprintManager* mgr)
+    {
+        m_fingerprintManager = mgr;
+    }
+    void setNextFingerIdForTest(int id) { m_nextFingerId = id; }
+    int nextFingerIdForTest() const { return m_nextFingerId; }
+
+    // 夹具直接读写这几个（public 是刻意的：它们就是被观测的状态）。
+    HailinFingerprint* m_fingerprint = nullptr;
+    FingerprintManager* m_fingerprintManager = nullptr;
+    int m_nextFingerId = 1;
+#endif
 
     // ---- 测试观测点 ----
     int notifyStopSendCalls = 0;

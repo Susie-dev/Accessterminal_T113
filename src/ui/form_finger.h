@@ -3,8 +3,15 @@
 // 定义预处理宏或常量 FORM_FINGER_H。
 #define FORM_FINGER_H
 
+// 引入系统或第三方头文件 <QPointer>。
+#include <QPointer>
 // 引入系统或第三方头文件 <QWidget>。
 #include <QWidget>
+
+// `QPointer<FingerprintManager>` 的模板实例化需要完整类型（任何 include 了
+// 本头文件的翻译单元都会实例化它的析构/赋值）。只靠前置声明在部分编译器上
+// 会失败，且失败信息晦涩。该头文件本身很轻（只依赖 QObject），直接包含。
+#include "managers/fingerprint_manager.h"
 
 // 声明或进入命名空间 Ui。
 namespace Ui {
@@ -14,8 +21,6 @@ class Form_finger;
 }
 
 class QTimer;
-class FingerprintManager;
-
 // 声明类 Form_finger。
 class Form_finger : public QWidget
 // 进入新的代码块作用域。
@@ -73,7 +78,21 @@ private:
     /// 注册流程与常驻识别共用同一个串口，必须互斥：识别轮询每 500ms 主动
     /// 下发 CMD_GET_IMAGE 并抢读应答，会把注册流程正在等待的应答取走，
     /// 导致注册随机失败。这里记录由谁挂起，保证恢复成对发生。
-    FingerprintManager* m_suspendedFingerprintManager = nullptr;
+    ///
+    /// 为什么必须是 `QPointer` 而不是裸指针（第 37 轮实测的 use-after-free）：
+    /// 本窗口与 `FingerprintManager` 都是 `Widget` 的子对象，而 **Qt 按创建
+    /// 顺序销毁子对象**（先建先死，非逆序；已用探针实测确认）。生产代码里
+    /// `FingerprintManager` 在 widget.cpp:250 创建，本窗口在 widget.cpp:670
+    /// 创建 —— 于是 `delete Widget` 时管理器**先**析构，等本窗口析构函数
+    /// 再执行 `if (m_suspendedFingerprintManager) m_suspendedFingerprintManager
+    /// ->setSuspended(false);` 时，那个裸指针已经悬垂，`if` 判空**挡不住**
+    /// 已销毁的对象（实测：裸指针非空、对象已死），构成实打实的
+    /// use-after-free。`QPointer` 在被指对象销毁后自动变空，正好补上这一课。
+    /// 与 widget.h 中 `m_passwdForm` 用 QPointer 的理由一致。
+    ///
+    /// 触发条件：用户进过指纹注册（记下了句柄）且**没有**点『退出』就关机/退出
+    /// 程序 —— 退出路径会清空句柄因而不触发，所以这是一条容易被漏测的路径。
+    QPointer<FingerprintManager> m_suspendedFingerprintManager;
     /// 停掉“检测手指”轮询，并作废已排队的延时重启。退出窗口与析构时都必须调用。
     void stopFingerPoll();
     // 定义或声明函数 startFingerRegisterStep。

@@ -2630,6 +2630,139 @@ def check_live_fingerprint_enroll_sequence_is_pinned(root, src_root):
 
 
 
+def check_form_finger_suspended_manager_is_guarded(root, src_root):
+    r"""
+    `Form_finger` 持有的「被挂起的常驻识别管理器」句柄必须是 `QPointer`，
+    且挂起/恢复必须成对。
+
+    背景（第 37 轮，实测确认的 use-after-free）
+    -------------------------------------------
+    指纹注册与常驻识别共用同一个串口，注册期间必须挂起识别
+    （`setSuspended(true)`），退出/析构时成对恢复。窗体把这个"由我挂起的"
+    管理器记在成员里，以便恢复。
+
+    生产对象图（src/ui/widget.cpp）：
+        L250  m_fingerprintManager = new FingerprintManager(this);   // 先建
+        L670  m_fingerForm         = new Form_finger(this);          // 后建
+    两者都是 `Widget` 的子对象。**Qt 按创建顺序销毁子对象（先建先死，
+    不是逆序 —— 第 37 轮用探针实测确认）**，所以 `delete Widget` 时
+    管理器先析构。等窗体析构函数执行
+
+        if (m_suspendedFingerprintManager)
+            m_suspendedFingerprintManager->setSuspended(false);
+
+    时那个**裸指针仍然非空**（实测：裸指针非空、对象已死），于是对已析构
+    的管理器调用成员函数 —— 实打实的 use-after-free。
+
+    为什么这条必须由**静态规则**守，而不是单元测试
+    ----------------------------------------------
+    我先写的回归测试就是"不点退出、直接让窗体析构，看进程崩不崩"。
+    故障注入实测（把 `QPointer` 改回裸指针，重编译，跑该用例）：
+    **变异体 5/5 退出码全为 0，一次都没崩**。原因是 use-after-free 属未定义
+    行为：Qt 析构只是把内存还给分配器，"刚释放、尚未复用"的窗口里那块内存
+    往往仍能读出原 vtable 与字段，`setSuspended()` 走完看着一切正常。
+    **一条在缺陷代码上不失败的回归测试没有价值**（本仓库既有约定），所以
+    "崩溃"不能作为守卫。
+
+    改由两处分工守卫，都是**确定性**的：
+      1. 单元测试 `managerIsDestroyedBeforeTheFormProvesTheHazardIsReal`
+         钉住**成因前提**：Qt 确实先销毁先创建的子对象（顺序反了它就失败，
+         已用故障注入验证有判别力）。
+      2. **本条静态规则**钉住**做法**：成员类型必须是 `QPointer<...>`，
+         不能是裸指针；`<QPointer>` 必须被包含；挂起与恢复必须成对出现。
+
+    判定：
+      - `form_finger.h` 里必须存在形如
+        `QPointer<FingerprintManager> m_suspendedFingerprintManager` 的成员声明，
+        且**不得**同时存在裸指针版本的同一成员名；
+      - 必须 `#include <QPointer>`；
+      - 挂起点（`setSuspended(true)`）与恢复点（`setSuspended(false)`）都必须
+        出现在 `m_suspendedFingerprintManager` 的作用域内（即都对同一成员操作），
+        且恢复点至少出现两次（退出路径 + 析构路径各一次）。
+    """
+    import re as _re
+    hdr_rel = os.path.join("src", "ui", "form_finger.h")
+    cpp_rel = os.path.join("src", "ui", "form_finger.cpp")
+    hdr_path = os.path.join(root, hdr_rel)
+    cpp_path = os.path.join(root, cpp_rel)
+    if not os.path.exists(hdr_path) or not os.path.exists(cpp_path):
+        return
+
+    hdr = strip_comments_and_strings(read(hdr_path))
+    cpp = strip_comments_and_strings(read(cpp_path))
+
+    member = "m_suspendedFingerprintManager"
+
+    # (1) 成员声明必须是 QPointer。裸指针形式 = 缺陷复发。
+    bare = _re.search(
+        r'\bFingerprintManager\s*\*\s*' + member + r'\b', hdr)
+    if bare:
+        fail("[fp-manager-uaf] {} 中 `{}` 又被声明成了**裸指针**"
+             "（`FingerprintManager* {}`）。\n"
+             "        生产代码里 FingerprintManager 在 widget.cpp:250 创建、"
+             "Form_finger 在 widget.cpp:670 创建，两者同为 Widget 的子对象；"
+             "Qt **按创建顺序销毁子对象**，因此 `delete Widget` 时管理器先死，"
+             "窗体析构函数再对裸指针调 setSuspended() 就是 use-after-free"
+             "（第 37 轮实测确认）。\n"
+             "        必须用 `QPointer<FingerprintManager> {}`：被指对象销毁后"
+             "自动变空。".format(hdr_rel, member, member, member))
+
+    guarded = _re.search(
+        r'\bQPointer\s*<\s*FingerprintManager\s*>\s*' + member + r'\b', hdr)
+    if not guarded:
+        fail("[fp-manager-uaf] {} 中未找到 `QPointer<FingerprintManager> {}` "
+             "声明。\n"
+             "        该句柄用于在注册结束后恢复常驻识别；它指向的对象**可能"
+             "先于本窗口被销毁**，必须是 QPointer（详见该成员上方的注释）。"
+             .format(hdr_rel, member))
+
+    # (2) 必须包含 <QPointer>（只靠间接包含会在重构中悄悄失效）。
+    if not _re.search(r'#\s*include\s*<\s*QPointer\s*>', hdr):
+        fail("[fp-manager-uaf] {} 使用了 QPointer 却未 `#include <QPointer>`。"
+             .format(hdr_rel))
+
+    # (3) 挂起/恢复必须成对，且都作用于同一成员。
+    suspends = _re.findall(
+        r'\b' + member + r'\s*->\s*setSuspended\s*\(\s*true\s*\)', cpp)
+    resumes = _re.findall(
+        r'\b' + member + r'\s*->\s*setSuspended\s*\(\s*false\s*\)', cpp)
+    if not suspends:
+        fail("[fp-manager-uaf] {} 中未找到对 `{}` 的挂起调用"
+             "（`{}->setSuspended(true)`）。注册期间必须挂起常驻识别，"
+             "否则两者抢同一个串口的应答，注册会随机失败。"
+             .format(cpp_rel, member, member))
+    if len(resumes) < 2:
+        fail("[fp-manager-uaf] {} 中对 `{}` 的恢复调用只有 {} 处，期望至少 2 处"
+             "（退出路径 onAddQuitClicked + 析构路径 ~Form_finger 各一次）。\n"
+             "        漏掉任一处的后果：常驻指纹识别**永久失效**，而线上命令"
+             "字节一个都没变 —— 静态的字节序列规则完全看不出来。"
+             .format(cpp_rel, member, len(resumes)))
+
+    # (4) 恢复点必须真的落在"退出"与"析构"两个函数里，而不只是出现两次。
+    quit_body = _function_body(cpp, "Form_finger::onAddQuitClicked")
+    dtor_body = _function_body(cpp, "Form_finger::~Form_finger")
+    for label, body, fname in (
+            ("退出路径", quit_body, "onAddQuitClicked"),
+            ("析构路径", dtor_body, "~Form_finger")):
+        if body is None:
+            fail("[fp-manager-uaf] 在 {} 中找不到函数 {}".format(cpp_rel, fname))
+            continue
+        if not _re.search(r'\b' + member + r'\s*->\s*setSuspended\s*\(\s*false\s*\)',
+                          body):
+            fail("[fp-manager-uaf] {} 的 {} 里没有恢复常驻识别"
+                 "（`{}->setSuspended(false)`）。\n"
+                 "        漏掉这一步会让门禁的指纹识别**永久失效**。"
+                 .format(fname, label, member))
+        # 同一函数里还必须停表。析构里的 stopFingerPoll() 在行为上不可观测
+        # （定时器是本窗口的子对象，随窗口一起销毁，且析构不跑事件循环），
+        # 所以它**只能**由静态规则守 —— 没有这条，删掉它不会有任何测试变红。
+        if not _re.search(r'\bstopFingerPoll\s*\(\s*\)', body):
+            fail("[fp-manager-uaf] {} 的 {} 里没有调用 `stopFingerPoll()`。\n"
+                 "        轮询回调里的 readPacket() 是**阻塞读**且跑在 GUI 线程；"
+                 "退出/析构时不停表，窗口隐藏后它会继续每 500ms 阻塞一次界面。"
+                 .format(fname, label))
+
+
 def check_coverage_denominator_is_declared(root, src_root):
     r"""
     覆盖率必须连**分母**一起声明，否则数字本身具有误导性。
@@ -4020,6 +4153,7 @@ def main():
     check_fault_harnesses_classify_crashes_correctly(root, src_root)
     check_form_passwd_contract_is_pinned(root, src_root)
     check_form_call_stopsend_is_wired(root, src_root)
+    check_form_finger_suspended_manager_is_guarded(root, src_root)
     check_fake_fingerprint_builds_same_bytes(root, src_root)
     check_fingerprint_checksum_logic_is_not_duplicated(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)
