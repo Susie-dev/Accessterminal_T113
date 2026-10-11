@@ -3356,23 +3356,27 @@ def check_face_gate_hazard_is_documented(root, src_root):
       - "唯一判据"这条断言存在（丢了它，门禁安全就没人守）；
       - 上述隐患被测试**显式**记录（丢了它，隐患会静默变成缺陷）；
       - 故障注入夹具存在（不失败的回归测试没有价值）；
-      - 阈值无范围约束 -> warn（安全相关，见下）。
+      - 阈值上限必须低于 LBPH 距离的饱和点 -> 否则 fail（第 38 轮由告警升级）。
 
-    关于阈值的 warn
-    ---------------
+    关于阈值上限的断言
+    ------------------
     探针证实门禁安全**完全取决于**该阈值。第 29 轮第一版规则只搜
     `src/config/app_config.cpp` 里的 `qBound|clamp` 子串，于是**误报**了
-    "没有任何范围约束" —— 真正的夹取在 `app_config.h` 的访问器里：
+    "没有任何范围约束" —— 真正的夹取在 `app_config.h` 的访问器里。
+
+    第 31 轮改为读头文件、解析出实际的上下限，但仍只**告警**，而且把
+    "形同虚设"的门槛定成了 `1e6`：于是 `1000`（也远高于饱和点）被判合格。
+
+    第 38 轮的探针给出了真正的判据：LBPH（`create()` 默认参数，8x8 网格）
+    的距离在 **~256 处饱和**，阈值 >= 256 时**任何**图像 —— 包括完全陌生的
+    脸 —— 都判"通过"。所以安全上限必须**低于饱和点**，与 `1e6` 无关：
 
         double faceConfidenceThreshold() const
-        { return clampDouble(m_faceConfidenceThreshold, 0.0, 1e9); }
+        { return clampDouble(m_faceConfidenceThreshold, 0.0, 150.0); }
 
-    第 31 轮改为读头文件、解析出实际的上下限，并按**真实**情况告警：
-      - 访问器完全没夹取          -> warn（原隐患）；
-      - 夹了，但上限大到形同虚设
-        （如 1e9）                 -> warn（新的、更准确的措辞）。
-    配置成 1e9 会让任何陌生人像都判"通过"，门锁形同虚设；把上限收到
-    合理值（如 1000）属行为变化，仍需单独决定，故仍只告警。
+    本规则因此断言：访问器必须夹取，且上限必须 < 256.0。
+    判别边界：这里只解析 `.h` 里的夹取。若夹取被挪回 `.cpp`（历史上正是从
+    那儿漏掉的），本规则只能确认"有夹取"，无法核对上限的数值。
     """
     impl = os.path.join(src_root, "managers", "face_manager.cpp")
     if not os.path.exists(impl):
@@ -3415,16 +3419,26 @@ def check_face_gate_hazard_is_documented(root, src_root):
              "但一旦有人加了别的调用路径就会终止进程。必须显式钉住现状，"
              "使『是否改为检查模型训练状态』成为一个显式决定。")
 
+    # 上限处的**安全性质**必须有可执行断言（第 38 轮）。
+    # 同样用完整符号名：改成短名即消失。
+    if "maxAllowedThresholdStillRejectsStrangers(" not in t:
+        fail("[face-gate] 门禁测试里没有『阈值推到配置上限时，完全不同的图像"
+             "仍被拒绝』的断言。把上限从 1e9 收到 150 是第 38 轮的**安全决定**"
+             "（实测阈值 >= 饱和点 ~256 时任何脸都判通过）；丢了这条断言，"
+             "上限被放回饱和点以上就没人守了。")
+
     if not os.path.exists(fx):
         fail("[face-gate] 缺少 tools/verify_face_manager_test.py —— 没有故障注入"
              "就无法证明这些门禁断言**真的会失败**。不失败的回归测试没有价值。")
 
-    # 阈值范围约束 -> 告警（安全相关，但收紧上限属行为变化，需单独决定）。
+    # 阈值上限必须低于 LBPH 距离的饱和点（第 38 轮：由 warn 升级为 fail）。
     #
-    # 第 29 轮第一版只搜 app_config.cpp 的 `qBound|clamp` 子串，把
-    # 「夹取写在 app_config.h 的访问器里」误报成「没有任何范围约束」。
-    # 现在读头文件、解析出真实的上下限，只在**确实有问题**时告警：
-    # 没夹取，或上限大到形同虚设（1e9 允许任何陌生人脸通过）。
+    # 第 29 轮只搜 app_config.cpp 的 `qBound|clamp` 子串，把「夹取写在
+    # app_config.h 的访问器里」误报成「没有任何范围约束」；第 31 轮改为读
+    # 头文件、解析真实上下限，但把判据定成了 `1e6`，于是 1000 漏网。
+    # 第 38 轮探针实测：距离在 ~256 处饱和，阈值 >= 256 时**任何**图像
+    # （含完全陌生的脸）都判"通过" —— 故判据是**饱和点 256**，不是 1e6。
+    LBPH_SATURATION = 256.0
     cfg_h = os.path.join(src_root, "config", "app_config.h")
     cfg_cpp = os.path.join(src_root, "config", "app_config.cpp")
     if os.path.exists(cfg_h) and "faceConfidenceThreshold" in read(cfg_h):
@@ -3436,30 +3450,33 @@ def check_face_gate_hazard_is_documented(root, src_root):
         # 上限大小顺带看一眼 .cpp（有些实现把 clamp 放在那里）。
         ctext = read(cfg_cpp) if os.path.exists(cfg_cpp) else ""
 
-        def _no_upper_bound(expr):
-            """上限是否大到形同虚设（1e9 / 1e12 / DBL_MAX ...）。"""
+        def _is_saturated(expr):
+            """上限是否 >= LBPH 距离的饱和点（>= 饱和点即"谁都能过"）。"""
             e = expr.strip()
-            mm = re.match(r"^1[eE](\d+)$", e)
-            if mm:
-                return int(mm.group(1)) >= 6
-            return e.replace(" ", "") in ("DBL_MAX", "std::numeric_limits<double>::max()")
+            if e.replace(" ", "") in ("DBL_MAX",
+                                      "std::numeric_limits<double>::max()"):
+                return True
+            try:
+                return float(e) >= LBPH_SATURATION
+            except ValueError:
+                # 非常量表达式（如符号常量）：静态无法求值。这是本规则的
+                # 判别边界，已在 docstring 里如实交代。
+                return False
 
         if m is None and not re.search(r"qBound|std::clamp|std::min|std::max"
                                        r"|qMax|qMin", ctext):
-            warn("[face-gate] behavior.face_confidence_threshold 没有任何范围"
+            fail("[face-gate] behavior.face_confidence_threshold 没有任何范围"
                  "约束，而探针证实**门禁安全完全取决于它**（单 label 时"
                  "predictedLabel == 1 恒真）。配置成 1e9 会让任何陌生人像都"
-                 "判『通过』，门锁形同虚设；误配置成 900（少写一个 0）会"
-                 "静默失去门禁作用。是否加约束属行为变化，需单独决定 —— "
-                 "当前仅告警。")
-        elif m is not None and _no_upper_bound(m.group(2)):
-            warn("[face-gate] behavior.face_confidence_threshold 虽然做了夹取"
-                 "（%s），但**上限 %s 大到形同虚设** —— 而探针证实门禁安全"
-                 "完全取决于它（单 label 时 predictedLabel == 1 恒真）。"
-                 "配置成 1e9 会让任何陌生人像都判『通过』，门锁形同虚设；"
-                 "误配置成 900（少写一个 0）也会静默失去门禁作用。把上限收到"
-                 "合理区间属行为变化，需单独决定 —— 当前仅告警。"
-                 % (m.group(0).split("{")[-1].strip(), m.group(2).strip()))
+                 "判『通过』，门锁形同虚设；误配置成 900（多写一个 0）也会"
+                 "静默失去门禁作用。")
+        elif m is not None and _is_saturated(m.group(2)):
+            fail("[face-gate] behavior.face_confidence_threshold 的夹取上限 "
+                 "%s **不低于 LBPH 距离的饱和点 %.0f** —— 阈值 >= 饱和点时"
+                 "**任何**图像（含完全陌生的脸）都判『通过』，门锁形同虚设。"
+                 "第 38 轮实测：同一身份 <= ~103、冒充者 >= ~170、饱和 ~256，"
+                 "故安全上限必须低于饱和点（本工程取 150.0）。"
+                 % (m.group(2).strip(), LBPH_SATURATION))
 
 
 

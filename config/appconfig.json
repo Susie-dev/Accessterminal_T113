@@ -22,7 +22,7 @@
   },
 
   "behavior": {
-    "_comment": "frame_interval_ms=50 约 20fps 采集；face_detect_interval 每 N 帧检测一次人脸；face_confidence_threshold 为 LBPH 距离阈值(越小越严格)",
+    "_comment": "frame_interval_ms=50 约 20fps 采集；face_detect_interval 每 N 帧检测一次人脸；face_confidence_threshold 为 LBPH 距离阈值(越小越严格)，有效范围 0~150，超过会被夹到 150 —— LBPH 距离在 ~256 饱和，阈值 >= 256 时任何脸(含陌生人)都判通过，故禁止配置得更大",
     "frame_interval_ms": 50,
     "face_detect_interval": 10,
     "face_recognize_interval_ms": 2000,

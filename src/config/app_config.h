@@ -102,8 +102,19 @@ public:
     int faceDetectInterval() const { return clampInt(m_faceDetectInterval, 1, 100000); }
     /// 人脸识别冷却时间（毫秒），下限 0（0 表示不冷却，属合法配置）。
     int faceRecognizeIntervalMs() const { return clampInt(m_faceRecognizeIntervalMs, 0, 3600000); }
-    /// LBPH 距离阈值，越小越严格；负数会让所有比对都“成功”，故下限 0。
-    double faceConfidenceThreshold() const { return clampDouble(m_faceConfidenceThreshold, 0.0, 1e9); }
+    /// LBPH 距离阈值，越小越严格。下限 0：距离恒 >= 0，负阈值等价于
+    /// “谁都不通过”，是没有意义的配置。
+    ///
+    /// 上限 150 是**安全上界**，不是随手取的数（第 38 轮实测）：
+    ///   - LBPH（create() 默认参数，8x8 网格）的距离在 ~256 处**饱和**，
+    ///     阈值 >= 256 时任何图像 —— 包括完全陌生的脸 —— 都判“通过”；
+    ///   - 同一身份（含抖动）实测 <= ~103；完全不同的图像实测 >= ~170；
+    ///   - 150 落在两者之间：既挡住 `1e9` 与“900（多写一个 0）”这类
+    ///     **会静默让门锁形同虚设**的误配，又给现场标定留出余量。
+    /// 收紧上限相对原实现（1e9）是**行为变化**，第 38 轮按独立决定执行；
+    /// 默认值 90 仍在区间内，故未配置时的行为逐字节不变。
+    /// 判别边界与探针方法见 tools/verify_face_gate_rule.py。
+    double faceConfidenceThreshold() const { return clampDouble(m_faceConfidenceThreshold, 0.0, 150.0); }
     /// 指纹起始 ID。协议用 2 字节承载，限定到 [0, 65535] 与线格式一致。
     int fingerprintIdStart() const { return clampInt(m_fingerprintIdStart, 0, 65535); }
 

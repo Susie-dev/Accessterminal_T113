@@ -421,6 +421,31 @@ private slots:
     }
 
     /**
+     * 上限处的**安全性质**（第 38 轮）：把阈值推到配置允许的最大值 150 时，
+     * 与注册者完全不同的图像仍必须被拒绝。
+     *
+     * 这条守的是"收紧上限"这个决定本身：只要有人把 app_config.h 的上限放回
+     * `1e9` / `1000`（两者都 >= LBPH 距离的饱和点 ~256），门禁就会**静默**
+     * 失去作用 —— 而本用例会立刻变红。
+     *
+     * 同时也钉住 90 -> 150 的关系：150 是"允许的最松"，不是推荐值。
+     */
+    void maxAllowedThresholdStillRejectsStrangers()
+    {
+        FaceManager fm;
+        QVERIFY(trainOn(fm, 0));
+
+        // 完全不同的图案：垂直渐变 vs 训练用的水平渐变。
+        const QPair<bool, double> r = recognizeWith(fm, makePattern(1), 150.0);
+        QVERIFY2(!r.first,
+                 "阈值推到配置上限 150 时，完全不同的图像仍必须被拒绝");
+        QVERIFY2(r.second > 150.0,
+                 qPrintable(QStringLiteral(
+                     "阳性对照：该图的距离(%1)必须真的大于 150，否则这条断言恒真")
+                     .arg(r.second)));
+    }
+
+    /**
      * 阳性对照 + 判别力：与注册图案相同的图，距离必须**小于**不同的图。
      *
      * 没有这条，上面所有阈值断言在"两张图 conf 恰好都是 0"时都会恒真。

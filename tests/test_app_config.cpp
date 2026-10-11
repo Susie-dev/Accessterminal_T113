@@ -83,6 +83,7 @@ private slots:
     void garbageEnvFallsBackToSafeRange();
     void legalValuesPassThroughUnchanged();
     void outOfRangeJsonIsClamped();
+    void faceThresholdUpperBoundIsClampedToSafeMax();
     void brokenJsonKeepsDefaults();
     void legacyEnvVarsStillHonored();
     void fingerprintIdStartMatchesWireRange();
@@ -257,6 +258,47 @@ void TestAppConfig::outOfRangeJsonIsClamped()
     QCOMPARE(cfg.frameIntervalMs(), 10000);   // 上限
     QCOMPARE(cfg.fingerprintIdStart(), 65535);// 线格式为 2 字节
     QCOMPARE(cfg.faceConfidenceThreshold(), 0.0);
+}
+
+/**
+ * 门禁阈值的上限必须被夹到**安全**区间（第 38 轮）。
+ *
+ * 为什么不能只夹一个"很大的数"：LBPH（create() 默认参数，8x8 网格）的
+ * 距离在 ~256 处**饱和**，阈值 >= 256 时任何图像（包括完全陌生的脸）都判
+ * "通过"。所以原实现的上限 `1e9` 与旧稿建议的 `1000` **同样是形同虚设** ——
+ * 都能让门锁静默失守（`900` = 90 多写一个 0 的典型误配也被它放过）。
+ *
+ * 本用例把上限钉死在 150.0：它低于实测的冒充者距离下界（~170），高于实测的
+ * 同一身份上界（~103）。"阈值推到允许的最大值时，完全不同的图像仍被拒绝"
+ * 这条**行为**性质由 test_face_manager.cpp 的
+ * maxAllowedThresholdStillRejectsStrangers 再钉一遍。
+ */
+void TestAppConfig::faceThresholdUpperBoundIsClampedToSafeMax()
+{
+    AppConfig& cfg = AppConfig::instance();
+
+    // 超上限的输入一律夹到 150.0（含 1e9 与"多写一个 0"的 900）。
+    const char* tooLarge[] = {"900", "1000", "1e9", "1e300"};
+    for (const char* v : tooLarge) {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = writeConfig(dir,
+            QByteArray("{\"behavior\":{\"face_confidence_threshold\":") + v + "}}");
+        QVERIFY(cfg.load(path));
+        QCOMPARE(cfg.faceConfidenceThreshold(), 150.0);
+    }
+
+    // 区间内的合法值必须原样通过：默认 90 与现场标定值都不能被改动。
+    const double legal[] = {90.0, 77.5, 120.5, 150.0};
+    for (double v : legal) {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = writeConfig(dir,
+            QString("{\"behavior\":{\"face_confidence_threshold\":%1}}")
+                .arg(v).toUtf8());
+        QVERIFY(cfg.load(path));
+        QCOMPARE(cfg.faceConfidenceThreshold(), v);
+    }
 }
 
 /// JSON 损坏时必须整体回退到默认值，而不是留下"半套"配置。
