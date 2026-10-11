@@ -94,7 +94,7 @@ cmake --build /tmp/t113-tests
 ctest --test-dir /tmp/t113-tests --output-on-failure
 ```
 
-当前 16 个目标：`t113_protocol`（协议编解码）、`t113_fingerprint_parser`
+当前 17 个目标：`t113_protocol`（协议编解码）、`t113_fingerprint_parser`
 （指纹帧解析）、`t113_app_config`（配置读取与夹取）、`t113_audio_manager`
 （提示音播放，用假 ALSA 注入设备错误）、`t113_audio_sender`（UDP 12345
 上行音频）、`t113_audio_receiver`（UDP 12345 下行播放）、`t113_video_push`
@@ -106,12 +106,16 @@ ctest --test-dir /tmp/t113-tests --output-on-failure
 `t113_gpio`（物理门锁/补光那条线，用可编程假 libgpiod）、
 `t113_face_manager`（人脸门禁，链接真实 LBPH；**缺 OpenCV face 模块时
 自动跳过**）、`t113_v4l2_camera`（画面源头，用可编程假 syscall 层 +
-`-Wl,--wrap`）、`t113_form_passwd`（密码输入窗体，**唯一的 Qt Widgets
-目标**，用影子 `Widget`/`AudioManager` 驱动真实按钮点击并捕获真实日志）。
+`-Wl,--wrap`）、`t113_form_passwd`（密码输入窗体，用影子 `Widget`/
+`AudioManager` 驱动真实按钮点击并捕获真实日志）、
+`t113_form_call`（通话窗体，**stopsend 的发源地**：真 `QTcpServer` + 真
+`SignalingClient`，点下停止按钮后断言对端收到 `"stopsend\n"`）。
 
 注意最后两个目标的取向**相反**，这是刻意的：
 `t113_fingerprint_manager` 用替身替换 `fingerprint_hailin.cpp`，
 `t113_fingerprint_wire` 则链接真实实现。前者测流程调度，后者测报文字节。
+同理 `t113_form_call` 对 `Widget` 用替身，但对 `SignalingClient` 用**真实
+实现** —— 否则"点按钮发出 stopsend"就退化成"替身自己记了一笔"。
 
 除前三个是纯逻辑外，其余都用**可注入的假替身**在真实接口边界上跑：
 假 ALSA（设备错误按需注入）、假套接字（记录/投递数据报）、假 V4L2 相机
@@ -231,16 +235,18 @@ gcov 数据里：
 | `src/managers/password_manager.cpp` | 19 |
 | 其余头文件与 `main.cpp` | — |
 
-（`src/ui/form_passwd.cpp` 第 35 轮已接进 `t113_test_form_passwd`，故已从此表
-移出；见下文更新后的数字。）
+（上表是**第 24 轮首次量化时**的快照，保留以说明"分母"这件事是怎么被发现的。
+此后 `form_passwd.cpp`（第 35 轮）、`v4l2_camera.cpp`（第 30 轮）、
+`form_call.cpp`（第 36 轮）等已陆续接进测试目标，故**不再是当前状态**；
+当前状态见下文"从未被任何测试目标链接的产线源文件（8 个）"。）
 
 **数字正确、口径错误，比没有数字更危险** —— 它会让人停止寻找缺口。
 
 `tools/run_coverage.sh` 一键产出：
 
 ```
-已测文件 1069 行（覆盖 823）+ 未测文件约 1274 行 = 分母 2343
-近似总覆盖率 = 35.1%   （上表那个 77.0% 仅描述已测文件）
+已测文件 1196 行（覆盖 939）+ 未测文件约 1090 行 = 分母 2286
+近似总覆盖率 = 41.1%   （上表那个 78.5% 仅描述已测文件）
 ```
 
 （第 25 轮新增 `t113_test_fingerprint_wire` 后，把 332 行的
@@ -258,12 +264,18 @@ gcov 数据里：
 46 行从"未测"挪进"已测"，未测侧同时少了它原先的近似行数），
 真实总覆盖率 **35.1% -> 39.3%**。该文件自身覆盖率 **97.8%**（46 行覆盖 45）。
 
+第 36 轮把 `form_call.cpp`（25 行）接进 `t113_test_form_call` 后：
+分子 918 -> 939，已测文件百分比 78.2% -> 78.5%，分母 2335 -> 2286，
+真实总覆盖率 **39.3% -> 41.1%**。该文件自身覆盖率 **100.0%**（25 行全覆盖）——
+它只有 25 个可执行行，却包含门口机**唯一**发出 `stopsend` 的那条接线。
+"从未被任何测试目标链接的产线源文件"从 10 个降到 **8 个**。
+
 这正是"分母必须一起报"的价值：只报已测文件百分比的话，**做对了事数字反而
 变难看**，会诱导人不去补齐未测文件。）
 
 #### 已测文件的明细与未覆盖行
 
-被测到的文件覆盖度相当高（1174 行中 918 行，78.2%）：
+被测到的文件覆盖度相当高（1196 行中 939 行，78.5%）：
 
 | 文件 | 可执行行 | 覆盖 | 覆盖率 |
 | --- | --- | --- | --- |
@@ -274,6 +286,7 @@ gcov 数据里：
 | `src/core/vision/v4l2_camera.cpp` | 68 | 68 | 100% |
 | `src/managers/face_manager.cpp` | 29 | 29 | 100% |
 | `src/managers/password_manager.cpp` | 10 | 10 | 100% |
+| **`src/ui/form_call.cpp`** | **25** | **25** | **100%** |
 | `src/managers/audio_manager.cpp` | 69 | 68 | 98.6% |
 | `src/ui/form_passwd.cpp` | 46 | 45 | 97.8% |
 | `src/core/net/protocol.h` | 58 | 56 | 96.6% |
@@ -285,8 +298,8 @@ gcov 数据里：
 | `src/core/media/camera_preview_server.cpp` | 52 | 45 | 86.5% |
 | `src/hal/fingerprint_hailin.cpp` | 262 | 43 | 16.4% |
 
-（另有 5 个单行头文件各 1 行、100%，未列入本表；合计正好 1174 行 / 918 行。
-本表是第 35 轮 `tools/run_coverage.sh` 的**实测值** —— 第 30 轮之后列过的数字
+（另有 8 个单行/零行头文件，未列入本表；合计正好 1196 行 / 939 行。
+本表是第 36 轮 `tools/run_coverage.sh` 的**实测值** —— 第 30 轮之后列过的数字
 已经漂移（新接了文件、行号也随之变化），所以**每次引用覆盖率都要重新跑一遍**，
 不要抄旧数字。）
 
@@ -509,8 +522,9 @@ QWidget* Form_passwd::getMainWidget() {
 > 下不同，删掉这个分支等于放弃对"父链上存在非 `Widget` 的 QWidget"这种
 > 退化情形的防御。判断为不可达只影响**覆盖率口径**，不影响代码本身。
 
-其余 10 个"从未被任何测试目标链接"的产线文件（`widget.cpp`、`form_finger.cpp`、
-`form_call.cpp`、`main.cpp` 等）仍未接入，见上文表格 —— 那是下一批待办。
+其余 8 个"从未被任何测试目标链接"的产线文件（`widget.cpp`、`form_finger.cpp`、
+`main.cpp` 等）仍未接入，见上文表格 —— 那是下一批待办。
+`form_call.cpp` 第 36 轮已接进 `t113_test_form_call`（见下文专节）。
 
 #### 故障注入夹具本身也暴露了两个问题
 
@@ -924,6 +938,71 @@ ALSA 播放 `/tmp/pcm/beep.pcm`（慢、依赖声卡、文件通常不存在）�
 > 本轮**不修**（改变"退格删几位"是用户可感知的行为变化），改为用特征化测试
 > 钉住现状。详见约定第 58 条。
 
+### 通话窗体：stopsend 的**发源地**，以及"两头都有测试、中间没人守"
+
+`src/ui/form_call.cpp` 是门口机**唯一**发出 `stopsend` 信令的地方，而
+`stopsend` 在硬约束清单里（TCP 8887 信令语义必须与 baseline 逐字节兼容）。
+
+第 36 轮之前的状态是**两头都有测试、中间没人守**：
+
+| 环节 | 此前由谁守 |
+|---|---|
+| `Signal::StopSend` ↔ wire 串 `"stopsend"` | `test_protocol.cpp`（toWire / fromWire / 前缀歧义） |
+| `SignalingClient::send()` 写出 `"stopsend\n"` | `test_signaling_client.cpp`、interop |
+| **"点下停止按钮 → stopsend 真的发出去"** | **无人守** |
+
+`form_call.cpp` 一直挂在"从未被任何测试目标链接的产线文件"清单上。于是
+把这一行删掉：
+
+```cpp
+widget->notifyPeerStopSend();     // -> TCP 8887 "stopsend\n"
+```
+
+此前**全部 15 个测试目标都会照常通过**。现场表现是"点了挂断，但室内机不知道
+本端已停发" —— 正是约定第 30 条"有测试 ≠ 被测到"的又一个实例。
+
+新增测试目标 `t113_form_call`（`tests/test_form_call.cpp`，20 个用例）。做法是
+起一个**真实** `QTcpServer` 监听，用**真实** `SignalingClient` 连上它，把真实
+`Widget` 替身挂成 `Form_CALL` 的父窗口，然后 `QTest::mouseClick` 真的点下停止
+按钮，最后断言**对端 socket 收到的字节恰好是 `"stopsend\n"`**。
+
+断言落在**线上字节**上，所以任何一处接线断裂都会红：不发、发错信令（`stop`
+而不是 `stopsend`）、发多次、漏掉结尾换行。
+
+替换了什么、没替换什么：
+
+| 用真的 | 用替身 |
+|---|---|
+| `form_call.cpp` / `form_call.ui`（真 uic） | `Widget`（`tests/shadows/ui/widget.h`） |
+| **真实** `SignalingClient` + 真实 TCP socket | `AudioManager`（影子头，避免真 ALSA） |
+| `QPushButton`、真实信号槽连接、`hangupRequested` 信号 | — |
+
+这里有个**必须说清的诚实边界**：唯一的替身 `Widget` 的
+`notifyPeerStopSend()` 是 3 行真实现的**副本**（真 `widget.cpp` 因依赖 OpenCV
+与整个主程序门面而无法链接）。副本对了不代表原件对 —— 所以静态规则
+`check_form_call_stopsend_is_wired` **单独去核对真 `src/ui/widget.cpp`** 里那个
+函数确实发的是 `Signal::StopSend`，而不是裸字符串。没有这一步，规则就退化成
+"替身和替身自己一致"，真实现漂移了照样发现不了。
+
+本目标还覆盖：`hangupRequested` 在**没有 `Widget` 祖先**时也照发（这是真实的
+失败模式：窗体被单独构造时就是这种父子关系）、点击不自己关窗口、`NoFocus`、
+半透明浮层属性、点停止打断提示音、计时器归零/停止/文案。另有一条**负面断言**：
+构造窗体本身不得发出任何信令 —— 缺了它，"点一下收到 stopsend"可能是构造时就
+发了（约定第 28 条）。
+
+故障注入自检见 `tools/verify_form_call_test.py`：**17 个变异全部被抓到**
+（含 5 种"把 stopsend 接线弄断"，其中"删掉那一行调用"是首要变异），
+1 个对照不误报，还原逐字节一致。
+静态契约自检见 `tools/verify_form_call_rule.py`：**12 个变异 + 1 个文件系统
+变异全部被抓到**，3 个对照不误报。
+
+> 本轮真实踩到的假绿：`startCallTimerShowsZeroAndRestartsTheCounter` 第一版只
+> 比较 `ui->label->text() == "通话中 00:00"`，而 `startCallTimer()` 末尾**无条件**
+> 写了 `ui->label->setText("通话中 00:00")` —— 于是把 `callSeconds = 0;` 删掉
+> 之后标签照样是 `00:00`，断言 rc=0（故障注入实测）。有判别力的判据是**下一次
+> tick 的秒数**：归零了下一个 tick 必然是 `00:01`，没归零就接着上次的数走。
+> 这与约定第 50 条（"没有判别力"的断言要当作没有断言）同源。
+
 ### 主机端编译验证（无 ALSA/libgpiod 的开发机可用）
 
 ALSA 与 libgpiod 是 Linux 专有接口，Windows/macOS 开发机上装不了；但没有
@@ -1110,7 +1189,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下六十条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下六十四条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -2628,6 +2707,82 @@ QString payloadAt(const QSignalSpy& spy, int i)
 修法：查**定义**形态，即 `TestFormPasswd::logCapturePipelineWorks\s*\(`。
 这与第 51 条（用词元边界而不是子串）是同一条：确认一个符号**存在且可用**，
 要匹配它的定义点，不是它任意一次被提及。
+
+### 61. 改源文件的脚本要有**不依赖 `finally`** 的还原保障
+
+第 36 轮真实事故：`tools/verify_form_call_test.py` 第一版把"原始内容"只放在
+**内存**里，靠 `finally` 还原。结果脚本跑到第一个变异（删掉
+`widget->notifyPeerStopSend();` 那一行）时被**从外部强杀**，`finally` 根本没
+机会执行，仓库里就留下了一个**被变异过的源文件**。
+
+它的可怕之处在于**看起来完全正常**：只是少了一行，没有语法错误、没有标记。
+直到下一次运行在启动预检时报"锚点出现 0 次"才暴露出来。如果那个变异恰好是
+"把信令改成 stop"这种语义错误，它会被原样提交上去。
+
+三道防线（缺一不可）：
+
+1. **磁盘上的原始副本**，不只在内存里 —— `<临时目录>/fi36_pristine/`；
+2. **启动自愈**：若发现磁盘副本与当前文件不同，先用副本还原再干活。于是
+   上一次被强杀留下的污染会被**下一次运行自动修好**；
+3. **信号处理器 + `atexit`**：`SIGINT`/`SIGTERM`/`SIGBREAK` 也走还原。
+
+`finally` 仍然保留（正常流程用），但它**不是**唯一保障。这条与第 33 轮
+"不要 `job_kill` 一个正在改源文件的夹具"是同一件事的两面：前者是操作纪律，
+这条是让脚本自己扛得住纪律失守。
+
+### 62. 规则要限定在**拥有该性质的那个用例体内**，不能全文件搜
+
+第 36 轮实例：`check_form_call_stopsend_is_wired` 要确认"断言落在线上字节上"，
+第一版写成全文件搜 `QByteArray`。故障注入实测**两次假绿**：
+
+- 第一次：把 `QCOMPARE(got, QByteArray("stopsend\n"))` 换成 `QVERIFY(true)`，
+  文件**别处**仍有 `QByteArray` 用法（`QByteArray("call\n")` 等），rc=0；
+- 补上字面量匹配后**仍然**假绿：同一个 `QCOMPARE(got, QByteArray("stopsend\n"))`
+  在**另一个用例**里也有一份，删掉主用例那一份，全文件搜照样命中。
+
+修法：用 `_function_body()` 先框出
+`TestFormCall::clickingStopSendsExactlyStopSendOnTheWire`，**只在它内部**找。
+这与第 34 条（宽松正则一旦有第二处同形代码就静默失效）是同一类；也和
+`_cmake_call_containing()` 用"作用域内匹配"替换宽松正则是同一招。
+
+### 63. 需要匹配**字符串字面量**时，用第三种剥离器（只挖注释）
+
+第 36 轮发现前两个剥离器都不适用：
+
+- `strip_comments_and_strings()` 会把字符串内容**清空** —— 用来查
+  `"stopsend\n"` 这类线上字节字面量的检查会变成真空命中/真空不命中，两端都
+  没有意义；
+- `strip_comments_and_strings_cmake()` 把 `#` 当注释起点 —— 用在 C++ 上会把
+  `#include`、`#error` 整条删掉（第 35 轮已踩过一次）。
+
+于是新增 `strip_comments_only()`：挖 `//` 与 `/* */`，**保留字符串字面量**，
+保留换行（行号不漂移）。选择剥离器取决于**要匹配的东西在不在字符串里**：
+
+| 要匹配的东西 | 用哪个 |
+|---|---|
+| 注释里也会出现的代码标识符（`Q_OBJECT`、`#error`） | `strip_comments_and_strings` |
+| 线上字节字面量（`"stopsend\n"`） | `strip_comments_only` |
+| CMake 参数（几乎全是带引号的） | `strip_comments_and_strings_cmake` |
+
+### 64. 夹具的锚点不要钉在**会漂移的文案**上
+
+第 36 轮连带修的：`verify_form_passwd_rule.py` 里两条"去掉影子头 `#error`
+安全阀"的变异，锚点是 `#error` 那行的**整句中文文案**。本轮给两个影子头的
+安全阀加上了第二个测试宏（`ACC_FORM_CALL_TEST`）之后，文案一变，夹具立刻报
+"锚点出现 0 次"——**规则本身是对的**，是夹具把自己测坏了。
+
+同一个文件里还有第三条：`shadows/ui/widget.h` 那行在**两个**
+`add_executable` 里都出现之后，裸行锚点命中 2 次。
+
+修法：
+1. 安全阀两条改为**正则变异**（`RX_MUT`），锚在 `#\s*error\s` 这个**指令**
+   本身。被测属性是"安全阀存在"，不是那句文案 —— 锚在文案上等于让夹具去测
+   一件与规则无关的东西。
+2. 影子头那条锚点**带上目标名**，恢复唯一性。
+
+这与第 39 条（锚点必须唯一，且要唯一到正确的那个函数）是同一条：**新增一个
+同形的目标/文件之后，所有"裸锚点"都要重新检查唯一性**。接新测试目标时这是
+最容易漏掉的一步 —— 它不会让任何测试变红，只会让**验证工具本身**静默失效。
 
 ## 开发约定
 

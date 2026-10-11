@@ -25,14 +25,15 @@
  *   - 替身让测试能断言"按数字键确实会响一声"（提示音是产品行为，不能被
  *     顺手删掉），以及"传给播放器的路径就是 AppConfig::pcmFile() 的结果"。
  *
- * 安全阀：只有定义了 `ACC_FORM_PASSWD_TEST` 的目标才能命中，否则 `#error`。
+ * 安全阀：只有定义了 `ACC_FORM_PASSWD_TEST` 或 `ACC_FORM_CALL_TEST` 的目标
+ * 才能命中，否则 `#error`。
  * 本头带 Q_OBJECT，必须被显式列进 `add_executable` 的源列表让 AUTOMOC 处理。
  */
 #ifndef ACCESSTERMINAL_T113_TESTS_SHADOWS_AUDIO_MANAGER_H
 #define ACCESSTERMINAL_T113_TESTS_SHADOWS_AUDIO_MANAGER_H
 
-#ifndef ACC_FORM_PASSWD_TEST
-#  error "影子 managers/audio_manager.h 只能用于测试；请定义 ACC_FORM_PASSWD_TEST"
+#if !defined(ACC_FORM_PASSWD_TEST) && !defined(ACC_FORM_CALL_TEST)
+#  error "影子 managers/audio_manager.h 只能用于测试；请定义 ACC_FORM_PASSWD_TEST 或 ACC_FORM_CALL_TEST"
 #endif
 
 #include <QObject>

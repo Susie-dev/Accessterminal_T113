@@ -630,3 +630,72 @@ add_test(NAME t113_form_passwd COMMAND t113_test_form_passwd)
 set_tests_properties(t113_form_passwd PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
 )
+
+# ---------------------------------------------------------------------------
+# 通话窗体（src/ui/form_call.cpp）—— **stopsend 的发源地**
+#
+# 为什么值得测：form_call.cpp 是门口机唯一发出 stopsend 信令的地方，而
+# stopsend 在硬约束清单里（TCP 8887 信令语义必须与 baseline 逐字节兼容）。
+#
+# 此前两头都有测试、中间没人守：
+#   - protocol.h 的 StopSend <-> "stopsend" 映射：test_protocol.cpp 有；
+#   - SignalingClient::send(StopSend) 写出 "stopsend\n"：test_signaling_client
+#     与 interop 有；
+#   - **"点下停止按钮 -> stopsend 真的被发出去"这条接线：没有**。
+#     form_call.cpp 一直挂在"从未被任何测试目标链接的产线文件"清单上。
+#
+# 后果：把 `widget->notifyPeerStopSend();` 那一行删掉，此前全部测试目标都会
+# 照常通过 —— 现场表现为"点了挂断，但室内机不知道本端已停发"。
+#
+# 本目标的做法：起**真实** QTcpServer + **真实** SignalingClient，把真实
+# Widget 替身挂成父窗口，真的点下按钮，断言**对端收到的字节恰好是
+# "stopsend\n"**。断言落在线上字节上，因此"不发、发错、发两次、漏了换行"
+# 都会红。
+#
+# 复用第 35 轮的两个影子头（widget.h 已扩展出 notifyPeerStopSend() 与
+# setSignalingClientForTest()），安全阀宏换成 ACC_FORM_CALL_TEST。
+# 注意：SignalingClient 用**真实实现**，不用替身。
+# ---------------------------------------------------------------------------
+qt5_wrap_ui(T113_FORM_CALL_UIS
+    ${ACCESSTERMINAL_SRC_ROOT}/ui/form_call.ui
+)
+
+add_executable(t113_test_form_call
+    test_form_call.cpp
+    # 影子头必须列进来，AUTOMOC 才会为它们生成元对象
+    ${CMAKE_CURRENT_LIST_DIR}/shadows/ui/widget.h
+    ${CMAKE_CURRENT_LIST_DIR}/shadows/managers/audio_manager.h
+    ${ACCESSTERMINAL_SRC_ROOT}/ui/form_call.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/config/app_config.cpp
+    # 真实信令客户端：stopsend 必须真的走到 TCP 上
+    ${ACCESSTERMINAL_SRC_ROOT}/core/net/signaling_client.cpp
+    ${T113_FORM_CALL_UIS}
+)
+
+# BEFORE：影子 ui/widget.h 与 managers/audio_manager.h 必须排在真头之前命中。
+target_include_directories(t113_test_form_call BEFORE PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/shadows
+)
+
+target_include_directories(t113_test_form_call PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_BINARY_DIR}                   # ui_form_call.h（uic 产物）
+)
+
+target_compile_definitions(t113_test_form_call PRIVATE
+    ACC_FORM_CALL_TEST
+)
+
+target_link_libraries(t113_test_form_call PRIVATE
+    Qt5::Core
+    Qt5::Test
+    Qt5::Gui
+    Qt5::Widgets
+    Qt5::Network                                  # QTcpServer / QTcpSocket
+)
+
+add_test(NAME t113_form_call COMMAND t113_test_form_call)
+
+set_tests_properties(t113_form_call PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+)

@@ -71,13 +71,12 @@ MUT = [
      '    // 上面三条"日志里没有 X"的断言都依赖捕获管道真的在工作。\n'),
 
     # ---- 安全阀被去掉 ----
-    ("去掉影子 Widget 的 #error 安全阀", SW,
-     '#  error "影子 ui/widget.h 只能用于测试；请在测试目标上定义 '
-     'ACC_FORM_PASSWD_TEST"', '// 安全阀被移除'),
-
-    ("去掉影子 AudioManager 的 #error 安全阀", SA,
-     '#  error "影子 managers/audio_manager.h 只能用于测试；请定义 '
-     'ACC_FORM_PASSWD_TEST"', '// 安全阀被移除'),
+    #
+    # 用**正则**而不是逐字文本：第 36 轮给两个影子头的安全阀加上了第二个
+    # 测试宏（ACC_FORM_CALL_TEST），`#error` 的文案随之改变，逐字锚点当场
+    # 失效（"锚点出现 0 次"）。安全阀的**存在**才是被测属性，文案不是 ——
+    # 锚在文案上会让夹具每次改文案都误报"夹具错误"。
+    # 见 RX_MUT 里的说明。
 
     # ---- 影子头 Q_OBJECT 被去掉 ----
     ("去掉影子 Widget 的 Q_OBJECT（编译期静态断言）", SW,
@@ -85,7 +84,14 @@ MUT = [
      'class Widget : public QWidget\n{\n'),
 
     # ---- 影子头没被列进源列表 ----
+    #
+    # 锚点必须带上目标名：第 36 轮新增 t113_test_form_call 之后，
+    # `shadows/ui/widget.h` 这一行在**两个** add_executable 里都出现，
+    # 裸行会命中 2 次（"锚点出现 2 次"）。这是夹具自身的锚点唯一性问题。
     ("影子头没列进 add_executable 源列表", CM,
+     'add_executable(t113_test_form_passwd\n'
+     '    test_form_passwd.cpp\n'
+     '    # 影子头必须列进来，AUTOMOC 才会为它们生成元对象\n'
      '    ${CMAKE_CURRENT_LIST_DIR}/shadows/ui/widget.h\n', ''),
 
     # ---- 测试没接进 CMake ----
@@ -109,6 +115,20 @@ MUT = [
 # 当然仍为真，规则不报是对的。真正的"夹具没了"必须是**文件消失**。
 FS_MUT = [
     ("故障注入夹具被改名（规则找不到它）", FX),
+]
+
+# 用**正则**替换的变异：(名字, 路径, 正则, 替换)。
+#
+# 为什么需要这一组：安全阀的 `#error` 文案在轮次间会变（第 36 轮给它加了
+# 第二个测试宏 ACC_FORM_CALL_TEST），逐字锚点立刻就"锚点出现 0 次"。
+# 而**被测属性是"#error 指令存在"**，不是那句中文文案 —— 锚在文案上等于
+# 让夹具去测一件与规则无关的事，每次改文案都要修夹具。
+# 正则锚在指令本身，文案怎么改都不影响。
+RX_MUT = [
+    ("去掉影子 Widget 的 #error 安全阀", SW,
+     r"#\s*error\s", "// 安全阀被移除"),
+    ("去掉影子 AudioManager 的 #error 安全阀", SA,
+     r"#\s*error\s", "// 安全阀被移除"),
 ]
 
 CTRL = [
@@ -162,6 +182,34 @@ def main():
                       % (name, r.returncode))
                 problems.append(name)
 
+            io.open(p, 'w', encoding='utf-8', newline='\n').write(_ORIG[p])
+
+        print()
+        # 正则变异：锚在指令本身，不锚在会漂移的文案上。
+        for name, p, pat, rep in RX_MUT:
+            new_text, n = re.subn(pat, rep, _ORIG[p], count=1)
+            if n != 1:
+                print('  [夹具错误] %-46s 正则命中 %d 次（期望 1）%s'
+                      % (name, n, pat))
+                problems.append(name)
+                continue
+            io.open(p, 'w', encoding='utf-8',
+                    newline='\n').write(new_text)
+            if read(p) == _ORIG[p]:
+                print('  [夹具错误] %-46s 文件未变' % name)
+                problems.append(name)
+                io.open(p, 'w', encoding='utf-8',
+                        newline='\n').write(_ORIG[p])
+                continue
+            r = run_verify()
+            out = (r.stdout + r.stderr).decode('utf-8', 'replace')
+            hits = re.findall(r'^\s*X (\[form-passwd\][^\n]*)', out, re.M)
+            if r.returncode != 0 and hits:
+                print('  %-46s 被抓到 ✓ %s' % (name, hits[0][:44]))
+            else:
+                print('  %-46s *** 未被抓到（假绿）rc=%d'
+                      % (name, r.returncode))
+                problems.append(name)
             io.open(p, 'w', encoding='utf-8', newline='\n').write(_ORIG[p])
 
         print()
@@ -220,8 +268,9 @@ def main():
         if '结论' in l:
             print('还原后:', l.strip())
     print()
-    print('变异 %d 个，文件系统变异 %d 个，对照 %d 个，致命问题 %d 个'
-          % (len(MUT), len(FS_MUT), len(CTRL), len(problems)))
+    print('变异 %d 个，正则变异 %d 个，文件系统变异 %d 个，对照 %d 个，'
+          '致命问题 %d 个'
+          % (len(MUT), len(RX_MUT), len(FS_MUT), len(CTRL), len(problems)))
     if problems:
         print('问题清单:', problems)
     return 1 if (problems or not same) else 0

@@ -266,6 +266,27 @@ def strip_comments_and_strings(text):
     return text
 
 
+def strip_comments_only(text):
+    r"""只挖掉注释，**保留字符串字面量**。
+
+    为什么需要第三个变体（第 36 轮）：
+      - `strip_comments_and_strings()` 把字符串内容清空 —— 用来查"线上字节"
+        这类**字面量**的检查会变成真空成立（`"stopsend\n"` 被掏空后就找不到了，
+        于是"断言落在线上字节上"这条规则恒报失败或恒通过，都无意义）；
+      - `strip_comments_and_strings_cmake()` 把 `#` 当注释起点 —— 用在 C++ 上
+        会把 `#include`、`#error` 全删掉。
+
+    于是这里给"需要保留字符串、又要避免把注释里的示例当代码"的检查用。
+    换行符保留，行号不漂移。
+    """
+    def blank_keep_newlines(m):
+        return re.sub(r"[^\n]", " ", m.group(0))
+
+    text = re.sub(r"/\*.*?\*/", blank_keep_newlines, text, flags=re.S)
+    text = re.sub(r"//[^\n]*", "", text)
+    return text
+
+
 def split_top_level_args(call):
     """
     按**顶层逗号**切分一个调用/参数列表文本，返回实参列表。
@@ -3497,6 +3518,38 @@ def _cmake_call_containing(text, command, marker):
     return None
 
 
+def _function_body(text, qualified_name):
+    r"""返回 `qualified_name` 函数体的花括号内文本；找不到返回 None。
+
+    为什么要这个（第 36 轮）：`check_form_call_stopsend_is_wired` 需要核对
+    **真** `Widget::notifyPeerStopSend()` 的实现，但全文件搜索
+    `Signal::StopSend` 是不够的 —— 同一个 .cpp 里别处也可能出现该标识符
+    （注释、其它函数），匹配会变成"文件里某处有"而不是"这个函数里有"。
+
+    做法：先定位 `qualified_name` 后面第一个 `{`（跳过可能的 `const`、
+    参数表等），再按花括号深度配对取到配对的 `}`。取不到就返回 None，
+    让调用方报"规则自身需修复"而不是假通过。
+
+    前提：调用方应传入**已剥离注释**的文本，否则注释里的花括号会打乱配对。
+    """
+    marker = qualified_name + "("
+    i = text.find(marker)
+    if i < 0:
+        return None
+    j = text.find("{", i + len(marker))
+    if j < 0:
+        return None
+    depth = 0
+    for k in range(j, len(text)):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[j + 1:k]
+    return None
+
+
 def check_form_passwd_contract_is_pinned(root, src_root):
     r"""
     密码输入窗体（`src/ui/form_passwd.cpp`）必须由**运行期测试**守住，而且
@@ -3734,6 +3787,187 @@ def check_cross_repo_test_targets_are_unique(root, extra_root):
                      "请给用例名加仓库前缀。".format(la, lb, ", ".join(sorted(dup_c))))
 
 
+def check_form_call_stopsend_is_wired(root, src_root):
+    r"""
+    通话窗体（`src/ui/form_call.cpp`）的 **stopsend 发源地**必须由运行期测试
+    守住，且 `Widget::notifyPeerStopSend()` 的真实现必须与替身保持一致。
+
+    背景（第 36 轮）
+    ---------------
+    `form_call.cpp` 是门口机**唯一**发出 `stopsend` 信令的地方，而 `stopsend`
+    在硬约束清单里（TCP 8887 信令语义必须与 baseline 逐字节兼容）。
+
+    此前**两头都有测试、中间没人守**：
+      - `protocol.h` 的 `StopSend` <-> `"stopsend"` 映射 —— `test_protocol.cpp` 有；
+      - `SignalingClient::send(StopSend)` 写出 `"stopsend\n"` ——
+        `test_signaling_client.cpp` 与 interop 有；
+      - **"点下停止按钮 → stopsend 真的被发出去"这条接线 —— 没有任何目标覆盖。**
+        `form_call.cpp` 一直挂在"从未被任何测试目标链接的产线文件"清单上。
+
+    后果：把 `widget->notifyPeerStopSend();` 那一行删掉，此前全部 15 个测试
+    目标都会照常通过。现场表现是"点了挂断，但室内机不知道本端已停发"。
+
+    第 36 轮补上 `t113_test_form_call`：起真实 `QTcpServer` + 真实
+    `SignalingClient`，真的点下按钮，断言对端收到的字节恰好是 `"stopsend\n"`。
+
+    本规则钉住四件事（都是"真跑一次"之外还能静态守住的部分）：
+      1. 测试目标接进了 tests/CMakeLists.txt（含影子头与 BEFORE）；
+      2. 断言落在**线上字节**上（有 `"stopsend\\n"` 与 `QByteArray` 比较），
+         而不是只查"某个信号发过"；
+      3. **真实 `Widget::notifyPeerStopSend()` 的实现**确实发的是
+         `Signal::StopSend`（不是 `Stop`，也不是裸字符串）—— 替身只是它的
+         副本，副本对了不代表原件对；
+      4. 故障注入夹具在（证明断言真的会失败）。
+
+    第 3 条特别重要：测试用的是 `tests/shadows/ui/widget.h` 里的替身，真
+    `widget.cpp` 因依赖 OpenCV 与整个主程序门面而无法链接。若只测替身，规则
+    就变成"替身和替身自己一致"，真实现漂移了也发现不了。所以这里**单独**
+    对 `src/ui/widget.cpp` 做检查。
+
+    能力边界：这是形态检查，**不能**替代真跑一次。它与
+    `tools/verify_form_call_test.py` 的故障注入互补。
+    """
+    tests_dir = os.path.join(root, "tests")
+    tf = os.path.join(tests_dir, "test_form_call.cpp")
+    cm = os.path.join(tests_dir, "CMakeLists.txt")
+
+    if not os.path.exists(tf):
+        fail("[form-call] 缺少 tests/test_form_call.cpp —— stopsend 的**发源地**"
+             "（form_call.cpp）没有运行期测试。它的信令语义在硬约束清单里，"
+             "此前 wire 串与 SignalingClient 都有测试，但『点按钮 → 真的发出』"
+             "这条接线无人覆盖：删掉 notifyPeerStopSend() 调用后全部目标照常"
+             "通过（第 36 轮故障注入实测）。")
+        return
+
+    # 与 form-passwd 同款：所有匹配跑在**注释被挖空**的文本上。
+    # 教训见 check_form_passwd_contract_is_pinned 的说明（第 43 条）。
+    cm_raw = read(cm) if os.path.exists(cm) else ""
+    cm_code = strip_comments_and_strings_cmake(cm_raw)
+    text_code = strip_comments_and_strings(read(tf))
+
+    if os.path.exists(cm):
+        exe_call = _cmake_call_containing(cm_code, "add_executable",
+                                          "test_form_call.cpp")
+        if exe_call is None:
+            fail("[form-call] tests/CMakeLists.txt 里找不到包含 "
+                 "test_form_call.cpp 的 add_executable() 调用 —— "
+                 "tests/test_form_call.cpp 没有接进构建，写了但不会跑。")
+        else:
+            for need_file, why in (
+                    ("shadows/ui/widget.h",
+                     "form_call.cpp 沿父链 qobject_cast<Widget*> 取 audioManager()"
+                     " 与 notifyPeerStopSend()，没有它编译不过"),
+                    ("core/net/signaling_client.cpp",
+                     "stopsend 必须真的走到 TCP 上；不给真实实现，断言就退化成"
+                     "『替身自己记了一笔』，测不到线上字节")):
+                if need_file not in exe_call:
+                    fail("[form-call] t113_test_form_call 的 add_executable() "
+                         "没有列出 %s —— %s。" % (need_file, why))
+
+        inc_call = _cmake_call_containing(cm_code, "target_include_directories",
+                                          "t113_test_form_call")
+        if inc_call is None:
+            fail("[form-call] tests/CMakeLists.txt 里找不到 "
+                 "t113_test_form_call 的 target_include_directories() —— "
+                 "影子头不会被命中，测试会去用真 ui/widget.h（拖进 OpenCV）。")
+        elif "shadows" not in inc_call:
+            fail("[form-call] t113_test_form_call 的 target_include_directories()"
+                 " 没有把 shadows 目录加进去 —— 影子头不会被命中。")
+        elif "BEFORE" not in inc_call:
+            fail("[form-call] 影子头的 target_include_directories 没有 BEFORE "
+                 "—— 真 src/ui/widget.h 会先被找到，影子形同虚设。")
+
+        if "ACC_FORM_CALL_TEST" not in cm_code:
+            fail("[form-call] 测试目标没有定义 ACC_FORM_CALL_TEST —— 影子头"
+                 "（tests/shadows/ui/widget.h、shadows/managers/audio_manager.h）"
+                 "的安全阀就是靠这个宏。未定义时影子头会 #error；若哪天有人把"
+                 "安全阀去掉，产线目标就可能拿到替身跑，而编译链接一切正常 "
+                 "—— 那是最危险的一类错误。")
+
+    # 2) 断言必须落在**线上字节**上，且字面量就是 `"stopsend\n"`。
+    #
+    #    只查"文件里出现 QByteArray"是**太弱的**：第 36 轮故障注入实测，把
+    #    `QCOMPARE(got, QByteArray("stopsend\n"))` 换成 `QVERIFY(true)` 之后，
+    #    文件里别处仍有 QByteArray 用法，规则 rc=0（假绿）。
+    #    改成也查字面量后仍有一次假绿：同一个断言在**另一个用例**里也有一份，
+    #    删掉主用例那一份，全文件匹配照样命中。
+    #
+    #    所以必须**限定在拥有该性质的用例体内**（第 34 条教训：宽松正则一旦
+    #    有第二处同形代码就静默失效）。用 _function_body 框出
+    #    `clickingStopSendsExactlyStopSendOnTheWire`，只在它内部找。
+    #
+    #    这里用 strip_comments_only（保留字符串）：若用挖空字符串的版本，
+    #    `"stopsend\n"` 会被掏空，检查恒不命中。
+    text_lit = strip_comments_only(read(tf))
+    case_body = _function_body(
+        text_lit, "TestFormCall::clickingStopSendsExactlyStopSendOnTheWire")
+    if case_body is None:
+        fail("[form-call] test_form_call.cpp 里找不到 "
+             "TestFormCall::clickingStopSendsExactlyStopSendOnTheWire 的用例"
+             "定义 —— 这是钉住『点下停止按钮 -> TCP 上出现 stopsend\\n』的"
+             "唯一用例（规则自身也靠它定位）。改名或删除都会让本规则失去"
+             "作用对象。")
+    elif not re.search(r'QByteArray\s*\(\s*"stopsend\\n"\s*\)', case_body):
+        fail("[form-call] clickingStopSendsExactlyStopSendOnTheWire 用例体里"
+             "找不到 QByteArray(\"stopsend\\n\") 这样的比较 —— stopsend 的断言"
+             "没有落在**线上字节**上，或者换行丢了。只查信号/标志位的断言无法"
+             "区分『发了 stopsend』『发了 stop』『什么都没发』；而漏掉 \\n 会让"
+             "室内机的行解码器一直等下一个包，现场表现是『点了挂断，室内机"
+             "没反应』。")
+
+    # 3) 真实现必须发 Signal::StopSend。
+    #
+    #    测试用替身（shadows/ui/widget.h），真 widget.cpp 链接不进来。若不管
+    #    真实现，规则就退化成"替身与替身自己一致"。
+    widget_cpp = os.path.join(src_root, "ui", "widget.cpp")
+    if not os.path.exists(widget_cpp):
+        fail("[form-call] 找不到 src/ui/widget.cpp —— 无法核对 "
+             "Widget::notifyPeerStopSend() 的真实现。")
+    else:
+        body = _function_body(strip_comments_and_strings(read(widget_cpp)),
+                              "Widget::notifyPeerStopSend")
+        if body is None:
+            fail("[form-call] src/ui/widget.cpp 里找不到 "
+                 "Widget::notifyPeerStopSend() 的函数体 —— form_call.cpp 的"
+                 "停止按钮就是靠它把 stopsend 发出去的，删了会导致『点挂断"
+                 "不发信令』（第 36 轮故障注入实测：这正是最容易被漏掉的一处）。")
+        else:
+            if "Signal::StopSend" not in body:
+                fail("[form-call] Widget::notifyPeerStopSend() 的实现里没有 "
+                     "Signal::StopSend —— 它是 stopsend 的**唯一**发送点。"
+                     "写成 Signal::Stop（前缀歧义）会让室内机语义完全错位："
+                     "stop 是『停止取流』，stopsend 是『本端停止发送』。")
+            if re.search(r'"\s*stopsend', body):
+                fail("[form-call] Widget::notifyPeerStopSend() 里出现了裸字符串 "
+                     '"stopsend" —— 信令必须经 protocol::frame()/toWire() 生成，'
+                     "裸写会绕过协议表单点，将来改表就会漏掉这一处。")
+
+    # 4) 故障注入夹具必须在。
+    fx = os.path.join(root, "tools", "verify_form_call_test.py")
+    if not os.path.exists(fx):
+        fail("[form-call] 缺少 tools/verify_form_call_test.py —— 没有故障注入"
+             "就无法证明这些断言**真的会失败**。不失败的回归测试没有价值。")
+
+    # 5) 影子头安全阀 + Q_OBJECT + notifyPeerStopSend 声明。
+    w = os.path.join(root, "tests", "shadows", "ui", "widget.h")
+    if os.path.exists(w):
+        w_code = strip_comments_and_strings(read(w))
+        if not re.search(r"#\s*error\b", w_code):
+            fail("[form-call] 影子 ui/widget.h 没有安全阀（缺 #error 预处理"
+                 "指令）。产线目标一旦误命中替身就会拿假实现跑，而编译链接"
+                 "一切正常 —— 必须用 ACC_FORM_CALL_TEST 把它挡住。")
+        if "notifyPeerStopSend" not in w_code:
+            fail("[form-call] 影子 ui/widget.h 没有 notifyPeerStopSend() —— "
+                 "form_call.cpp 的停止按钮调它发 stopsend，缺了就编译不过，"
+                 "测试会退化成『只看源码文本』。")
+        # 用**带括号**的匹配，而不是裸标识符：第 36 轮故障注入实测，
+        # 把声明改成 `notifyPeerStopSendGone()` 后裸子串检查照样命中
+        # （前者是后者的子串），规则 rc=0（假绿）。
+        elif not re.search(r"\bnotifyPeerStopSend\s*\(", w_code):
+            fail("[form-call] 影子 ui/widget.h 里 notifyPeerStopSend 不是一个"
+                 "可调用的声明（找不到 `notifyPeerStopSend(`）—— 名字被改坏后"
+                 "form_call.cpp 编译不过，测试会退化成『只看源码文本』。")
+
 def main():
     if len(sys.argv) < 2:
         print("用法: python verify.py <项目根目录> [另一仓库根目录]")
@@ -3785,6 +4019,7 @@ def main():
     check_v4l2_camera_failure_paths_are_testable(root, src_root)
     check_fault_harnesses_classify_crashes_correctly(root, src_root)
     check_form_passwd_contract_is_pinned(root, src_root)
+    check_form_call_stopsend_is_wired(root, src_root)
     check_fake_fingerprint_builds_same_bytes(root, src_root)
     check_fingerprint_checksum_logic_is_not_duplicated(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)
