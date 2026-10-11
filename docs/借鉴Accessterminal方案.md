@@ -250,6 +250,28 @@ Password, TempCode, Remote}`、唯一的 `unlock(userId, method, note)`、
 
 **验收门**：分层在 UI 层重新成立 · `dead-slot` 归零 · 音效时序测试全绿。
 
+> **实施记录（第 40 轮，部分完成）** —— 实际落地与计划的差异：
+> 1. 本轮做的是 P1-a：新增 `AccessController`（放行记账 + 静默期 + 语义化
+>    信号），四条认证路径收敛到它；**P1-b/P1-c（把提示音策略与人脸检测调度
+>    搬进来）尚未做** —— 那两步是纯位移、风险集中，单独一轮做更稳。
+> 2. 静默期默认 **0 = 保持现状**，取非 0 属行为变更，已记为待裁决事项
+>    （见 `docs/交接与继续开发.md` 的【决策】）。
+> 3. `dead-slot` 从 3 条降到 **1 条**（不是 0）：两个 `Widget` 死槽已删，
+>    剩下的 `FingerprintManager::startEnroll()` 是公开 API + 有测试，
+>    接不接线需要拍板，已记为【决策】第 3 条。
+> 4. 顺手修掉了 P0 的一个疏漏：`requestUnlock` 原先被写在**不可达**的
+>    `Widget::onFingerprintIdentify` 里，等于指纹成功并不开锁。本轮把开锁
+>    接到**现场真正执行**的 `identifyResult` lambda 上，并删掉那两个死槽。
+> 5. 出口链变成三级（widget → AccessController → DoorActuator），规则
+>    `[actuator]` 的第 ③④ 项随之改成"widget 必须调中枢"+"`->unlock(` 只能
+>    出现在 `access_controller.cpp`"。**这条规则的第一版被夹具抓到假绿**：
+>    它只匹配 `m_actuator->unlock(`，改成 `m_doorActuator->unlock(s)` 就漏报，
+>    现已按调用形式匹配（4/4 变异抓到、2/2 对照不误报）。
+>
+> 实测：`ctest` 20/20（110.64s）· `verify.py` rc=0（9 项告警，其中 8 项是既有的
+> `fp-ack-tag`，1 项是上面那条待裁决的 `dead-slot`）· 20/20 个 `.cpp` 主机端
+> 语法检查通过。
+
 ---
 
 ### P2 · 凭据与安全模型（1.5 天）
@@ -305,6 +327,22 @@ Password, TempCode, Remote}`、唯一的 `unlock(userId, method, note)`、
 | 噪声注释 | 5 个遗留模块里 275 行机器生成的 `// 逐行注释：…`，其中部分已失真（如 `video_push_thread.h:12` 写的头文件路径已过时） |
 | 跨平台缺口 | 交接文档第五节记录的 `tools/devstubs/sys/socket.h` 里 `#include <_mingw.h>`（属 P8），建议与本阶段一并修掉 |
 | 缺陷台账 | 把 A 的 **40 条缺陷台账**逐条对照本项目，产出 `docs/借鉴核对表.md`：哪些本项目也存在、哪些已修、哪些不适用 |
+
+> **实施记录（第 40 轮，部分完成）**：
+> - ✅ Qt 5.9 API 违规：已修（提交 `修复 Qt 5.9 兼容性…`），并补了规则与夹具。
+> - ✅ 跨平台缺口（devstubs）：已修（提交 `devstubs: 让主机端检查在 Linux 上可用`），
+>   18/18 → 20/20 ctest 可跑。
+> - ✅ `tools/check_host_compile.sh` 支持 Linux：本轮补了 Qt/OpenCV/mkspecs 的
+>   自动定位、QtSerialPort 头目录与 `-fPIC`（Linux 分支；MinGW 分支逐条保持
+>   原样），现在 `bash tools/check_host_compile.sh` 在 Linux 上**开箱即用**，
+>   实测 20/20 通过。唯一仍需外部变量的是 `QTSP_INC`（QtSerialPort dev 包
+>   解出来的位置）。
+> - ✅ README 两处失真：配置查找顺序（4 级 → 实际的 2 级）与
+>   `run_interop.sh` 的平台限制，都已改正并标注"第 40 轮更正"。
+> - ⬜ 未做：人脸分类器路径三处不一致（`app_config.cpp` 的默认值、
+>   CMake `install()`、`deploy/install.sh`）—— 需要先决定"哪个是规范路径"，
+>   属决策类工作；275 行机器生成噪声注释的清理；A 的 40 条缺陷对照台账
+>   （其中 A 的第 39/40 条是真实的指纹解析缺陷，值得单独核对本项目是否同病）。
 
 ---
 

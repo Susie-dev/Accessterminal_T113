@@ -4319,13 +4319,35 @@ def check_door_actuator_is_the_only_unlock_path(root, src_root):
                 fail("[actuator] %s 的 %s() 里直接写 GPIO 电平 —— "
                      "开锁必须经过 DoorActuator（唯一出口）" % (rel, fname))
 
-    # ③ 执行器必须真的被调用
+    # ③ 唯一出口链：widget -> AccessController -> DoorActuator
     widget = os.path.join(src_root, "ui", "widget.cpp")
     if os.path.exists(widget):
         text = strip_comments_and_strings(read(widget))
-        if "m_doorActuator->unlock(" not in text:
-            fail("[actuator] src/ui/widget.cpp 里找不到 m_doorActuator->unlock( "
-                 "调用 —— 执行器成了死代码，或开锁被绕到别处去了")
+        if "m_accessController->request(" not in text:
+            fail("[actuator] src/ui/widget.cpp 里找不到 m_accessController->request( "
+                 "调用 —— 放行决策被绕开，或中枢成了死代码")
+    # ④ 电气动作只能由 AccessController 发起（不许别处直接 unlock 执行器）
+    #
+    # 判据用 `->unlock(` / `.unlock(` 的**调用形式**，而不是某一个成员名：
+    # 第 40 轮的故障注入实测，只匹配 `m_actuator->unlock(` 时，把调用写成
+    # `m_doorActuator->unlock(s)` 就整处漏报（规则假绿）。本工程里没有其它
+    # 类的成员叫 unlock，因此这个判据不误报。
+    actuator_caller = "src/managers/access_controller.cpp"
+    found_caller = False
+    call_re = re.compile(r"(?:->|\.)\s*unlock\s*\(")
+    for path in find_files(src_root, {".cpp"}):
+        rel = os.path.relpath(path, root).replace("\\", "/")
+        text = strip_comments_and_strings(read(path))
+        if not call_re.search(text):
+            continue
+        if rel != actuator_caller:
+            fail("[actuator] %s 里直接调用了执行器的 unlock() —— 开锁的电气动作"
+                 "只能由 AccessController 发起（唯一出口链）" % rel)
+        else:
+            found_caller = True
+    if not found_caller:
+        fail("[actuator] %s 里没有 unlock() 调用 —— "
+             "放行中枢没有真正驱动门锁" % actuator_caller)
 
 
 def main():

@@ -44,12 +44,12 @@ WIDGET = os.path.join(T, "src", "ui", "widget.cpp")
 ACTUATOR = os.path.join(T, "src", "managers", "door_actuator.cpp")
 PY = sys.executable
 
-# 唯一开锁出口的那一行（锚点）：它必须逐字节存在，否则夹具已过期。
-UNLOCK_CALL = "    m_doorActuator->unlock(source);\n"
-# 危险回退：绕开执行器，直接驱动补光那条线
+# 唯一放行出口的那一行（锚点）：它必须逐字节存在，否则夹具已过期。
+UNLOCK_CALL = "    m_accessController->request(method, source);\n"
+# 危险回退：绕开中枢，直接驱动补光那条线
 BAD_UNLOCK = "    m_fillLight->setValue(1);\n"
-# 另一种回退：把出口删掉（执行器变死代码）
-NO_UNLOCK = "    Q_UNUSED(source);\n"
+# 另一种回退：把出口删掉（中枢成了死代码）
+NO_UNLOCK = "    Q_UNUSED(method);\n    Q_UNUSED(source);\n"
 
 INJECT_FILL_IDENT = (
     "\n// 夹具注入：执行器里出现补光标识符（应被 [actuator] 抓到）\n"
@@ -59,6 +59,14 @@ INJECT_FILL_IDENT = (
     "    (void)fillLight;\n"
     "}\n"
     "} // namespace accessterminal\n"
+)
+# 危险回退：绕过 AccessController，由 widget 直接调执行器
+INJECT_DIRECT_ACTUATOR = (
+    "\n// 夹具注入：widget 直接调用执行器（绕过放行中枢）\n"
+    "void Widget::fixtureDirectActuatorCall(const QString& s)\n"
+    "{\n"
+    "    m_doorActuator->unlock(s);\n"
+    "}\n"
 )
 INJECT_COMMENT_SETVALUE = (
     "\n// 夹具对照：注释里写 m_fillLight->setValue(1) 与 unlock 不算违规\n"
@@ -113,8 +121,11 @@ MUT = [
     ("door_actuator.cpp 里出现补光标识符",
      lambda: app(ACTUATOR, INJECT_FILL_IDENT), "actuator"),
 
-    ("删掉唯一开锁出口调用（执行器变死代码）",
+    ("删掉唯一放行出口调用（中枢变死代码）",
      lambda: sub(WIDGET, UNLOCK_CALL, NO_UNLOCK), "actuator"),
+
+    ("widget 绕过中枢直接调执行器",
+     lambda: app(WIDGET, INJECT_DIRECT_ACTUATOR), "actuator"),
 
     ("对照：注释里同时写 setValue 与 unlock（不得误报）",
      lambda: app(WIDGET, INJECT_COMMENT_SETVALUE), None),

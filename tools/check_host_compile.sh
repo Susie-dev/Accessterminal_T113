@@ -67,9 +67,51 @@ OUT="${TMPDIR:-/tmp}/t113-host-check"
 rm -rf "$OUT"; mkdir -p "$OUT/ui"
 
 # ---- 定位 Qt 与 OpenCV ----
-QT_INC="${QT_INC:-/mingw64/include}"
-CV_INC="${CV_INC:-$QT_INC/opencv5}"
-MOCS="${MOCS:-/mingw64/share/qt5/mkspecs/win32-g++}"
+#
+# 第 40 轮补：**Linux 上开箱可用**。此前这四个默认值全是 MSYS2 路径，在
+# Linux 上必须由调用者手工传 QT_INC/CV_INC/MOCS 并自行加 -fPIC，否则每个
+# 文件都报 "QtCore/qobjectdefs.h: No such file"（那看起来像代码问题，其实是
+# 路径问题 —— 正是本脚本开头"预检失败就不要开始编译"想避免的误导）。
+# Windows/MSYS2 的分支逐条保持原样。
+qt_query() {
+    command -v qmake >/dev/null 2>&1 || return 0
+    qmake -query "$1" 2>/dev/null | head -1
+}
+
+if [ -z "${QT_INC:-}" ]; then
+    if [ -d /mingw64/include ]; then
+        QT_INC=/mingw64/include
+    else
+        QT_INC="$(qt_query QT_INSTALL_HEADERS)"
+        [ -n "$QT_INC" ] || QT_INC=/usr/include/x86_64-linux-gnu/qt5
+    fi
+fi
+QTSP_INC="${QTSP_INC:-$(qt_query QT_INSTALL_HEADERS)}"   # QtSerialPort 头可能来自解出的 dev 包
+
+if [ -z "${CV_INC:-}" ]; then
+    if [ -d "$QT_INC/opencv5" ]; then
+        CV_INC="$QT_INC/opencv5"
+    elif [ -d /usr/include/opencv4 ]; then
+        CV_INC=/usr/include/opencv4
+    else
+        CV_INC="$QT_INC/opencv5"
+    fi
+fi
+
+if [ -z "${MOCS:-}" ]; then
+    if [ -d /mingw64/share/qt5/mkspecs/win32-g++ ]; then
+        MOCS=/mingw64/share/qt5/mkspecs/win32-g++
+    else
+        MOCS="$(qt_query QT_INSTALL_ARCHDATA)/mkspecs/linux-g++"
+    fi
+fi
+
+# Linux 的 Qt5 是按 -reduce-relocations 构建的，必须 -fPIC（MinGW 不需要，
+# 且原样保持不影响 Windows 的既有行为）。
+EXTRA_FLAGS=""
+case "$(uname -s)" in
+    Linux*) EXTRA_FLAGS="-fPIC -isystem $QT_INC" ;;
+esac
 
 # ---- 定位 uic ----
 UIC=""
@@ -113,8 +155,8 @@ CXXFLAGS="-std=c++11 -fsyntax-only -Wall -Wextra -Wno-unused-parameter \
  -I$SRC_ROOT/src -I$OUT/ui -I$STUBS \
  -include host_compat.h \
  -isystem $QT_INC/QtCore -isystem $QT_INC/QtGui -isystem $QT_INC/QtWidgets \
- -isystem $QT_INC/QtNetwork -isystem $QT_INC/QtSerialPort -isystem $QT_INC/QtConcurrent \
- -isystem $CV_INC -isystem $MOCS \
+ -isystem $QT_INC/QtNetwork -isystem $QTSP_INC -isystem $QTSP_INC/QtSerialPort -isystem $QT_INC/QtConcurrent \
+ -isystem $CV_INC -isystem $MOCS $EXTRA_FLAGS \
  -DQT_CORE_LIB -DQT_GUI_LIB -DQT_WIDGETS_LIB -DQT_NETWORK_LIB \
  -DQT_SERIALPORT_LIB -DQT_CONCURRENT_LIB $CV_COMPAT"
 

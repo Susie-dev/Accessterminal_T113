@@ -55,6 +55,8 @@ namespace accessterminal {
 class SignalingClient;
 class GpioLine;
 class DoorActuator;
+class AccessController;
+enum class AccessMethod;
 } // namespace accessterminal
 
 // 使 protocol::Signal 可用于跨线程排队的信号槽。
@@ -135,8 +137,9 @@ private slots:
     void onSignalReceived(accessterminal::protocol::Signal signal);
 
     // ---- 指纹 ----
-    void onFingerprintIdentify(bool success, int id, int score, const QString& msg);
-    void onFingerprintEnroll(bool success, int id, const QString& msg);
+    // 这里原有 onFingerprintIdentify / onFingerprintEnroll 两个槽，但都不可达
+    // （无调用者、也不是 connect 目标），第 40 轮已删除；现场路径见
+    // setupModules() 的 identifyResult lambda 与 Form_finger 的内联状态机。
 
     // ---- 人脸 ----
     void onAddFaceFromFingerForm();
@@ -152,13 +155,13 @@ private:
      * @brief 认证成功后的**唯一**开锁入口。
      *
      * 密码 / 指纹 / 人脸 / 远程 unlock 四条路径都必须走这里，不允许任何
-     * 一处直接写 GPIO。它只做一件事：把请求转给 m_doorActuator，由后者
-     * 决定"真实开锁"还是"模拟开锁"（板端未接执行器时）。
-     * 规则 `[actuator]` 守着"这里必须是唯一出口"。
+     * 一处直接写 GPIO。它把请求转给 AccessController（放行决策 + 静默期），
+     * 后者再驱动 DoorActuator。规则 `[actuator]` 守着"这里必须是唯一出口"。
      *
+     * @param method 认证方式。
      * @param source 来源描述，用于日志与信号（"密码"/"指纹"/"人脸"/"远程"）。
      */
-    void requestUnlock(const QString& source);
+    void requestUnlock(accessterminal::AccessMethod method, const QString& source);
 
     /// 处理服务器 accept：创建音视频线程，进入通话。
     void startCallSession();
@@ -234,10 +237,12 @@ private:
     // 占用它；若板端确认 PE5 是继电器而非补光灯，则补光与开锁必须二选一，
     // 那是一次需要显式决策的现场行为变更（见 docs/借鉴Accessterminal方案.md）。
     accessterminal::GpioLine* m_fillLight = nullptr;
-    // 门锁执行器：唯一的"开门"出口。板端未接执行器时走模拟开锁。
+    // 门锁执行器：唯一的"开门"电气出口。板端未接执行器时走模拟开锁。
     // 认证成功的四条路径（密码/指纹/人脸/远程 unlock）都必须经过
-    // requestUnlock()，不允许任何一处直接写 GPIO。
+    // requestUnlock() -> AccessController -> 本对象，不允许任何一处直接写 GPIO。
     accessterminal::DoorActuator* m_doorActuator = nullptr;
+    // 放行决策中枢：唯一的"谁能进门"出口（放行记账 + 静默期）。
+    accessterminal::AccessController* m_accessController = nullptr;
     bool m_hasPerson = false;
 
     // ---- 其它 ----

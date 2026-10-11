@@ -101,7 +101,7 @@ cmake --build /tmp/t113-tests
 ctest --test-dir /tmp/t113-tests --output-on-failure
 ```
 
-当前 19 个目标：`t113_protocol`（协议编解码）、`t113_fingerprint_parser`
+当前 20 个目标：`t113_protocol`（协议编解码）、`t113_fingerprint_parser`
 （指纹帧解析）、`t113_app_config`（配置读取与夹取）、`t113_audio_manager`
 （提示音播放，用假 ALSA 注入设备错误）、`t113_audio_sender`（UDP 12345
 上行音频）、`t113_audio_receiver`（UDP 12345 下行播放）、`t113_video_push`
@@ -113,6 +113,8 @@ ctest --test-dir /tmp/t113-tests --output-on-failure
 `t113_gpio`（物理门锁/补光那条线，用可编程假 libgpiod）、
 `t113_door_actuator`（**唯一的开锁出口**：真 `GpioLine` + 真 `DoorActuator` +
 可编程假 libgpiod，断言"不假装开门 / 不阻塞 / 不重复驱动"三条硬约束）、
+`t113_access_controller`（**唯一的放行入口**：静默期为 0 时不得抑制任何请求、
+大于 0 时抑制且到期恢复、被抑制的请求不得触达执行器）、
 `t113_face_manager`（人脸门禁，链接真实 LBPH；**缺 OpenCV face 模块时
 自动跳过**）、`t113_v4l2_camera`（画面源头，用可编程假 syscall 层 +
 `-Wl,--wrap`）、`t113_form_passwd`（密码输入窗体，用影子 `Widget`/
@@ -139,6 +141,11 @@ ctest --test-dir /tmp/t113-tests --output-on-failure
 > 其实一步没跑"的通路。
 
 跨工程信令互通测试同理，见 `tests/interop/run_interop.sh`（同样不依赖 ALSA）。
+**注意（第 40 轮更正）**：该脚本目前是 **Windows/MSYS2 专用** —— 它把
+`/mingw64/bin` 加进 PATH、并用 `cygpath` 换算路径，Linux 上直接跑不起来
+（属交接文档 P8 的"夹具/脚本跨平台化"工作，尚未移植）。Linux 上要验跨工程
+契约，现在可用的是 `python3 tools/check_protocol_sync.py`（两侧 protocol.h
+逐字节一致 + 常量取值钉死）。
 
 > **注意**：这两条路径此前实际上是坏的 —— `tests/CMakeLists.txt` 缺
 > `cmake_minimum_required`/`project()`，配置阶段就直接失败；补上之后又会
@@ -1364,12 +1371,15 @@ udevadm control --reload-rules && udevadm trigger
 }
 ```
 
-配置文件查找顺序：
+配置文件查找顺序（**第 40 轮更正** —— 此前这里写了 4 级，实现只有 2 级，
+第 2、3 级根本不存在，照它部署会以为"放同目录就能生效"）：
 
-1. 命令行第一个参数
-2. 可执行文件同目录的 `appconfig.json`
-3. 当前工作目录的 `config/appconfig.json`
-4. `/etc/accessterminal/appconfig.json`
+1. 命令行第一个参数：`./smartpro /path/to/appconfig.json`
+2. `/etc/accessterminal/appconfig.json`（内置默认值，见 `app_config.cpp` 的
+   `kDefaultConfigPath`）
+
+找不到文件、JSON 解析失败或根节点不是对象时，一律**回退到内置默认值并告警**，
+不会崩、也不会把整份配置清空。
 
 ### 环境变量覆盖
 
@@ -3316,6 +3326,7 @@ bash tools/check_host_compile.sh
 bash tools/check_host_link.sh
 
 # 6. 跨工程信令互通（需同级目录存在 Accessterminal_desktop）
+#    注意：该脚本目前是 MSYS2 专用（/mingw64 + cygpath），Linux 上见 P8
 bash tests/interop/run_interop.sh
 
 # 7. 单元测试（独立构建，不需要 ALSA）

@@ -23,6 +23,7 @@
 #include "core/vision/v4l2_camera.h"
 #include "hal/fingerprint_hailin.h"
 #include "hal/gpio.h"
+#include "managers/access_controller.h"
 #include "managers/audio_manager.h"
 #include "managers/door_actuator.h"
 #include "managers/face_manager.h"
@@ -53,6 +54,7 @@
 #include <cstring>
 #include <errno.h>
 
+using accessterminal::AccessMethod;
 using accessterminal::AppConfig;
 using accessterminal::protocol::Signal;
 
@@ -76,6 +78,12 @@ constexpr int kThreadStopTimeoutMs = 3000;
 /// 将来若要现场可调，应在 AppConfig 里加旋钮并遵守开发约定第 10 条
 /// （公开的开关必须真的生效）；留给显式决策，不在这里悄悄写死配置读取。
 constexpr int kUnlockPulseMs = 1000;
+
+/// 放行静默期（毫秒）：**0 = 保持现状，不抑制**。
+/// 取非 0（例如 5000）会改变现场行为：同一段时间内第二次认证不再开门 ——
+/// 这正是"门口站着的人被 3Hz 人脸识别反复开门"的解药，但改了就与
+/// "行为兼容"冲突，必须显式决策（见 docs/交接与继续开发.md 的待裁决事项）。
+constexpr int kUnlockSilentPeriodMs = 0;
 
 } // namespace
 
@@ -247,13 +255,31 @@ void Widget::setupGpio()
     m_doorActuator = new accessterminal::DoorActuator(this);
     m_doorActuator->setDurationMs(kUnlockPulseMs);
     m_doorActuator->setLine(nullptr);
+
+    // 放行决策中枢：唯一的"谁能进门"出口。
+    m_accessController = new accessterminal::AccessController(this);
+    m_accessController->setActuator(m_doorActuator);
+    // 静默期：0 = **保持现状**（不做任何抑制）。
+    // 取非 0 会改变现场行为（同一段时间内的第二次认证不再驱动门锁），
+    // 属于需要显式决策的变更，因此默认 0；能力本身有单元测试覆盖
+    // （tests/test_access_controller.cpp）。
+    m_accessController->setSilentPeriodMs(kUnlockSilentPeriodMs);
+    connect(m_accessController, &accessterminal::AccessController::actuated, this,
+            [](const QString& source, bool realActuator) {
+                // 只在"没真的开门"时出声：现场必须能一眼看出是模拟开锁，
+                // 否则会把提示音当成门开了。
+                if (!realActuator) {
+                    qWarning() << "[开锁] 本次为模拟开锁（板端未接门锁执行器），来源:"
+                               << source;
+                }
+            });
 }
 
-void Widget::requestUnlock(const QString& source)
+void Widget::requestUnlock(accessterminal::AccessMethod method, const QString& source)
 {
     // 认证成功的**唯一**开锁出口。四条路径（密码/指纹/人脸/远程）都必须
     // 经过这里；规则 [actuator] 会拦住任何"在别处直接写 GPIO"的写法。
-    m_doorActuator->unlock(source);
+    m_accessController->request(method, source);
 }
 
 void Widget::setupModules()
@@ -285,6 +311,13 @@ void Widget::setupModules()
                 m_audioManager->playAsync(
                     cfg.pcmFile(success ? QStringLiteral("fingerdoor.pcm")
                                         : QStringLiteral("fingererr.pcm")));
+                if (success) {
+                    // 指纹通过 -> 开锁。**这一条才是现场真正执行的路径**：
+                    // Form_finger 的内联状态机与这里的 identifyResult 是产线
+                    // 路径，原先那个 Widget::onFingerprintIdentify 槽没有任何
+                    // 调用者（verify.py 的 [dead-slot] 一直在告警），已删除。
+                    requestUnlock(AccessMethod::Fingerprint, QStringLiteral("指纹"));
+                }
                 // 识别完成后延时重新开始，实现常驻循环。
                 QTimer::singleShot(500, this, [this]() {
                     m_fingerprintManager->startIdentify();
@@ -352,7 +385,7 @@ void Widget::setupModules()
                                       : QStringLiteral("faceerr.pcm")));
                 if (success) {
                     // 人脸通过 -> 开锁。提示音照旧先响（不改变现场时序）。
-                    requestUnlock(QStringLiteral("人脸"));
+                    requestUnlock(AccessMethod::Face, QStringLiteral("人脸"));
                 }
             });
 
@@ -364,7 +397,7 @@ void Widget::setupModules()
                 if (success) {
                     m_audioManager->playAsync(c.pcmFile(QStringLiteral("opendoor.pcm")));
                     // 密码通过 -> 开锁（唯一出口）。
-                    requestUnlock(QStringLiteral("密码"));
+                    requestUnlock(AccessMethod::Password, QStringLiteral("密码"));
                     if (m_passwdForm) {
                         m_passwdForm->close();
                         m_passwdForm = nullptr;
@@ -617,7 +650,7 @@ void Widget::onSignalReceived(Signal signal)
                 AppConfig::instance().pcmFile(QStringLiteral("opendoor.pcm")));
         }
         // 室内机的远程开锁 -> 本机开锁（唯一出口）。
-        requestUnlock(QStringLiteral("远程"));
+        requestUnlock(AccessMethod::Remote, QStringLiteral("远程"));
         break;
     default:
         // 门口机不处理 call/getframe/stop/stopsend，忽略即可。
@@ -750,35 +783,19 @@ void Widget::on_btnpower_clicked()
 }
 
 // ============================================================================
-// 指纹与人脸回调
+// 人脸回调
 // ============================================================================
 
-void Widget::onFingerprintIdentify(bool success, int id, int score, const QString& msg)
-{
-    if (success) {
-        // 指纹通过 -> 开锁（唯一出口）。弹窗保留原行为。
-        requestUnlock(QStringLiteral("指纹"));
-        QMessageBox::information(
-            this, QStringLiteral("指纹识别"),
-            QStringLiteral("识别成功，ID=%1，score=%2").arg(id).arg(score));
-    } else {
-        qDebug() << "[指纹] 识别失败, msg=" << msg;
-        // 识别失败不弹窗，避免频繁打扰。
-    }
-}
-
-void Widget::onFingerprintEnroll(bool success, int id, const QString& msg)
-{
-    if (success) {
-        ++m_nextFingerId;
-        QMessageBox::information(this, QStringLiteral("指纹注册"),
-                                 QStringLiteral("注册成功，ID=%1").arg(id));
-    } else {
-        qDebug() << "[指纹] 注册失败, ID=" << id << ", msg=" << msg;
-        QMessageBox::warning(this, QStringLiteral("指纹注册"),
-                             QStringLiteral("注册失败，ID=%1\n原因：%2").arg(id).arg(msg));
-    }
-}
+// 这里原有两个不可达的槽：onFingerprintIdentify / onFingerprintEnroll。
+// verify.py 的 [dead-slot] 规则连续告警了十几轮：它们既没有调用者、也不是
+// 任何 connect 的目标；现场真正执行的是 setupModules() 里的
+// FingerprintManager::identifyResult lambda（识别）与 Form_finger 的内联
+// 状态机（注册）。第 40 轮做 P1 时把它们**删除**，理由：
+//   1. 死掉的平行实现最容易被后来者"顺手修一下"，而改动它不影响现场行为 ——
+//      这正是规则原文警告的陷阱（"为它写的单元测试覆盖的是平行实现"）；
+//   2. 指纹识别成功要开锁，开锁动作必须只有一处（见 requestUnlock）。
+// 注：FingerprintManager::startEnroll() 同样零生产调用者，但它是**公开 API**
+// 且有单元测试，删不删需要拍板，因此保留并在交接文档里记为待裁决事项。
 
 void Widget::onAddFaceFromFingerForm()
 {

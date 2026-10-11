@@ -484,6 +484,38 @@ target_link_libraries(t113_test_door_actuator PRIVATE
 add_test(NAME t113_door_actuator COMMAND t113_test_door_actuator)
 
 # ---------------------------------------------------------------------------
+# AccessController：唯一的放行入口（第 40 轮 P1 补）
+#
+# 把"谁能进门"从 Widget 的四个 lambda 收敛到本类之后，两件事只有这里能验：
+# 静默期为 0 时必须**完全不抑制**（默认值 = 保持现状），以及静默期大于 0 时
+# 必须真的抑制、不触达执行器、到期自动恢复。
+#
+# 真 AccessController + 真 DoorActuator + 真 GpioLine + 可编程假 libgpiod。
+# ---------------------------------------------------------------------------
+add_executable(t113_test_access_controller
+    test_access_controller.cpp
+    fake_gpiod.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/hal/gpio.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/managers/door_actuator.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/managers/door_actuator.h
+    ${ACCESSTERMINAL_SRC_ROOT}/managers/access_controller.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/managers/access_controller.h
+)
+
+target_include_directories(t113_test_access_controller PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_LIST_DIR}                     # fake_gpiod.h
+    ${CMAKE_CURRENT_LIST_DIR}/../tools/devstubs   # <gpiod.h>
+)
+
+target_link_libraries(t113_test_access_controller PRIVATE
+    Qt5::Core
+    Qt5::Test
+)
+
+add_test(NAME t113_access_controller COMMAND t113_test_access_controller)
+
+# ---------------------------------------------------------------------------
 # FaceManager：人脸门禁的注册 / 训练 / 识别（第 29 轮补）
 #
 # FaceManager 决定**门开不开**：widget.cpp:889 检出人脸后调用 recognize()，

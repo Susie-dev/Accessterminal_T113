@@ -81,6 +81,7 @@ SOURCES += \
     src/core/vision/v4l2_camera.cpp \
     src/hal/fingerprint_hailin.cpp \
     src/hal/gpio.cpp \
+    src/managers/access_controller.cpp \
     src/managers/audio_manager.cpp \
     src/managers/door_actuator.cpp \
     src/managers/face_manager.cpp \
@@ -103,6 +104,7 @@ HEADERS += \
     src/hal/fingerprint_frame_parser.h \
     src/hal/fingerprint_hailin.h \
     src/hal/gpio.h \
+    src/managers/access_controller.h \
     src/managers/audio_manager.h \
     src/managers/door_actuator.h \
     src/managers/face_manager.h \
