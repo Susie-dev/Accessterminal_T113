@@ -86,6 +86,13 @@ void reset()
     g_readCount = 0;
     g_buildCount = 0;
     g_sendFailFirst = 0;
+    // "哪些设备已打开"同样是替身状态，必须一起清。
+    //
+    // 不清会有一个隐蔽后果：替身按**对象地址**记录已打开的设备，而测试里的
+    // 设备都是栈对象、地址会被后续用例复用。于是上一个用例 open() 过、又没
+    // close() 的设备地址留在集合里，下一个用例新建的设备"一出生就是打开的"
+    // —— `QVERIFY(!device.isOpen())` 会莫名其妙地失败（第 39 轮实测踩到）。
+    g_openDevices.clear();
 }
 
 QList<QByteArray> sent()

@@ -49,6 +49,24 @@ public:
     /// 当前是否处于暂停状态。
     bool isSuspended() const { return m_suspended; }
 
+    /**
+     * @brief 串口打不开时的重试间隔（毫秒）。
+     *
+     * 为什么要重试而不是直接放弃：指纹串口在**启动时**打不开是常态
+     * （设备缺失、权限不对、USB/串口在启动之后才枚举出来）。原实现不检查
+     * 串口状态就进入常驻识别循环，于是以 ~2Hz 反复写一个关闭的串口：
+     * 每轮刷出 Qt 自带的 "QIODevice::write (QSerialPort): device not open"
+     * 与 "[指纹] 串口写入不完整"，且**永远不会自愈**（全工程只有一处
+     * open()，在 widget.cpp 启动时调用一次）。
+     *
+     * 现在的行为：串口不可用时不进识别循环，改为按本间隔低频重试 open()，
+     * 一旦可用就自动恢复识别，不需要重启进程。
+     *
+     * 对外暴露这个数字，是为了让测试与文档只有一个事实来源
+     * （同 FaceManager::sampleTarget() 的理由）。
+     */
+    static int reopenRetryMs() { return 5000; }
+
 // 声明 Qt 信号槽成员区域。
 public slots:
     // 定义或声明函数 startEnroll。
@@ -84,8 +102,16 @@ private:
     bool m_waitingFinger = false;
     /// 是否正在注册（防重入）。原实现是函数内 static，跨实例共享。
     bool m_enrolling = false;
+    /// 串口不可用时的重试定时器句柄（单次触发，可复用；未排程时为 nullptr）。
+    QTimer* m_reopenTimer = nullptr;
+    /// 是否已经就"串口不可用"提示过一次（避免每 5 秒刷一条同样的日志）。
+    bool m_portUnavailable = false;
     /// 停掉识别/注册轮询定时器并清空句柄。
     void stopPoll();
+    /// 串口不可用时排一次低频重试（已在排程中则不重复排）。
+    void scheduleReopenRetry();
+    /// 重试到期：再试一次 open()，成功则恢复识别，失败则重新排程。
+    void onReopenRetry();
 // 结束当前代码块作用域。
 };
 

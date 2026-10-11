@@ -462,6 +462,64 @@ private slots:
         QCOMPARE(fakefp::sentCount(), 0);
     }
 
+    /**
+     * 串口**没打开**时不得进入识别循环（第 39 轮）。
+     *
+     * 原缺陷：startIdentify() 只查 m_suspended/m_waitingFinger，不查串口状态，
+     * 于是串口打不开时仍每 500ms 一轮 write + readPacket，每轮刷两条日志：
+     *
+     *   QIODevice::write (QSerialPort): device not open   ← Qt 自己打的，压不住
+     *   [指纹] 串口写入不完整                              ← 本工程打的
+     *
+     * 而且**永远不会自愈**：全工程只有 widget.cpp 一处 open()，仅在启动时调一次。
+     *
+     * 这里断言的是**行为**（没有任何下发、没有读串口），不是"有没有某个 if"。
+     */
+    void closedPortDoesNotEnterIdentifyLoop()
+    {
+        HailinFingerprint device;          // 故意不 open()
+        QVERIFY(!device.isOpen());
+        FingerprintManager mgr;
+        mgr.setDevice(&device);
+
+        QSignalSpy spy(&mgr, &FingerprintManager::identifyResult);
+        mgr.startIdentify();
+
+        // 跨越 2 个轮询周期：若仍在轮询，这里必然出现下发。
+        QTest::qWait(kNoMoreMs);
+        QCOMPARE(fakefp::sentCount(), 0);
+        QCOMPARE(fakefp::readCount(), 0);
+        for (int i = 0; i < spy.count(); ++i) {
+            QVERIFY2(!spy.at(i).at(0).toBool(), "串口不可用时不得上报识别成功");
+        }
+        mgr.setSuspended(true);
+    }
+
+    /**
+     * 串口**后来可用**时必须自动恢复识别（第 39 轮）。
+     *
+     * 这条守的是"低频重试"这个设计：只加 isOpen() 守卫会把指纹功能彻底关死
+     * （因为没有任何代码会重新 open()），所以必须真的重试。
+     * 这里让替身的 open() 在重试到点时成功，断言识别自动接上、无需重启进程。
+     */
+    void reopenRetryResumesIdentifyWhenPortBecomesAvailable()
+    {
+        HailinFingerprint device;          // 起始未打开
+        FingerprintManager mgr;
+        mgr.setDevice(&device);
+        mgr.startIdentify();
+
+        // 重试间隔到点之前：必须完全没有流量（否则说明仍在校验前的空转）。
+        QTest::qWait(kNoMoreMs);
+        QCOMPARE(fakefp::sentCount(), 0);
+
+        // 等重试到点（替身的 open() 恒成功）。
+        QVERIFY2(waitForSent(1, FingerprintManager::reopenRetryMs() + 3000),
+                 "串口可用后识别没有自动恢复 —— 重试机制失效");
+        QVERIFY(device.isOpen());
+        mgr.setSuspended(true);
+    }
+
     /// startIdentify() 重复调用**不得**叠加定时器（否则下发频率翻倍）。
     void repeatedStartIdentifyDoesNotStackTimers()
     {

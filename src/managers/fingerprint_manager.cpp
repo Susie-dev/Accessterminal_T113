@@ -45,6 +45,54 @@ void FingerprintManager::stopPoll()
         m_enrollTimer = nullptr;
         m_enrolling = false;
     }
+    // 串口重试定时器也要停：暂停（注册流程）或析构时都不该再去碰串口。
+    if (m_reopenTimer) {
+        m_reopenTimer->stop();
+        m_reopenTimer->deleteLater();
+        m_reopenTimer = nullptr;
+    }
+}
+
+// 定义或声明函数 FingerprintManager::scheduleReopenRetry。
+void FingerprintManager::scheduleReopenRetry()
+{
+    // 已在排程中就不叠加：本函数会被 startIdentify() 反复调到。
+    if (m_reopenTimer) return;
+    // 只在**进入**"串口不可用"状态时提示一次。若每次重试都打一条，
+    // 5 秒一条同样会把日志淹掉（只是从 2Hz 变成 0.2Hz）。
+    if (!m_portUnavailable) {
+        m_portUnavailable = true;
+        qWarning() << "[指纹] 串口未打开，识别已暂停；每"
+                   << reopenRetryMs() / 1000 << "秒重试一次";
+    }
+    m_reopenTimer = new QTimer(this);
+    m_reopenTimer->setSingleShot(true);
+    connect(m_reopenTimer, &QTimer::timeout,
+            this, &FingerprintManager::onReopenRetry);
+    m_reopenTimer->start(reopenRetryMs());
+}
+
+// 定义或声明函数 FingerprintManager::onReopenRetry。
+void FingerprintManager::onReopenRetry()
+{
+    // 先把句柄摘掉再动其它逻辑：后续 startIdentify() 会走 stopPoll()，
+    // 那里若还持有本定时器，就会在它自己的回调栈里再 stop/delete 一次。
+    QTimer* const timer = m_reopenTimer;
+    m_reopenTimer = nullptr;
+    if (timer) timer->deleteLater();
+
+    if (!fingerprint) return;
+    if (m_suspended) return;
+
+    if (fingerprint->open()) {
+        // 设备回来了。open() 成功时自己会打 "[指纹] 串口打开成功"，
+        // 这里不重复打日志。
+        m_portUnavailable = false;
+        startIdentify();
+        return;
+    }
+    // 还是打不开：静默重排一次（不重复刷日志）。
+    scheduleReopenRetry();
 }
 
 // 定义或声明函数 FingerprintManager::setSuspended。
@@ -85,6 +133,24 @@ void FingerprintManager::startIdentify()
     if (m_suspended) return;
     // 只允许一个识别流程
     if (m_waitingFinger) return;
+
+    // 串口没打开：**不要**进入识别循环。
+    //
+    // 进循环的代价：每 500ms 一轮 buildPacket + write + readPacket(500)，
+    // 而 write 打在关闭的串口上 —— 每轮刷两条日志（Qt 自带的
+    // "QIODevice::write (QSerialPort): device not open"，这条不受本工程
+    // 日志开关控制；以及我们的 "[指纹] 串口写入不完整"），且**永远不会
+    // 自愈**：全工程只有 widget.cpp 一处 open()，只在启动时调一次。
+    //
+    // 改为：不进循环，按 reopenRetryMs() 低频重试 open()，设备一旦可用
+    // 就自动恢复识别，不需要重启进程。
+    if (!fingerprint->isOpen()) {
+        scheduleReopenRetry();
+        return;
+    }
+    // 串口可用（或刚刚恢复）：允许下次不可用时再提示一次。
+    m_portUnavailable = false;
+
     // 执行本行语句完成对应变量、对象或业务状态处理。
     m_waitingFinger = true;
 

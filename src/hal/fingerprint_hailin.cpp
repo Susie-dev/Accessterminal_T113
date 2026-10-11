@@ -41,12 +41,19 @@ bool HailinFingerprint::open() {
     if (m_serial.isOpen()) return true;
     // 根据条件判断是否执行该分支。
     if (!m_serial.open(QIODevice::ReadWrite)) {
-        // 执行本行语句完成对应变量、对象或业务状态处理。
-        debug(QString("[指纹] 打开串口失败: %1").arg(m_serial.errorString()));
+        // 只在**进入**"打不开"状态时提示一次。识别侧会每 5 秒重试一次
+        // open()（见 FingerprintManager::reopenRetryMs()），每次都打的话
+        // 一个月约 52 万条，在嵌入式 flash 上就是慢性日志泄漏。
+        if (!m_openFailureLogged) {
+            m_openFailureLogged = true;
+            debug(QString("[指纹] 打开串口失败: %1").arg(m_serial.errorString()));
+        }
         // 返回当前函数的执行结果或结束函数。
         return false;
     // 结束当前代码块作用域。
     }
+    // 打开了：复位标志，使"插上设备→再掉线"仍能在日志里留下痕迹。
+    m_openFailureLogged = false;
     // 执行本行语句完成对应变量、对象或业务状态处理。
     debug(QString("[指纹] 串口打开成功: %1").arg(m_portName));
     // 新会话开始：清空解析状态与驱动侧残留字节。上电/重连时模块可能已在
@@ -412,6 +419,15 @@ QByteArray HailinFingerprint::buildPacket(const QByteArray& payload) {
 
 // 定义或声明函数 HailinFingerprint::sendPacket。
 bool HailinFingerprint::sendPacket(const QByteArray& pkt) {
+    // 与同文件的 cancel()/readPacket() 等入口保持一致：串口没打开就不要写。
+    // 为什么必须显式挡在这里：QSerialPort::write() 在关闭状态下会由 **Qt 自己**
+    // 往 stderr 打一条 "QIODevice::write (QSerialPort): device not open"，
+    // 这条 warning 不受本工程日志开关控制，也压不住；返回 -1 又让下面判成
+    // "写入不完整"，于是每轮轮询刷两条。识别轮询是常驻的，现场会一直刷。
+    // 返回 false 与"写到关闭串口"的结果一致（调用方本来就只看布尔值）。
+    if (!m_serial.isOpen()) {
+        return false;
+    }
     // 执行本行语句完成对应变量、对象或业务状态处理。
     qint64 written = m_serial.write(pkt);
     // 根据条件判断是否执行该分支。
