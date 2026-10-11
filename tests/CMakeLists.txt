@@ -453,6 +453,37 @@ target_link_libraries(t113_test_gpio PRIVATE
 add_test(NAME t113_gpio COMMAND t113_test_gpio)
 
 # ---------------------------------------------------------------------------
+# DoorActuator：与补光分离的**唯一**开锁出口（第 40 轮补）
+#
+# 第 40 轮之前本项目没有"开锁"这条代码路径：PE5 只有 5 处补光用法，
+# 认证成功只播音；而 app_config.h 又写着"开锁继电器与补光灯共用 PE5"。
+# 本目标把执行器的三条硬约束钉住：不假装开门、不阻塞、不重复驱动。
+#
+# 用假 libgpiod + **真实** GpioLine + **真实** DoorActuator。
+# 头文件必须显式列进源列表让 AUTOMOC 处理（它带 Q_OBJECT）。
+# ---------------------------------------------------------------------------
+add_executable(t113_test_door_actuator
+    test_door_actuator.cpp
+    fake_gpiod.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/hal/gpio.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/managers/door_actuator.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/managers/door_actuator.h
+)
+
+target_include_directories(t113_test_door_actuator PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_LIST_DIR}                     # fake_gpiod.h
+    ${CMAKE_CURRENT_LIST_DIR}/../tools/devstubs   # <gpiod.h>
+)
+
+target_link_libraries(t113_test_door_actuator PRIVATE
+    Qt5::Core
+    Qt5::Test
+)
+
+add_test(NAME t113_door_actuator COMMAND t113_test_door_actuator)
+
+# ---------------------------------------------------------------------------
 # FaceManager：人脸门禁的注册 / 训练 / 识别（第 29 轮补）
 #
 # FaceManager 决定**门开不开**：widget.cpp:889 检出人脸后调用 recognize()，

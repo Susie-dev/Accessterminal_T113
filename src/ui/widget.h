@@ -54,6 +54,7 @@ class Form_passwd;
 namespace accessterminal {
 class SignalingClient;
 class GpioLine;
+class DoorActuator;
 } // namespace accessterminal
 
 // 使 protocol::Signal 可用于跨线程排队的信号槽。
@@ -144,8 +145,20 @@ private slots:
 private:
     /// 一次性装配：加载配置、创建模块、连接信号。
     void setupModules();
-    /// 装配 GPIO（开锁/补光灯）。
+    /// 装配 GPIO（补光灯）与门锁执行器。
     void setupGpio();
+
+    /**
+     * @brief 认证成功后的**唯一**开锁入口。
+     *
+     * 密码 / 指纹 / 人脸 / 远程 unlock 四条路径都必须走这里，不允许任何
+     * 一处直接写 GPIO。它只做一件事：把请求转给 m_doorActuator，由后者
+     * 决定"真实开锁"还是"模拟开锁"（板端未接执行器时）。
+     * 规则 `[actuator]` 守着"这里必须是唯一出口"。
+     *
+     * @param source 来源描述，用于日志与信号（"密码"/"指纹"/"人脸"/"远程"）。
+     */
+    void requestUnlock(const QString& source);
 
     /// 处理服务器 accept：创建音视频线程，进入通话。
     void startCallSession();
@@ -215,10 +228,16 @@ private:
 
     // ---- GPIO 与轮询线程 ----
     GpioPe4MonitorThread* m_pe4Thread = nullptr;
-    // 开锁继电器与补光灯在硬件上共用同一条 GPIO（PE5，线号 133）。
-    // libgpiod 对同一条线只允许一个 consumer，因此必须共用同一个对象，
-    // 不能为两者各建一个 GpioLine（否则第二个请求必然失败）。
-    accessterminal::GpioLine* m_auxLine = nullptr;
+    // 补光灯：PE5，线号 133。**只做补光**，不承担开锁语义
+    // （第 40 轮把执行器拆了出去，见 m_doorActuator）。
+    // libgpiod 对同一条线只允许一个 consumer，因此全工程只能有一个对象
+    // 占用它；若板端确认 PE5 是继电器而非补光灯，则补光与开锁必须二选一，
+    // 那是一次需要显式决策的现场行为变更（见 docs/借鉴Accessterminal方案.md）。
+    accessterminal::GpioLine* m_fillLight = nullptr;
+    // 门锁执行器：唯一的"开门"出口。板端未接执行器时走模拟开锁。
+    // 认证成功的四条路径（密码/指纹/人脸/远程 unlock）都必须经过
+    // requestUnlock()，不允许任何一处直接写 GPIO。
+    accessterminal::DoorActuator* m_doorActuator = nullptr;
     bool m_hasPerson = false;
 
     // ---- 其它 ----

@@ -24,6 +24,7 @@
 #include "hal/fingerprint_hailin.h"
 #include "hal/gpio.h"
 #include "managers/audio_manager.h"
+#include "managers/door_actuator.h"
 #include "managers/face_manager.h"
 #include "managers/fingerprint_manager.h"
 #include "managers/password_manager.h"
@@ -70,6 +71,11 @@ constexpr int kDetectHeight = 240;
 
 /// 线程等待退出的最长时间。
 constexpr int kThreadStopTimeoutMs = 3000;
+
+/// 开锁脉冲宽度（毫秒）：与重构前"开锁 1 秒"的现场语义一致。
+/// 将来若要现场可调，应在 AppConfig 里加旋钮并遵守开发约定第 10 条
+/// （公开的开关必须真的生效）；留给显式决策，不在这里悄悄写死配置读取。
+constexpr int kUnlockPulseMs = 1000;
 
 } // namespace
 
@@ -204,9 +210,9 @@ Widget::~Widget()
         delete m_camera;
         m_camera = nullptr;
     }
-    // GPIO 线由 GpioLine 析构自动释放（开锁与补光共用同一条线）。
-    delete m_auxLine;
-    m_auxLine = nullptr;
+    // GPIO 线由 GpioLine 析构自动释放（补光灯；门锁执行器由 QObject 父子关系回收）。
+    delete m_fillLight;
+    m_fillLight = nullptr;
 
     delete ui;
 }
@@ -219,16 +225,35 @@ void Widget::setupGpio()
 {
     const AppConfig& cfg = AppConfig::instance();
 
-    // 开锁继电器与补光灯在硬件上共用 PE5（线号默认 133）。
-    // 重构前的 line5 就是同一条线的单一句柄；这里必须同样只请求一次。
-    m_auxLine = new accessterminal::GpioLine();
-    if (!m_auxLine->openOutput(QStringLiteral("gpiochip0"),
+    // 补光灯：PE5（线号默认 133）。全工程只允许一个对象占用这条线。
+    m_fillLight = new accessterminal::GpioLine();
+    if (!m_fillLight->openOutput(QStringLiteral("gpiochip0"),
                                static_cast<unsigned int>(cfg.doorGpioLine()),
                                QStringLiteral("accessterminal"), 0)) {
-        qWarning() << "[GPIO] PE5 初始化失败，开锁与补光均不可用";
-        delete m_auxLine;
-        m_auxLine = nullptr;
+        qWarning() << "[GPIO] PE5 初始化失败，补光不可用";
+        delete m_fillLight;
+        m_fillLight = nullptr;
     }
+
+    // 门锁执行器：与补光**分离**的唯一开锁出口。
+    //
+    // 这里刻意**不接线**（setLine(nullptr)）：板端尚未确认门锁执行器究竟
+    // 接在哪条线 —— app_config.h 的注释说"开锁继电器与补光灯共用 PE5"，
+    // 而相邻仓库的板端实测结论是"PE5 是补光灯，不是门锁"。在事实裁决之前
+    // 把 PE5 接给执行器，就等于"采集人脸时给锁上电"，是危险的猜测。
+    // 不接线时 unlock() 走**模拟开锁**：明确日志 + realActuator=false，
+    // 绝不假装门开了。裁决结论出来后再在这里填线。
+    // 见 docs/借鉴Accessterminal方案.md 的 P0 与"需要显式决策的事项"。
+    m_doorActuator = new accessterminal::DoorActuator(this);
+    m_doorActuator->setDurationMs(kUnlockPulseMs);
+    m_doorActuator->setLine(nullptr);
+}
+
+void Widget::requestUnlock(const QString& source)
+{
+    // 认证成功的**唯一**开锁出口。四条路径（密码/指纹/人脸/远程）都必须
+    // 经过这里；规则 [actuator] 会拦住任何"在别处直接写 GPIO"的写法。
+    m_doorActuator->unlock(source);
 }
 
 void Widget::setupModules()
@@ -303,12 +328,12 @@ void Widget::setupModules()
                 // 采集中打开补光，第 1 张开、第 3 张关（保留原行为）。
                 if (current == 1) {
                     m_audioManager->playAsync(c.pcmFile(QStringLiteral("faceone.pcm")));
-                    if (m_auxLine) m_auxLine->setValue(1);
+                    if (m_fillLight) m_fillLight->setValue(1);
                 } else if (current == 2) {
                     m_audioManager->playAsync(c.pcmFile(QStringLiteral("facetwo.pcm")));
                 } else if (current == 3) {
                     m_audioManager->playAsync(c.pcmFile(QStringLiteral("facethree.pcm")));
-                    if (m_auxLine) m_auxLine->setValue(0);
+                    if (m_fillLight) m_fillLight->setValue(0);
                 }
             });
 
@@ -320,11 +345,15 @@ void Widget::setupModules()
             [this](bool success, double confidence) {
                 qInfo() << "[人脸识别] 结果:" << (success ? "成功" : "失败")
                         << "confidence=" << confidence;
-                if (m_auxLine) m_auxLine->setValue(0);
+                if (m_fillLight) m_fillLight->setValue(0);
                 const AppConfig& c = AppConfig::instance();
                 m_audioManager->playAsync(
                     c.pcmFile(success ? QStringLiteral("opendoor.pcm")
                                       : QStringLiteral("faceerr.pcm")));
+                if (success) {
+                    // 人脸通过 -> 开锁。提示音照旧先响（不改变现场时序）。
+                    requestUnlock(QStringLiteral("人脸"));
+                }
             });
 
     // ---- 密码 ----
@@ -334,6 +363,8 @@ void Widget::setupModules()
                 const AppConfig& c = AppConfig::instance();
                 if (success) {
                     m_audioManager->playAsync(c.pcmFile(QStringLiteral("opendoor.pcm")));
+                    // 密码通过 -> 开锁（唯一出口）。
+                    requestUnlock(QStringLiteral("密码"));
                     if (m_passwdForm) {
                         m_passwdForm->close();
                         m_passwdForm = nullptr;
@@ -585,6 +616,8 @@ void Widget::onSignalReceived(Signal signal)
             m_audioManager->playAsync(
                 AppConfig::instance().pcmFile(QStringLiteral("opendoor.pcm")));
         }
+        // 室内机的远程开锁 -> 本机开锁（唯一出口）。
+        requestUnlock(QStringLiteral("远程"));
         break;
     default:
         // 门口机不处理 call/getframe/stop/stopsend，忽略即可。
@@ -711,8 +744,8 @@ void Widget::on_btnpsswd_clicked()
 void Widget::on_btnpower_clicked()
 {
     // 熄灭补光灯（保留原语义：重构前此处为 gpiod_line_set_value(line5, 0)）。
-    if (m_auxLine) {
-        m_auxLine->setValue(0);
+    if (m_fillLight) {
+        m_fillLight->setValue(0);
     }
 }
 
@@ -723,6 +756,8 @@ void Widget::on_btnpower_clicked()
 void Widget::onFingerprintIdentify(bool success, int id, int score, const QString& msg)
 {
     if (success) {
+        // 指纹通过 -> 开锁（唯一出口）。弹窗保留原行为。
+        requestUnlock(QStringLiteral("指纹"));
         QMessageBox::information(
             this, QStringLiteral("指纹识别"),
             QStringLiteral("识别成功，ID=%1，score=%2").arg(id).arg(score));
@@ -900,7 +935,7 @@ void Widget::updateFrame()
             // 有人但未检出人脸：提示调整位置并打开补光。
             m_audioManager->playAsync(cfg.pcmFile(QStringLiteral("oncam.pcm")));
             recognizeCooldown.restart();
-            if (m_auxLine) m_auxLine->setValue(1);
+            if (m_fillLight) m_fillLight->setValue(1);
         }
     }
 }

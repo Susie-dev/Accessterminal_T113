@@ -4245,6 +4245,89 @@ def check_form_call_stopsend_is_wired(root, src_root):
                  "可调用的声明（找不到 `notifyPeerStopSend(`）—— 名字被改坏后"
                  "form_call.cpp 编译不过，测试会退化成『只看源码文本』。")
 
+def check_door_actuator_is_the_only_unlock_path(root, src_root):
+    """
+    [actuator] 开锁必须经过 DoorActuator，且执行器不得掺补光。
+
+    为什么需要这条规则（第 40 轮）
+    -----------------------------
+    第 40 轮之前本项目**没有"开锁"这条代码路径**：`Widget::m_auxLine`
+    （PE5，线号 133）只有 5 处使用，全是补光（采样开/关、识别结果关、
+    挂断关、检出人无脸时开）；认证成功侧只播音/弹窗。而
+    `src/config/app_config.h` 写的是"开锁继电器与补光灯共用 PE5"。
+    两种解释都是功能缺陷：
+      - 若 PE5 是继电器 → "采集人脸时给锁上电、识别成功时把锁关掉"；
+      - 若 PE5 只是灯   → 认证成功根本不开门。
+    更根本的是"补光"与"开锁"在代码里共用一个变量、没有任何语义区分，
+    48 项静态检查与 71 条约定里也没有一条守着它。
+
+    检查三项
+    --------
+      ① 执行器文件存在，且 `door_actuator.{h,cpp}` 里**不得出现**补光标识符
+         （fillLight / auxLine）——执行器只管开门；
+      ② 除 `managers/door_actuator.cpp` 与 `hal/gpio.cpp` 外，任何**名字含
+         unlock / openDoor 的函数体**里不得直接写 GPIO 电平（`setValue(`）——
+         开锁必须走执行器；
+      ③ `src/ui/widget.cpp` 里必须真的存在 `m_doorActuator->unlock(` 调用 ——
+         否则执行器成了死代码，或开锁又被绕到别处去了。
+
+    已知判别边界（宁可漏报也不误报）
+    --------------------------------
+      * ②只认**花括号深度为 0** 的块（复用 top_level_function_ranges 的既有
+        判据）：命名空间内的函数在命名空间那个深度 0 块里，因此不会被逐个
+        识别。本工程的开锁路径在 widget.cpp（全局作用域），已被覆盖。
+      * ①按**标识符子串**匹配；注释与字符串先被剥离，所以注释里写
+        "不要用 fillLight" 不会触发。
+    """
+    actuator_h = os.path.join(src_root, "managers", "door_actuator.h")
+    actuator_cpp = os.path.join(src_root, "managers", "door_actuator.cpp")
+
+    for path in (actuator_h, actuator_cpp):
+        if not os.path.exists(path):
+            fail("[actuator] 缺少开锁执行器文件: "
+                 + os.path.relpath(path, root).replace("\\", "/"))
+
+    # ① 执行器不得掺补光
+    for path in (actuator_h, actuator_cpp):
+        if not os.path.exists(path):
+            continue
+        rel = os.path.relpath(path, root).replace("\\", "/")
+        text = strip_comments_and_strings(read(path))
+        for ident in ("fillLight", "auxLine"):
+            if ident in text:
+                fail("[actuator] %s 里出现补光标识符 `%s` —— 执行器只负责开锁，"
+                     "不得与补光共用变量或线" % (rel, ident))
+
+    # ② unlock 类函数体内不得直接写电平
+    allowed = {"src/managers/door_actuator.cpp", "src/hal/gpio.cpp"}
+    for path in find_files(src_root, {".cpp"}):
+        rel = os.path.relpath(path, root).replace("\\", "/")
+        if rel in allowed:
+            continue
+        text = strip_comments_and_strings(read(path))
+        prev_end = 0
+        for start, end, body in top_level_function_ranges(text):
+            sig = text[prev_end:start]
+            prev_end = end
+            names = re.findall(r"([A-Za-z_]\w*)\s*::\s*([A-Za-z_]\w*)\s*\(", sig)
+            if not names:
+                continue
+            fname = names[-1][1]
+            if not re.search(r"unlock|openDoor|open_door", fname, re.I):
+                continue
+            if re.search(r"\bsetValue\s*\(", body):
+                fail("[actuator] %s 的 %s() 里直接写 GPIO 电平 —— "
+                     "开锁必须经过 DoorActuator（唯一出口）" % (rel, fname))
+
+    # ③ 执行器必须真的被调用
+    widget = os.path.join(src_root, "ui", "widget.cpp")
+    if os.path.exists(widget):
+        text = strip_comments_and_strings(read(widget))
+        if "m_doorActuator->unlock(" not in text:
+            fail("[actuator] src/ui/widget.cpp 里找不到 m_doorActuator->unlock( "
+                 "调用 —— 执行器成了死代码，或开锁被绕到别处去了")
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: python verify.py <项目根目录> [另一仓库根目录]")
@@ -4304,6 +4387,7 @@ def main():
     check_cross_repo_test_targets_are_unique(
         root, sys.argv[2] if len(sys.argv) > 2 else None)
     check_no_secret_in_logs(root, src_root)
+    check_door_actuator_is_the_only_unlock_path(root, src_root)
 
     print(f"校验目录: {root}")
     print("=" * 70)

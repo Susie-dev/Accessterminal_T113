@@ -197,6 +197,21 @@ A 仓库的架构构思确实更好（见第一节），但**它没有 git**：�
 新规则夹具能变红。
 **回滚**：单个提交，`git revert` 回到现状。
 
+> **实施记录（第 40 轮，已完成）** —— 与上面的计划有三处偏差，按实际落地为准：
+> 1. 静态规则不是独立脚本，而是 `tools/verify.py` 里的
+>    `check_door_actuator_is_the_only_unlock_path`（本工程的规则一律住在
+>    verify.py，`tools/verify_*.py` 是**夹具**），标签 `[actuator]`；
+> 2. 脉冲宽度暂用 `widget.cpp` 里的 `kUnlockPulseMs = 1000`（重构前的现场
+>    语义），**没有**加 AppConfig 旋钮 —— 加旋钮要连带遵守开发约定第 10 条
+>    （公开的开关必须真的生效），留给显式决策；
+> 3. `setLine(nullptr)` 是刻意的：在 PE5 事实裁决之前**不接任何线**，
+>    因此 unlock() 走模拟开锁，物理行为零变化（只多了日志与信号）。
+>
+> 实测：`ctest` 19/19 通过（109.51s）· 全部 19 个 `.cpp` 主机端语法检查通过 ·
+> `verify.py` rc=0（48 项检查、11 项告警）· 三条硬约束的故障注入
+> 3/3 变红（`tools/verify_door_actuator_test.py`）· 规则夹具 3 变异抓到、
+> 2 对照不误报（`tools/verify_actuator_separation_rule.py`）。
+
 ---
 
 ### P1 · 单一放行出口：引入 `AccessController`（2–3 天）

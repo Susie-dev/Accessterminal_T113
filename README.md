@@ -101,7 +101,7 @@ cmake --build /tmp/t113-tests
 ctest --test-dir /tmp/t113-tests --output-on-failure
 ```
 
-当前 18 个目标：`t113_protocol`（协议编解码）、`t113_fingerprint_parser`
+当前 19 个目标：`t113_protocol`（协议编解码）、`t113_fingerprint_parser`
 （指纹帧解析）、`t113_app_config`（配置读取与夹取）、`t113_audio_manager`
 （提示音播放，用假 ALSA 注入设备错误）、`t113_audio_sender`（UDP 12345
 上行音频）、`t113_audio_receiver`（UDP 12345 下行播放）、`t113_video_push`
@@ -111,6 +111,8 @@ ctest --test-dir /tmp/t113-tests --output-on-failure
 `t113_fingerprint_wire`（指纹报文构造，链接**真实**实现）、
 `t113_password_manager`（门禁密码校验不得进日志）、
 `t113_gpio`（物理门锁/补光那条线，用可编程假 libgpiod）、
+`t113_door_actuator`（**唯一的开锁出口**：真 `GpioLine` + 真 `DoorActuator` +
+可编程假 libgpiod，断言"不假装开门 / 不阻塞 / 不重复驱动"三条硬约束）、
 `t113_face_manager`（人脸门禁，链接真实 LBPH；**缺 OpenCV face 模块时
 自动跳过**）、`t113_v4l2_camera`（画面源头，用可编程假 syscall 层 +
 `-Wl,--wrap`）、`t113_form_passwd`（密码输入窗体，用影子 `Widget`/

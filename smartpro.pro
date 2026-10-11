@@ -82,6 +82,7 @@ SOURCES += \
     src/hal/fingerprint_hailin.cpp \
     src/hal/gpio.cpp \
     src/managers/audio_manager.cpp \
+    src/managers/door_actuator.cpp \
     src/managers/face_manager.cpp \
     src/managers/fingerprint_manager.cpp \
     src/managers/password_manager.cpp \
@@ -103,6 +104,7 @@ HEADERS += \
     src/hal/fingerprint_hailin.h \
     src/hal/gpio.h \
     src/managers/audio_manager.h \
+    src/managers/door_actuator.h \
     src/managers/face_manager.h \
     src/managers/fingerprint_manager.h \
     src/managers/password_manager.h \
