@@ -11,6 +11,32 @@
 
 ---
 
+## 进度总览（截至第 40 轮末）
+
+图例：✅ 完成 · 🟡 部分完成 · ⬜ 未开始。**每完成一步都要在这里与对应小节的
+"实施记录"里同时更新**，否则下一个人只能靠翻 git log 猜进度。
+
+| 阶段 | 状态 | 证据（提交 / 可执行验证） |
+|---|---|---|
+| **P0** 门锁语义与执行器分离 | ✅ 代码完成，**PE5 待板端裁决** | `214fd79` · 新测试 `t113_door_actuator`（3 条硬约束各配故障注入，3/3 变红）· 规则 `[actuator]` 夹具 4/4 抓到 |
+| **P1** 单一放行出口 `AccessController` | 🟡 **P1-a 完成**；P1-b/P1-c（提示音策略与人脸调度位移）未做 | `ae2b52f` · 新测试 `t113_access_controller` · `dead-slot` 告警 3 → 1 |
+| **P2** 凭据与安全模型 | ⬜ 未开始 | 现状缺口仍在：`password_manager.cpp:42` 明文比对 |
+| **P3** 并发与"最新值"约定 | ⬜ 未开始 | 开发约定第 72 条尚未落笔 |
+| **P4** 人脸质量门与防假阳性 | ⬜ 未开始 | — |
+| **P5** 工程卫生与文档对齐 | 🟡 4 项已完成，3 项未做（见该节实施记录） | `8308121`（Qt 5.9 重载）· `df22048`（devstubs 跨平台）· `ae2b52f`（`check_host_compile.sh` 支持 Linux、README 两处失真） |
+| **P6** 交叉编译预检 | ✅ 完成 | `18092db` · 首次交叉编译成功：`ELF 32-bit ARM`，516,644 字节，依赖闭包 **13/13** |
+| 五、建议的前三个提交 | ✅ 全部完成 | `7259117`（方案文档）· `8308121`（Qt5.9）· `214fd79`（P0） |
+
+**当前门禁水位（第 40 轮末，本机 Linux）**：`ctest` 20/20 · 主机端语法检查
+20/20 · `verify.py` rc=0（48 项检查、9 项告警、0 失败）· `check_signatures.py`
+rc=0 · `check_protocol_sync.py` rc=0 · 交叉编译产物核验通过。
+
+**下一件该做的事**：P2（安全模型，改动最大且是真实缺口）或 P1-b/P1-c（纯位移、
+风险低）；两者都不依赖板端裁决。板端裁决（PE5）与上板运行是另一条线，
+见 `docs/交接与继续开发.md` 的【决策】与【P0】。
+
+---
+
 ## 零、前提与红线
 
 ### 0.1 为什么以本仓库为基座
@@ -197,7 +223,7 @@ A 仓库的架构构思确实更好（见第一节），但**它没有 git**：�
 新规则夹具能变红。
 **回滚**：单个提交，`git revert` 回到现状。
 
-> **实施记录（第 40 轮，已完成）** —— 与上面的计划有三处偏差，按实际落地为准：
+> **实施记录（第 40 轮，已完成；提交 `214fd79`）** —— 与上面的计划有三处偏差，按实际落地为准：
 > 1. 静态规则不是独立脚本，而是 `tools/verify.py` 里的
 >    `check_door_actuator_is_the_only_unlock_path`（本工程的规则一律住在
 >    verify.py，`tools/verify_*.py` 是**夹具**），标签 `[actuator]`；
@@ -207,7 +233,8 @@ A 仓库的架构构思确实更好（见第一节），但**它没有 git**：�
 > 3. `setLine(nullptr)` 是刻意的：在 PE5 事实裁决之前**不接任何线**，
 >    因此 unlock() 走模拟开锁，物理行为零变化（只多了日志与信号）。
 >
-> 实测：`ctest` 19/19 通过（109.51s）· 全部 19 个 `.cpp` 主机端语法检查通过 ·
+> 实测（**当时水位**；P1 之后目标数变为 20 个，当前水位见开头「进度总览」）：
+> `ctest` 19/19 通过（109.51s）· 全部 19 个 `.cpp` 主机端语法检查通过 ·
 > `verify.py` rc=0（48 项检查、11 项告警）· 三条硬约束的故障注入
 > 3/3 变红（`tools/verify_door_actuator_test.py`）· 规则夹具 3 变异抓到、
 > 2 对照不误报（`tools/verify_actuator_separation_rule.py`）。
@@ -250,7 +277,7 @@ Password, TempCode, Remote}`、唯一的 `unlock(userId, method, note)`、
 
 **验收门**：分层在 UI 层重新成立 · `dead-slot` 归零 · 音效时序测试全绿。
 
-> **实施记录（第 40 轮，部分完成）** —— 实际落地与计划的差异：
+> **实施记录（第 40 轮，部分完成；提交 `ae2b52f`）** —— 实际落地与计划的差异：
 > 1. 本轮做的是 P1-a：新增 `AccessController`（放行记账 + 静默期 + 语义化
 >    信号），四条认证路径收敛到它；**P1-b/P1-c（把提示音策略与人脸检测调度
 >    搬进来）尚未做** —— 那两步是纯位移、风险集中，单独一轮做更稳。
@@ -276,6 +303,8 @@ Password, TempCode, Remote}`、唯一的 `unlock(userId, method, note)`、
 
 ### P2 · 凭据与安全模型（1.5 天）
 
+> **状态（第 40 轮末）：⬜ 未开始。** 下面写的是设计，一行代码都还没落地。
+
 #### 现状缺口
 
 `src/managers/password_manager.cpp:42` 是 `const bool matched = (input == password);`
@@ -300,6 +329,8 @@ Password, TempCode, Remote}`、唯一的 `unlock(userId, method, note)`、
 
 ### P3 · 并发与"最新值"约定（0.5 天）
 
+> **状态（第 40 轮末）：⬜ 未开始。**
+
 **只借鉴语义，不搬代码**（理由见 2.2）。把 A 的"跨线程只传容量 1 的最新值，
 不排队"写成**开发约定第 72 条**，并配静态规则；若 `src/core/vision/v4l2_camera.*`
 缺"代际号防旧帧"，补一个 `m_frameGeneration`。
@@ -307,6 +338,8 @@ Password, TempCode, Remote}`、唯一的 `unlock(userId, method, note)`、
 ---
 
 ### P4 · 人脸质量门与防假阳性（1 天）
+
+> **状态（第 40 轮末）：⬜ 未开始。**（ONNX 那一半已决定**不做**，见第 3 条。）
 
 1. 新增 `src/managers/face_quality.{h,cpp}`：清晰度（Laplacian 方差）/ 亮度 /
    对比度 / 占比，纯逻辑；测试目标按本项目惯例**缺 OpenCV 时自动跳过**
@@ -328,7 +361,7 @@ Password, TempCode, Remote}`、唯一的 `unlock(userId, method, note)`、
 | 跨平台缺口 | 交接文档第五节记录的 `tools/devstubs/sys/socket.h` 里 `#include <_mingw.h>`（属 P8），建议与本阶段一并修掉 |
 | 缺陷台账 | 把 A 的 **40 条缺陷台账**逐条对照本项目，产出 `docs/借鉴核对表.md`：哪些本项目也存在、哪些已修、哪些不适用 |
 
-> **实施记录（第 40 轮，部分完成）**：
+> **实施记录（第 40 轮，部分完成；提交 `8308121`/`df22048`/`ae2b52f`）**：
 > - ✅ Qt 5.9 API 违规：已修（提交 `修复 Qt 5.9 兼容性…`），并补了规则与夹具。
 > - ✅ 跨平台缺口（devstubs）：已修（提交 `devstubs: 让主机端检查在 Linux 上可用`），
 >   18/18 → 20/20 ctest 可跑。
@@ -359,7 +392,7 @@ Password, TempCode, Remote}`、唯一的 `unlock(userId, method, note)`、
 
 这一阶段同时是交接文档里【P0：真正的交叉编译与目标板验证】。
 
-> **实施记录（第 40 轮，已完成）** —— 四条纪律全部落地在 `deploy/build-t113.sh`
+> **实施记录（第 40 轮，已完成；提交 `18092db`）** —— 四条纪律全部落地在 `deploy/build-t113.sh`
 > 与 `cmake/toolchain-t113.cmake` 里，并在本机 SDK 上端到端验证：
 > - SDK 预检：sysroot 存在且含 `lib/libc.so`、编译器 `-dumpmachine` 必须是
 >   `arm*musl*`、sysroot 内能找到 Qt5 的 CMake 配置、OpenCV 与
@@ -375,6 +408,13 @@ Password, TempCode, Remote}`、唯一的 `unlock(userId, method, note)`、
 > 与 opencv_imgcodecs/videoio；libgpiod 是静态库故不在 DT_NEEDED 中）。
 > 顺带证伪一条旧担忧：本 SDK 是 Qt **5.12.9**，因此"5.10+ API 编不过"不成立；
 > 但 `[qt5]` 规则仍按 5.9 下限守着（换 SDK 时不至于翻车）。
+>
+> 与计划的偏差：第 4 条"在纯 ASCII 的 /tmp 路径下构建"改成了**警告 + 软链建议**，
+> 因为这次 SDK 的真实路径含中文（`Desktop/AccessterminalUI/交叉编译工具链`），
+> 而 CMake 这条路带非 ASCII 路径也能编过（实测）；与其强改路径，不如在预检里
+> 提示，真出 moc/uic 怪错时再软链到 `$HOME/t113-sdk`。
+> 另外新增了 A 计划里没有的两条：**产物依赖闭包核验**（每个 DT_NEEDED 都要能在
+> sysroot 中解析）与 **STAGING_DIR 自动设置**（消掉工具链包装脚本的警告）。
 
 ---
 
@@ -398,7 +438,7 @@ ctest --test-dir /tmp/t113-tests --output-on-failure
 
 ---
 
-## 五、建议的前三个提交
+## 五、建议的前三个提交（**第 40 轮已全部完成**）
 
 ```
 1. feat(door): 拆开补光灯与开锁执行器，新增 DoorActuator（非阻塞脉冲）
