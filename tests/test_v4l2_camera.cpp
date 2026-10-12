@@ -584,6 +584,180 @@ private slots:
         QCOMPARE(fakev4l2io::lastHeight(), 480u);
         QVERIFY(fakev4l2io::sawStreamOn());
     }
+
+    // -----------------------------------------------------------------------
+    // 代际号与 frameSize()：P3「跨线程只传容量 1 的最新值」的配套机制
+    //
+    // 为什么必须有这几条：前两组断言只证明"能取到帧"，证明不了
+    // "消费者能分辨出这是不是**新**帧"。
+    // -----------------------------------------------------------------------
+
+    /**
+     * 初始代际号为 0；**每成功存入一帧**恰好 +1。
+     *
+     * 末尾的"解码失败代际号不变"是这条用例的重点：如果失败也自增，
+     * 代际号就退化成"采集循环跑了多少次"，消费者无法据此判断帧是否更新，
+     * 防旧帧机制会静默失效（消费到重复帧却以为它是新的）。
+     */
+    void frameGenerationAdvancesOnlyOnNewFrames()
+    {
+        V4L2Camera cam;
+        QVERIFY(cam.open());
+
+        QCOMPARE(cam.frameGeneration(), quint64(0)); // 还没采过
+
+        fakev4l2io::setFrameData(makeJpeg(64, 48, 0));
+        driveCaptureLoop(cam);
+        QCOMPARE(cam.frameGeneration(), quint64(1));
+
+        fakev4l2io::setFrameData(makeJpeg(64, 48, 30));
+        driveCaptureLoop(cam);
+        QCOMPARE(cam.frameGeneration(), quint64(2));
+
+        // ---- 解码失败：没有新帧入缓存，代际号**不得**变化 ----
+        fakev4l2io::setFrameData(QByteArray("garbage"));
+        driveCaptureLoop(cam);
+        QCOMPARE(cam.frameGeneration(), quint64(2));
+
+        // ---- DQBUF 失败：同样没有新帧 ----
+        fakev4l2io::setDqbufFail(true);
+        driveCaptureLoop(cam);
+        QCOMPARE(cam.frameGeneration(), quint64(2));
+
+        // 阳性对照：恢复后能继续推进，证明上面不是"卡死所以相等"。
+        fakev4l2io::setDqbufFail(false);
+        fakev4l2io::setFrameData(makeJpeg(64, 48, 60));
+        driveCaptureLoop(cam);
+        QCOMPARE(cam.frameGeneration(), quint64(3));
+    }
+
+    /**
+     * 同一个代际号读两次必须相等 —— 代际号只在**新帧**到达时变化。
+     *
+     * 这条守的是消费者的用法：记下上次处理过的代际号，相等就跳过。
+     * 若这里每次都变（例如把计数器误写成"读取次数"），消费者会永远认为
+     * "有新帧"，防旧帧机制失效 —— 而那正是本机制存在的唯一理由。
+     */
+    void frameGenerationIsStableBetweenFrames()
+    {
+        fakev4l2io::setFrameData(makeJpeg(64, 48, 0));
+
+        V4L2Camera cam;
+        QVERIFY(cam.open());
+        driveCaptureLoop(cam);
+
+        const quint64 g1 = cam.frameGeneration();
+        const quint64 g2 = cam.frameGeneration();
+        const quint64 g3 = cam.frameGeneration();
+        QVERIFY2(g1 == g2 && g2 == g3,
+                 "没有新帧时代际号必须保持不变");
+
+        // 读帧（getFrame）也不得改变代际号：它只是取数据。
+        (void)cam.getFrame();
+        QCOMPARE(cam.frameGeneration(), g1);
+    }
+
+    /// frameSize() 与"getFrame().size()"必须一致，但没有帧时是 (0,0)。
+    void frameSizeMatchesTheCachedFrame()
+    {
+        V4L2Camera cam;
+        QVERIFY(cam.open());
+
+        QCOMPARE(cam.frameSize(), QSize(0, 0)); // 无帧
+
+        fakev4l2io::setFrameData(makeJpeg(64, 48, 0));
+        driveCaptureLoop(cam);
+        QCOMPARE(cam.frameSize(), QSize(64, 48));
+        // 与取整帧再读尺寸**逐位一致**：这正是它可安全替换的根据。
+        QCOMPARE(cam.frameSize(), cam.getFrame().size());
+
+        // 换一张不同尺寸的，必须跟着变（不是缓存了第一次的尺寸）。
+        fakev4l2io::setFrameData(makeJpeg(80, 60, 0));
+        driveCaptureLoop(cam);
+        QCOMPARE(cam.frameSize(), QSize(80, 60));
+    }
+
+    /**
+     * frameSize()/frameGeneration() 必须能在**没有帧**时安全调用。
+     *
+     * 这是替换掉 `getFrame().size()` 时最容易忽略的差异：原来的写法先判
+     * `frame.isNull()`，而这两个函数没有"空"可判，调用方（widget.cpp 的
+     * onFaceDetectResult）必须能靠返回值区分。若它们在无帧时崩溃或返回垃圾，
+     * 现场表现为摄像头还没就绪就开机时程序直接挂掉。
+     *
+     * 注：「frameSize() 不深拷贝像素」这一条**不在这里测** —— 从外部没有
+     * 可观测的判据（返回值是 QSize，不含图像数据），硬测只能靠计时，
+     * 那是不稳定的假证据。该性质由 tools/verify.py 的
+     * check_latest_value_handoff（静态）强制：它直接检查 frameSize() 的函数体
+     * 里不得出现 getFrame() 或 QImage。分工与 README 第 50 条一致 ——
+     * 不可观测的防御性代码用静态规则守。
+     */
+    void sizeAndGenerationAreSafeWithoutAFrame()
+    {
+        V4L2Camera cam;
+        QVERIFY(cam.open());
+
+        QCOMPARE(cam.frameSize(), QSize(0, 0));
+        QCOMPARE(cam.frameGeneration(), quint64(0));
+
+        // 反复调用不得改变状态（纯查询）。
+        QCOMPARE(cam.frameSize(), QSize(0, 0));
+        QCOMPARE(cam.frameGeneration(), quint64(0));
+
+        // 未 open 的相机同样安全。
+        V4L2Camera closed;
+        QCOMPARE(closed.frameSize(), QSize(0, 0));
+        QCOMPARE(closed.frameGeneration(), quint64(0));
+    }
+
+    /**
+     * 消费者用法闭环：代际号没变就跳过，变了就处理 —— 且**只处理一次**。
+     *
+     * 这是把"机制可用"升级成"用法正确"的证据：单看 getter 相等还不够，
+     * 要证明按这个判据能真的做到"同一帧不重复处理、新帧不漏处理"。
+     */
+    void generationEnablesSkipUnchangedFrames()
+    {
+        V4L2Camera cam;
+        QVERIFY(cam.open());
+
+        quint64 lastSeen = 0;
+        int processed = 0;
+        int skipped = 0;
+
+        // 模拟消费者轮询：每轮按代际号决定是否处理。
+        const auto pollOnce = [&]() {
+            const quint64 g = cam.frameGeneration();
+            if (g != 0 && g == lastSeen) {
+                ++skipped;
+                return;
+            }
+            if (g == 0) {
+                ++skipped;
+                return;
+            }
+            lastSeen = g;
+            ++processed;
+        };
+
+        pollOnce();                       // 无帧：跳过
+        QCOMPARE(processed, 0);
+
+        fakev4l2io::setFrameData(makeJpeg(64, 48, 0));
+        driveCaptureLoop(cam);
+        pollOnce();                       // 新帧：处理
+        QCOMPARE(processed, 1);
+
+        pollOnce();                       // 没新帧：跳过，**不重复处理**
+        pollOnce();
+        QCOMPARE(processed, 1);
+        QCOMPARE(skipped, 3);
+
+        fakev4l2io::setFrameData(makeJpeg(64, 48, 50));
+        driveCaptureLoop(cam);
+        pollOnce();                       // 新帧：再次处理
+        QCOMPARE(processed, 2);
+    }
 };
 
 QTEST_MAIN(TestV4L2Camera)

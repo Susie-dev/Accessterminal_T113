@@ -21,6 +21,7 @@
 #include <QVector>
 #include <QWidget>
 #include <atomic>
+#include <memory>
 // cv::CascadeClassifier 由 objdetect 模块提供，仅 include core.hpp 不足以
 // 获得其声明（已由主机端真实编译验证）。
 #include <opencv2/core.hpp>
@@ -204,6 +205,24 @@ private:
     cv::CascadeClassifier m_faceCascade;
     QVector<cv::Rect> m_faces;
     int m_collectCount = 0;
+
+    /// 人脸检测任务是否仍在后台运行（背压闸门，第 42 轮 P3）。
+    ///
+    /// 为什么需要：`updateFrame()` 每约 500ms 就 `QtConcurrent::run` 一个
+    /// Haar 检测任务，而 T113 上单次检测可能超过这个间隔。没有本标志时
+    /// 任务会在 QThreadPool 的无界队列里堆积（内存只增、且显示的是旧帧上的
+    /// 检测框）。置位后若上一帧仍在检测，就直接放弃本次提交 ——
+    /// 实时视觉只保留**最新一份请求**，不排队（README 第 77 条）。
+    ///
+    /// **为什么是 shared_ptr 而不是裸 std::atomic<bool> 成员**：
+    /// 检测任务可能比 Widget 活得更久（QPointer 守卫正是为此存在）。
+    /// 若任务持有 `this` 去清标志，Widget 先析构时就是一次 use-after-free
+    /// ——写已释放的成员。改成 shared_ptr 后，任务按值捕获一份，
+    /// Widget 析构只减引用计数，原子量本身活到最后一个任务结束。
+    /// 这与 `AudioManager::interruptFlag` 用的是同一套手法（那里也是
+    /// `std::make_shared<std::atomic<bool>>` 并被 lambda 按值捕获）。
+    std::shared_ptr<std::atomic<bool>> m_faceDetectRunning{
+        std::make_shared<std::atomic<bool>>(false)};
 
     // ---- 通话期间的音视频（仅在 accept 后创建）----
     AudioSenderThread* m_audioSenderThread = nullptr;

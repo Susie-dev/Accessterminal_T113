@@ -18,6 +18,7 @@
 #define ACCESSTERMINAL_TESTS_FAKE_V4L2_CAMERA_H
 
 #include <QImage>
+#include <QSize>
 
 namespace fakecam {
 
@@ -25,6 +26,7 @@ namespace fakecam {
 void reset();
 
 /// 设置此后 getFrame() 返回的帧。传空 QImage 表示"暂时没有帧"。
+/// **每调用一次（非空帧）代际号 +1**，与真实实现"存入新帧"的语义一致。
 void setFrame(const QImage& frame);
 
 /// 便捷：生成一张确定内容的测试图（便于断言像素->JPEG 的稳定性）。
@@ -34,7 +36,11 @@ void setSolidFrame(int w, int h, unsigned int rgb);
 bool hasFrame();
 
 /// getFrame() 被调用的次数（用于验证"没有请求就不取帧"）。
+/// frameSize()/frameGeneration() **不计入**此数 —— 它们不拷贝像素。
 int getFrameCount();
+
+/// 替身侧观察到的代际号（应与 camera->frameGeneration() 一致）。
+quint64 generation();
 
 /// open()/close() 的调用计数与返回码控制。
 void setOpenResult(bool ok);

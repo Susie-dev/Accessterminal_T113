@@ -171,17 +171,21 @@ def _run():
 
 
 # ---------------------------------------------------------------------------
-# 并发互斥：交给 **PristineGuard**（第 41 轮统一）。
+# 并发互斥：交给 **PristineGuard**（第 41 轮统一，第 42 轮清理干净）。
 #
 # 本夹具原先自带一套 LOCK/_acquire_lock/_release_lock，用的是**同一把锁**
 # （fi37_rewrite.lock）。第 41 轮给 main() 套上 PristineGuard 之后，
 # 内层这套变成纯冗余，而且实测会造成"自己把自己锁在门外"：
-# Guard 已经持有锁 -> 内层再拿 -> 只看到"文件已存在且持有者活着" -> rc=2。
+# Guard 已经持有锁 -> 内层再拿 -> 只看到"文件已存在且持有者活着" -> 被拒。
 #
 # 保留两套没有价值：同一进程内不存在竞争，而 Guard 已经提供了
 #   (a) 跨进程互斥、(b) 陈旧锁接管（用可靠的 process_is_alive，
 #       而不是 Windows 上会误判的 os.kill）、(c) 同一进程内可重入。
 # 删掉内层这套，只留一处实现（README §34：同一逻辑不要留两份）。
+#
+# 第 42 轮把最后一点残留也删了：那三个符号（LOCK / _acquire_lock /
+# _release_lock）在删掉调用点后已无任何引用，留着的唯一效果是让
+# `% LOCK` 这种未定义引用继续潜伏在死代码里。
 #
 # 为什么要锁：夹具是"原地改写源文件 -> 跑校验 -> 还原"，任何**读源码**的
 # 操作与它并发都会看到中间状态。第 40 轮实测：一边跑夹具、一边后台
@@ -189,17 +193,6 @@ def _run():
 # 于是 t113_door_actuator / t113_access_controller 双双 Failed，
 # 而串行重跑 20/20 全过 —— 与第 37 轮"两个夹具互相踩"是同一类错误。
 # ---------------------------------------------------------------------------
-LOCK = os.path.join(os.environ.get('TEMP') or tempfile.gettempdir(),
-                    'fi37_rewrite.lock')
-
-
-def _acquire_lock():
-    """委托给 PristineGuard（它在 main() 之前已构造）。"""
-    return _GUARD.acquire_lock()
-
-
-def _release_lock():
-    _GUARD.release_lock()
 
 
 # ---------------------------------------------------------------------------
@@ -233,14 +226,17 @@ def main():
 
 
 def _main_locked():
-    if not _acquire_lock():
-        print("另一个夹具正在改写源码（%s）—— 请等它跑完再试" % LOCK)
-        print("（构建/ctest/verify.py 也不要与夹具并发：会读到变异后的源码）")
-        return 2
-    try:
-        return _run()
-    finally:
-        _release_lock()
+    # 注意：这里**不再**重复 acquire_lock()。
+    #
+    # 第 42 轮删掉了这段冗余的二次加锁：main() 已经用 _GUARD 持有了同一把
+    # fi37_rewrite.lock，再问一次只可能得到"可重入 → True"，因此那段
+    # `if not _acquire_lock(): ...` 是**永不可达**的代码 —— 它连同里面
+    # `% LOCK` 的未定义引用一起，永远不会被执行，也就永远不会暴露自己坏了
+    # （第 41 轮迁移遗留）。仓库里不该留"看着像保护、其实永远不会触发"
+    # 的东西，那会让人误以为多了一道防线。
+    #
+    # 现在锁的获取只有一处：main()。互斥由 _GUARD 统一保证。
+    return _run()
 
 
 if __name__ == "__main__":

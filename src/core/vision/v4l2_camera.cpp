@@ -275,6 +275,9 @@ void V4L2Camera::captureLoop() {
         QMutexLocker locker(&frameMutex);
         // 逐行注释：执行本行语句完成对应变量、对象或业务状态处理。
         lastFrame = img;
+        // 代际号与帧**在同一临界区内**自增，消费者才能把"代际号"当作
+        // "这一帧"的可靠标识（见头文件里 frameGeneration 的说明）。
+        ++lastFrameGeneration;
     // 逐行注释：结束当前代码块作用域。
     }
     // 逐行注释：通过 ioctl 向 Linux 设备驱动发送控制命令。
@@ -288,6 +291,26 @@ QImage V4L2Camera::getFrame() {
     QMutexLocker locker(&frameMutex);
     // 逐行注释：返回当前函数的执行结果或结束函数。
     return lastFrame.copy();
+// 逐行注释：结束当前代码块作用域。
+}
+
+// 逐行注释：定义或声明函数 V4L2Camera::frameSize。
+QSize V4L2Camera::frameSize() const {
+    // 逐行注释：执行本行语句完成对应变量、对象或业务状态处理。
+    QMutexLocker locker(&frameMutex);
+    // QImage::size() 对空图返回 QSize(0,0)，因此没有帧时天然给出 (0,0)，
+    // 无需额外分支 —— 与"先 getFrame() 判 isNull() 再取 size()"等价。
+    // 逐行注释：返回当前函数的执行结果或结束函数。
+    return lastFrame.size();
+// 逐行注释：结束当前代码块作用域。
+}
+
+// 逐行注释：定义或声明函数 V4L2Camera::frameGeneration。
+quint64 V4L2Camera::frameGeneration() const {
+    // 逐行注释：执行本行语句完成对应变量、对象或业务状态处理。
+    QMutexLocker locker(&frameMutex);
+    // 逐行注释：返回当前函数的执行结果或结束函数。
+    return lastFrameGeneration;
 // 逐行注释：结束当前代码块作用域。
 }
 

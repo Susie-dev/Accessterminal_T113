@@ -867,14 +867,40 @@ void Widget::updateFrame()
 
     // ---- 异步人脸检测：每 N 帧一次，缩小尺寸降低计算量 ----
     if (++detectCounter % cfg.faceDetectInterval() == 0 && !m_faceCascade.empty()) {
+        // ---- 背压闸门：上一帧检测还没结束就**不再提交**（第 42 轮，P3）----
+        //
+        // 原来这里是"即发即忘"：每次到点就 QtConcurrent::run 一个新任务，
+        // 从不检查上一个是否还在跑。而任务体是 Haar detectMultiScale ——
+        // 门口机（T113 双核）上单次耗时可达数百毫秒，检测间隔却是
+        // frameIntervalMs(50) * faceDetectInterval(10) ≈ 500ms。一旦单次检测
+        // 超过 500ms（或线程池的 2 个线程被别的 QtConcurrent 任务占用），
+        // 提交速度就持续大于完成速度：
+        //
+        //   * 任务在 QThreadPool 的无界队列里堆积 —— 内存只增不减；
+        //   * 每个任务都按值捕获了一份缩放图，堆积的其实是"历史画面"；
+        //   * 结果按提交顺序回流，m_faces 显示的是**越来越旧的帧**上的框，
+        //     而画面本身是最新的 —— 框与画面错位，看起来像"检测漂了"。
+        //
+        // 实时视觉的正确语义（README 第 77 条）：**只保留最新一份请求，
+        // 处理不过来就丢弃**，绝不排队。检测结果本来就是个近似提示，
+        // 丢掉中间帧没有任何损失；堆积旧帧反而有害。
+        //
+        // 用 compare_exchange 而不是 if 再 store：同一时刻可能有
+        // 多个 updateFrame（定时器 + 手动刷新）走到这里，先测后写会漏。
+        // Qt5 的 std::atomic<bool> 提到 C++11，符合本项目底线。
+        // 取一份 shared_ptr 的拷贝交给任务（见 widget.h 里成员的说明：
+        // 任务可能比 Widget 活得久，不能让它回头去碰 this 的成员）。
+        std::shared_ptr<std::atomic<bool>> running = m_faceDetectRunning;
+        bool expected = false;
+        if (!running->compare_exchange_strong(expected, true)) {
+            return; // 上一帧还在检测，直接放弃本次（画面/识别不受影响）
+        }
+
         // 用 QPointer 观察 this：任务在后台线程运行时，Widget 可能已被析构
         // （例如用户关机或界面销毁）。原来的实现直接捕获裸 this，既会在
         // 已析构对象上读 m_faceCascade，又会把结果 invokeMethod 到一个
         // 已不存在的对象——两者都是 use-after-free。
         // QPointer 在对象销毁后自动变空，是最轻量的守卫。
-        //
-        // m_faceCascade 是生成检测器前就要用到的成员，因此在提交任务时就
-        // 把分类器按值拷贝进 lambda，避免任务体内再触碰 this 的成员。
         QPointer<Widget> self(this);
         // 必须是**非 const** 拷贝：cv::CascadeClassifier::detectMultiScale()
         // 不是 const 成员函数（内部有可变的缓存/状态），用 const 对象调用会
@@ -882,13 +908,33 @@ void Widget::updateFrame()
         //   error: passing 'const cv::CascadeClassifier' as 'this' argument
         //          discards qualifiers [-fpermissive]
         // 按值拷贝进 lambda 的初衷（避免任务体内再触碰 this 的成员）不变。
+        //
+        // 补充（第 42 轮核实）：这份拷贝**不是**深拷贝。CascadeClassifier
+        // 的唯一数据成员是 `Ptr<BaseCascadeClassifier> cc`（见
+        // opencv2/xobjdetect.hpp），按值拷贝只是给内部引用计数 +1，
+        // 不会复制整棵级联树。因此"每个任务拷一份分类器"的内存代价极小，
+        // 真正需要防的是上面那个无界任务堆积。
         cv::CascadeClassifier cascade = m_faceCascade;
         const QImage small = frame.scaled(kDetectWidth, kDetectHeight, Qt::KeepAspectRatio);
         // 注意 lambda 必须带 mutable：lambda 的 operator() 默认是 const，
         // 按值捕获的 cascade 在体内就成了 const 对象，而
         // cv::CascadeClassifier::detectMultiScale() 不是 const 成员，
         // 于是即使外面不加 const 仍然编不过（同上一条错误）。
-        QtConcurrent::run([self, small, cascade]() mutable {
+        // 捕获 `running`（shared_ptr 的拷贝）只用于末尾释放闸门（见下），
+        // **不捕获 this**：任务可能比 Widget 活得久，碰 this 就是 UAF。
+        QtConcurrent::run([running, self, small, cascade]() mutable {
+            // RAII 释放闸门：**所有**退出路径都要清标志，否则一次异常
+            // （cv::Exception 在本工程是现实存在的，测试里就有捕获它的用例）
+            // 或一次提前 return 都会让标志永久为 true —— 表现为
+            // "人脸检测从此再也不执行"，而且没有任何日志，极难定位。
+            // 用 guard 而不是在每个 return 前手写 store：手写会漏。
+            struct RunningGuard {
+                std::shared_ptr<std::atomic<bool>> flag;
+                explicit RunningGuard(std::shared_ptr<std::atomic<bool>> f)
+                    : flag(f) {}
+                ~RunningGuard() { flag->store(false); }
+            } guard(running);
+
             if (self.isNull()) {
                 return; // Widget 已析构，直接放弃本次检测
             }
@@ -959,13 +1005,29 @@ void Widget::updateFrame()
 
 void Widget::onFaceDetectResult(const QVector<cv::Rect>& detected, int imgW, int imgH)
 {
-    const QImage frame = m_camera->getFrame();
-    if (frame.isNull() || imgW <= 0 || imgH <= 0) {
+    // 只读**尺寸**，不要整帧。
+    //
+    // 原先这里是 `const QImage frame = m_camera->getFrame();` 然后只用
+    // frame.width()/frame.height() 算缩放系数 —— 为两个整数付了一次整幅
+    // 深拷贝（640x480 RGB32 约 1.2 MB），而且是每次检测完成都付（约 2 Hz）。
+    //
+    // QImage::copy() 是**深拷贝**：它还会让内部 QImageData 的引用计数与
+    // 采集线程那份脱钩，等于每次都在给实时链路添一份纯垃圾。
+    // V4L2Camera::frameSize() 在同一把锁下返回缓存的尺寸，语义与
+    // "getFrame().size()" 完全一致（见该函数与 tests/test_v4l2_camera.cpp
+    // 的 frameSizeMatchesTheCachedFrame / frameSizeDoesNotCopyPixels）。
+    //
+    // 注意这里**不需要**代际号：本函数只是把检测框坐标从小图还原到原图，
+    // 用的是"提交检测那一刻"的尺寸。真实运行中采集尺寸恒定（S_FMT 协商一次），
+    // 因此拿当前帧尺寸与拿当初那帧尺寸等价；这与"要不要处理这一帧"
+    // 是两回事（那个由代际号决定，见 updateFrame）。
+    const QSize frameSize = m_camera->frameSize();
+    if (frameSize.isEmpty() || imgW <= 0 || imgH <= 0) {
         return;
     }
     // 检测在缩小图上进行，需把坐标还原到原始分辨率。
-    const double scaleX = static_cast<double>(frame.width()) / imgW;
-    const double scaleY = static_cast<double>(frame.height()) / imgH;
+    const double scaleX = static_cast<double>(frameSize.width()) / imgW;
+    const double scaleY = static_cast<double>(frameSize.height()) / imgH;
     m_faces.clear();
     m_faces.reserve(detected.size());
     for (const auto& face : detected) {

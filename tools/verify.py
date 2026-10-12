@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import io
+import inspect
 import tokenize
 import xml.etree.ElementTree as ET
 
@@ -3851,6 +3852,172 @@ def _function_body(text, qualified_name):
     return None
 
 
+def check_latest_value_handoff(root, src_root):
+    r"""
+    跨线程实时数据必须走「容量 1 的最新值」语义，且**可判别新旧**。
+
+    背景（第 42 轮，方案 P3）
+    ------------------------
+    相邻仓库（室内机）有一条约定了十几年经验的惯例：跨线程传实时数据
+    （音频、视频帧）时**只传容量 1 的最新值，绝不排队**。排队在实时音视频
+    里是纯有害的：消费者跟不上时，队列只会让延迟无限增长、画面越来越旧，
+    而丢弃旧数据恰恰是正确行为（人耳/人眼只关心最新的一帧/一包）。
+
+    本工程的音频侧本来就是这个语义（`AudioReceiverThread` 在 ALSA 缓冲满时
+    明确丢弃整包，并在启动时丢弃积压 —— 见其 run() 里"实时音频的正确做法是
+    丢弃这一包"的注释）。相机侧用 `V4L2Camera::lastFrame`（容量 1 + 互斥）
+    也是这个语义。缺的是另外两半，本规则把它们固定下来：
+
+      (1) **不排队**：不得为实时帧数据引入无界的生产者/消费者容器。
+      (2) **可判别新旧**：消费者要能知道"这一帧是不是新的"，否则它会
+          反复处理同一份数据（浪费解码/编码/发送），或者处理到旧帧。
+
+    判定内容
+    --------
+    A. 实时视频帧的跨线程交接必须提供代际号。
+
+       `src/core/vision/v4l2_camera.{h,cpp}` 是**全部**视频消费路径的唯一源头
+       （UDP 23456 通话、UDP 50000 监看、人脸检测都取自它），因此在这里
+       要求存在 `frameGeneration()`：
+         - 头文件里有声明；
+         - 实现里**与 lastFrame 在同一临界区内**自增 —— 否则消费者可能
+           读到"新代际号 + 旧帧"，防旧帧机制静默失效。
+
+    B. 只想知道帧尺寸的查询不得深拷贝整帧。
+
+       `frameSize()` 的函数体里不得出现 `getFrame()` 或 `QImage`：
+       那意味着它为了两个整数复制了整幅图（640x480 RGB32 ≈ 1.2 MB）。
+       `Widget::onFaceDetectResult` 曾经正是这样（每次检测完成都付一次，
+       约 2 Hz），第 42 轮改为 `frameSize()`。
+
+    C. 提交到线程池的无界异步任务必须有背压闸门。
+
+       识别方式：`QtConcurrent::run` 提交任务的文件里，必须有"是否仍在运行"
+       的原子标志，且该标志**通过 compare_exchange（或等价的先测后写）**
+       设置。`widget.cpp` 的人脸检测此前是"即发即忘"：任务体是 Haar
+       detectMultiScale（T113 上可达数百毫秒），提交间隔约 500ms，
+       一旦单次检测慢于提交间隔，任务就在 QThreadPool 的无界队列里堆积 ——
+       内存只增，且显示的检测框来自越来越旧的帧。
+
+    为什么是**静态**规则（分工依据：README 第 50 条）
+    ------------------------------------------------
+    "frameSize() 没有深拷贝像素"从外部没有可观测判据（返回值是 QSize，
+    不含图像数据），运行期测试只能靠计时，那是不稳定的假证据。
+    "代际号与帧在同一临界区"同理 —— 竞态窗口极小，测试复现不了。
+    因此这类性质用静态规则守；**能**观测的部分（代际号推进规律、
+    尺寸一致性、按代际号跳过重复帧）仍由
+    tests/test_v4l2_camera.cpp 的运行期用例守，两者互补而非重复。
+    """
+    # ---- A. 代际号存在且与帧同临界区 ----
+    cam_h = os.path.join(src_root, "core", "vision", "v4l2_camera.h")
+    cam_cpp = os.path.join(src_root, "core", "vision", "v4l2_camera.cpp")
+    for p in (cam_h, cam_cpp):
+        if not os.path.isfile(p):
+            fail("[latest-value] 找不到 %s —— 视频链路源头缺失，"
+                 "本规则无法判定" % os.path.relpath(p, root))
+            return
+
+    htext = strip_comments_and_strings(read(cam_h))
+    ctext = strip_comments_and_strings(read(cam_cpp))
+
+    if not re.search(r'\bframeGeneration\s*\(', htext):
+        fail("[latest-value] V4L2Camera 未提供 frameGeneration()。"
+             "跨线程消费实时帧时无法判别新旧，消费者会反复处理同一帧"
+             "（重复解码/编码/发送），或处理到旧帧。见 README 第 77 条。")
+
+    # 实现体：取 frameGeneration() 的定义并确认它返回代际号成员。
+    body = _function_body(ctext, "V4L2Camera::frameGeneration")
+    if body is None:
+        fail("[latest-value] 找不到 V4L2Camera::frameGeneration() 的实现"
+             "（规则自身可能需随重构更新）")
+    elif not re.search(r'return\s+\w*[Gg]eneration', body):
+        fail("[latest-value] V4L2Camera::frameGeneration() 没有返回代际号成员")
+
+    # 自增必须与 lastFrame 的赋值在**同一个** if (loaded) 块内。
+    # 做法：定位 `lastFrame = ` 所在的语句块，要求块内同时出现代际号自增。
+    m = re.search(r'lastFrame\s*=\s*\w+\s*;', ctext)
+    if not m:
+        fail("[latest-value] 找不到 `lastFrame = ...;`（规则需随重构更新）")
+    else:
+        # 向上找最近的 `if (...loaded...)` 的开括号
+        head = ctext.rfind("if", 0, m.start())
+        brace = ctext.find("{", head) if head >= 0 else -1
+        block = None
+        if brace >= 0:
+            depth = 0
+            for k in range(brace, len(ctext)):
+                if ctext[k] == "{":
+                    depth += 1
+                elif ctext[k] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        block = ctext[brace:k]
+                        break
+        if block is None:
+            fail("[latest-value] 无法定位 lastFrame 赋值所在语句块（规则需修复）")
+        elif not re.search(r'\+\+\s*\w*[Gg]eneration|\w*[Gg]eneration\s*\+\+'
+                           r'|\w*[Gg]eneration\s*\+=\s*1', block):
+            fail("[latest-value] 代际号的自增没有和 lastFrame 的赋值放在同一个"
+                 "临界区/语句块内。分开写会让消费者读到『新代际号 + 旧帧』，"
+                 "防旧帧机制静默失效（见 v4l2_camera.h 的说明）")
+
+    # ---- B. frameSize() 不得深拷贝整帧 ----
+    fs = _function_body(ctext, "V4L2Camera::frameSize")
+    if fs is None:
+        fail("[latest-value] 找不到 V4L2Camera::frameSize() 的实现"
+             "（规则自身可能需随重构更新）")
+    else:
+        if re.search(r'\bgetFrame\s*\(', fs):
+            fail("[latest-value] V4L2Camera::frameSize() 里调用了 getFrame()。"
+                 "这是最典型的退化写法 `return getFrame().size();` —— "
+                 "为了读两个整数深拷贝整幅图（640x480 RGB32 ≈ 1.2 MB），"
+                 "而 QImage::copy() 是深拷贝。应直接读缓存的 size()。")
+        if re.search(r'\bQImage\b', fs):
+            fail("[latest-value] V4L2Camera::frameSize() 里出现了 QImage。"
+                 "本函数只应返回 QSize，不应触碰图像数据（见 README 第 77 条）")
+
+    # ---- C. QtConcurrent 提交点必须有背压闸门 ----
+    #
+    # 逐个**提交点**判定，而不是"整个文件里有没有闸门"。
+    # 第 42 轮实测：按文件判定会把 audio_manager.cpp 误报 ——
+    # 它确实用 QtConcurrent::run，但它**有**背压（先 stop() 置中断标志打断
+    # 上一次播放，并回收已完成的 future，见 playAsync() 与 waitForAllTasks()）。
+    # 按文件找"compare_exchange"找不到就报错，等于要求所有异步任务都用同一种
+    # 闸门写法，那是错的：这里有**两种**都正确的机制。
+    #
+    #   (a) 丢弃式闸门：atomic<bool> + compare_exchange，处理不过来就不提交
+    #       —— 适合"结果只是提示、丢了无所谓"的场景（人脸检测）。
+    #   (b) 取消式闸门：提交前先取消/打断上一次任务，并登记未完成的 future
+    #       —— 适合"每次都要有结果、但旧的不再需要"的场景（提示音播放）。
+    #
+    # 两种都满足"不无界堆积"这一要求，因此都接受；缺两者才是缺陷。
+    for path in find_files(src_root, {".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        if not re.search(r'QtConcurrent\s*::\s*run\s*\(', text):
+            continue
+        rel = os.path.relpath(path, root)
+
+        for m in re.finditer(r'QtConcurrent\s*::\s*run\s*\(', text):
+            body = enclosing_function_body(text, m.start())
+            if body is None:
+                continue  # 顶层 lambda 之类，本规则不判定
+            # (a) 丢弃式闸门：同一函数里有 atomic<bool> 与 compare_exchange
+            drop_gate = ("compare_exchange" in body
+                         and re.search(r'std::atomic\s*<\s*bool\s*>', body))
+            # (b) 取消式闸门：同一函数里既取消上一次、又登记未完成的任务
+            cancel_gate = (re.search(r'\bstop\s*\(\s*\)', body)
+                           and re.search(r'\.append\s*\(', body)
+                           and re.search(r'\bisRunning\s*\(\s*\)', body))
+            if not (drop_gate or cancel_gate):
+                line = text.count("\n", 0, m.start()) + 1
+                fail("[latest-value] %s:%d 用 QtConcurrent::run 提交任务，"
+                     "但既没有『丢弃式』背压闸门（std::atomic<bool> + "
+                     "compare_exchange），也没有『取消式』闸门（先 stop() 打断"
+                     "上一次并登记未完成的 future）。缺少它时，一旦任务耗时"
+                     "超过提交间隔，任务就会在线程池的无界队列里堆积：内存只增，"
+                     "且结果来自越来越旧的数据。见 README 第 77 条。" % (rel, line))
+
+
 def check_form_passwd_contract_is_pinned(root, src_root):
     r"""
     密码输入窗体（`src/ui/form_passwd.cpp`）必须由**运行期测试**守住，而且
@@ -4670,9 +4837,35 @@ def main():
     check_door_actuator_is_the_only_unlock_path(root, src_root)
     check_credentials_are_hashed_not_plaintext(root, src_root)
     check_credential_store_test_is_wired(root, src_root)
+    check_latest_value_handoff(root, src_root)
 
     print(f"校验目录: {root}")
     print("=" * 70)
+    # 把"本次实际跑了多少条检查"打出来，且**从注册表本身数**，不写死。
+    #
+    # 为什么（第 42 轮）：文档里的"48 项检查 / 50 项检查"是**手写的**，
+    # 而规则一直在增加 —— 实测 HEAD 版本已有 51 个 check_ 函数，文档却还写
+    # 50，且更早还写过 48。这与 README 第 76 条（夹具期望值静默过期）是
+    # **同一类**问题：人工维护的数字会随代码漂移，而漂移**没有任何症状**。
+    # 让工具自己报数，文档只需引用它的输出即可。
+    #
+    # 数的是 main() **函数体源码里实际出现的调用**，而不是"模块里定义了
+    # 多少个 check_" —— 后者会把"定义了但忘了注册"的函数也算进去，
+    # 那正是最该被发现的情况（定义了却没跑，不等于有这条检查）。
+    _main_src = inspect.getsource(main)
+    _calls = sorted(set(re.findall(r'^\s{4}(check_[a-z_0-9]+)\(', _main_src,
+                                   re.M)))
+    # 必须用 globals()，**不能用 dir()**：在函数内部 dir() 返回的是**局部**
+    # 名字，于是 _defined 恒为空集、orphan 检测恒不报 —— 一条永远为真的检查。
+    # 这一点是第 42 轮的故障注入探针抓出来的（加一个未注册的 check_ 函数，
+    # 规则居然不红）。教训：新加的"守卫"必须自己先被证明会红。
+    _defined = {n for n in globals() if n.startswith("check_")}
+    print(f"检查函数: {len(_calls)} 个（已注册）")
+    _orphan = sorted(n for n in _defined if n not in _calls)
+    if _orphan:
+        # 与 check_declared_slot_is_reachable 同源：定义了却没人调用 = 死规则。
+        fail("[harness-crash] 以下 check_ 函数已定义但 main() 从未调用"
+             "（等于没有这条检查）: " + ", ".join(_orphan))
     if WARN:
         print(f"\n警告 {len(WARN)} 项：")
         for w in WARN:

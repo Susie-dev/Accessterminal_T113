@@ -114,7 +114,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fixture_pristine import PristineGuard  # noqa: E402
 
 FILES = [CS_CPP, CS_H]
-_GUARD = PristineGuard(files=FILES, tag='p2credtest', lock_name='fi37_write.lock')
+_GUARD = PristineGuard(files=FILES, tag='p2credtest', lock_name='fi37_rewrite.lock')
 _ORIG = _GUARD.orig
 _HEALED = []
 
@@ -248,9 +248,10 @@ MUT = [
 
 def main():
     if not _acquire_lock():
-        print("另一个夹具正在改写源码（%s）—— 请等它跑完再试" % LOCK)
+        print("另一个夹具正在改写源码（%s）—— 请等它跑完再试"
+              % _GUARD.lock_path())
         print("（构建/ctest/verify.py 也不要与夹具并发）")
-        return 2
+        return 3
     try:
         return _run()
     finally:

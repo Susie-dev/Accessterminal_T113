@@ -337,6 +337,16 @@ class PristineGuard(object):
         """
         return self.lock.acquire()
 
+    def lock_path(self):
+        """锁文件的绝对路径。
+
+        存在的理由（第 42 轮）：夹具在"拿不到锁"时要打印**是哪个文件**
+        挡住了它，否则用户只知道"有别的夹具在跑"却不知道从哪查。
+        原先各夹具自己拼了一遍路径（并因此留下一处 `NameError`：
+        迁移到本 Guard 后忘了删 `% LOCK`）。现在只有这一份真相。
+        """
+        return self.lock.path
+
     @property
     def reentrant(self):
         """本 Guard 是否走的"可重入"路径（锁的持有者就是本进程）。"""

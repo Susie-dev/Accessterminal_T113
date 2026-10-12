@@ -193,7 +193,8 @@ def run_verify():
 
 def main():
     if not _acquire_lock():
-        print('!! 已有另一个"改写源文件"的夹具在运行（锁: %s）。' % LOCK)
+        print('!! 已有另一个"改写源文件"的夹具在运行（锁: %s）。'
+              % _GUARD.lock_path())
         print('   两个夹具同时改 form_finger.h/.cpp 会互相污染（第 37 轮实测），'
               '请等它结束再跑本夹具。')
         return 3

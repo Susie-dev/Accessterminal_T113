@@ -217,8 +217,9 @@ MUT = [
 
 def main():
     if not _acquire_lock():
-        print("另一个夹具正在改写源码（%s）—— 请等它跑完再试" % LOCK)
-        return 2
+        print("另一个夹具正在改写源码（%s）—— 请等它跑完再试"
+              % _GUARD.lock_path())
+        return 3
     try:
         return _run()
     finally:

@@ -14,6 +14,7 @@ namespace {
 QMutex g_mutex;
 QImage g_frame;
 int g_getFrameCount = 0;
+quint64 g_generation = 0;
 bool g_openResult = true;
 int g_openCount = 0;
 int g_closeCount = 0;
@@ -26,6 +27,7 @@ void reset()
     QMutexLocker l(&g_mutex);
     g_frame = QImage();
     g_getFrameCount = 0;
+    g_generation = 0;
     g_openResult = true;
     g_openCount = 0;
     g_closeCount = 0;
@@ -35,6 +37,8 @@ void setFrame(const QImage& frame)
 {
     QMutexLocker l(&g_mutex);
     g_frame = frame;
+    // 替身也要维护代际号：setFrame() 的语义就是"来了一帧新画面"。
+    ++g_generation;
 }
 
 void setSolidFrame(int w, int h, unsigned int rgb)
@@ -45,6 +49,13 @@ void setSolidFrame(int w, int h, unsigned int rgb)
                     static_cast<int>(rgb & 0xFF)));
     QMutexLocker l(&g_mutex);
     g_frame = img;
+    ++g_generation;
+}
+
+quint64 generation()
+{
+    QMutexLocker l(&g_mutex);
+    return g_generation;
 }
 
 bool hasFrame()
@@ -103,6 +114,21 @@ QImage V4L2Camera::getFrame()
     QMutexLocker l(&g_mutex);
     ++g_getFrameCount;
     return g_frame.copy();
+}
+
+QSize V4L2Camera::frameSize() const
+{
+    QMutexLocker l(&g_mutex);
+    // 与真实实现同语义：只读尺寸，**不**计入 g_getFrameCount。
+    // 这是刻意的：调用方改用 frameSize() 之后，getFrameCount() 应当下降，
+    // 测试正是用这个计数证明"不再为读尺寸而深拷贝整帧"。
+    return g_frame.size();
+}
+
+quint64 V4L2Camera::frameGeneration() const
+{
+    QMutexLocker l(&g_mutex);
+    return g_generation;
 }
 
 int V4L2Camera::width() const { return v4l2_width; }
