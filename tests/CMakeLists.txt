@@ -602,6 +602,40 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# FaceQuality：人脸质量门（第 43 轮，方案 P4）
+#
+# 背景：本工程已实测确认 LBPH 在单 label 下 `predictedLabel == 1` **恒为真**，
+# 距离阈值是**唯一的门**。因此一张模糊/过曝/过暗的图只要凑巧落进阈值，
+# **门就开了** —— 这是安全问题，不是体验问题。质量门是识别之前的第一道判断。
+#
+# 为什么这里**没有** OpenCV 可选分支（与本文件 t113_face_manager 的写法不同）
+# ---------------------------------------------------------------------------
+# 方案文档原计划"按本项目惯例缺 OpenCV 时跳过"。实现时发现清晰度只需一个
+# 四邻域 Laplacian 卷积、十几行纯 C++，于是改成**纯 Qt 实现**：本目标在
+# 任何环境都真的跑。理由正是 README §78 —— "会静默跳过/安静地少跑一条"
+# 的检查比没有检查更糟：t113_face_manager 在本机跑得起来，但换一台没装
+# OpenCV face 模块的机器就会安静消失，而没人会注意到。
+#
+# 纯逻辑类，只用 Qt5::Core/Test/Gui，不需要硬件 / ALSA / OpenCV。
+# ---------------------------------------------------------------------------
+add_executable(t113_test_face_quality
+    test_face_quality.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/managers/face_quality.cpp
+)
+
+target_include_directories(t113_test_face_quality PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+)
+
+target_link_libraries(t113_test_face_quality PRIVATE
+    Qt5::Core
+    Qt5::Test
+    Qt5::Gui            # QImage
+)
+
+add_test(NAME t113_face_quality COMMAND t113_test_face_quality)
+
+# ---------------------------------------------------------------------------
 # V4L2Camera：门口机的画面来源（第 30 轮补）
 #
 # V4L2Camera 是整个视频链路的源头：UDP 23456 通话视频、UDP 50000 远程监看、

@@ -15,6 +15,12 @@ namespace {
 /// 静默期上限：比一分钟更长没有意义（门口的人早走了），且能挡住误配。
 const int kMaxSilentPeriodMs = 60000;
 
+/// 连续命中次数上限：超过 10 次门口的人早走了，且"到底要试几次"不可预期。
+const int kMaxRequiredStreak = 10;
+
+/// 连续命中窗口上限，与静默期同量级。
+const int kMaxStreakWindowMs = 60000;
+
 int clampSilentPeriod(int ms)
 {
     if (ms < 0) {
@@ -26,7 +32,38 @@ int clampSilentPeriod(int ms)
     return ms;
 }
 
+int clampRequiredStreak(int n)
+{
+    if (n < 1) {
+        return 1;
+    }
+    if (n > kMaxRequiredStreak) {
+        return kMaxRequiredStreak;
+    }
+    return n;
+}
+
+int clampStreakWindow(int ms)
+{
+    if (ms < 1) {
+        return 1;
+    }
+    if (ms > kMaxStreakWindowMs) {
+        return kMaxStreakWindowMs;
+    }
+    return ms;
+}
+
 } // namespace
+
+int methodIndex(AccessMethod method)
+{
+    const int i = static_cast<int>(method);
+    if (i < 0 || i >= kAccessMethodCount) {
+        return 0;   // 越界不崩：枚举被扩展却忘了改 kAccessMethodCount 时兜底
+    }
+    return i;
+}
 
 AccessController::AccessController(QObject* parent)
     : QObject(parent)
@@ -77,8 +114,56 @@ qint64 AccessController::silentRemainingMs() const
     return static_cast<qint64>(m_silentPeriodMs) - elapsed;
 }
 
+void AccessController::setRequiredStreak(AccessMethod method, int required,
+                                         int windowMs)
+{
+    const int cReq = clampRequiredStreak(required);
+    const int cWin = clampStreakWindow(windowMs);
+    if (cReq != required) {
+        qWarning() << "[放行] 连续命中次数" << required << "超出合法范围，夹取为"
+                   << cReq << "（方式:" << methodText(method) << "）";
+    }
+    if (cWin != windowMs) {
+        qWarning() << "[放行] 连续命中窗口" << windowMs << "ms 超出合法范围，夹取为"
+                   << cWin << "ms（方式:" << methodText(method) << "）";
+    }
+    StreakState& s = m_streak[methodIndex(method)];
+    s.required = cReq;
+    s.windowMs = cWin;
+    // 阈值变了就把已有进度清掉：否则"先攒了 3 次、再把阈值从 5 改成 2"
+    // 会**立刻**放行一次，而那一次并不是在 2 次窗口内攒出来的。
+    s.pending = 0;
+    s.hasFirst = false;
+}
+
+int AccessController::requiredStreak(AccessMethod method) const
+{
+    return m_streak[methodIndex(method)].required;
+}
+
+int AccessController::streakWindowMs(AccessMethod method) const
+{
+    return m_streak[methodIndex(method)].windowMs;
+}
+
+int AccessController::pendingStreak(AccessMethod method) const
+{
+    return m_streak[methodIndex(method)].pending;
+}
+
+void AccessController::resetStreaks()
+{
+    for (int i = 0; i < kAccessMethodCount; ++i) {
+        m_streak[i].pending = 0;
+        m_streak[i].hasFirst = false;
+    }
+}
+
 bool AccessController::request(AccessMethod method, const QString& source)
 {
+    // 顺序很重要：先判静默期（既有行为，优先保持），再判连续命中。
+    // 若把两者调换，"静默期内的人脸命中"会被算进连续计数，使静默期
+    // 实际上缩短了人脸所需的观察时间 —— 两个独立机制互相污染。
     const qint64 remaining = silentRemainingMs();
     if (remaining > 0) {
         ++m_suppressed;
@@ -86,6 +171,35 @@ bool AccessController::request(AccessMethod method, const QString& source)
                 << "请求，剩余" << remaining << "ms，来源:" << source;
         emit suppressed(static_cast<int>(method), source, remaining);
         return false;
+    }
+
+    // ---- 连续命中平滑：required == 1 时整段短路，行为与重构前完全一致 ----
+    StreakState& s = m_streak[methodIndex(method)];
+    if (s.required > 1) {
+        const bool expired = s.hasFirst && s.sinceFirst.isValid()
+                             && s.sinceFirst.elapsed() >= s.windowMs;
+        if (!s.hasFirst || expired) {
+            // 首次命中，或窗口已过 -> 从这一次**重新**开始计时与计数。
+            s.sinceFirst.start();
+            s.hasFirst = true;
+            s.pending = 1;
+        } else {
+            ++s.pending;
+        }
+
+        if (s.pending < s.required) {
+            // 还没攒够：暂缓放行。**不**动 m_sinceGrant（未放行就没有静默期）。
+            ++m_pending;
+            qInfo() << "[放行] 连续命中未达标，" << methodText(method) << "已"
+                    << s.pending << "/" << s.required << "，来源:" << source;
+            emit streakProgress(static_cast<int>(method), source, s.pending,
+                                s.required);
+            return false;
+        }
+
+        // 攒够了：清空进度（下一次要重新攒），然后照常放行。
+        s.pending = 0;
+        s.hasFirst = false;
     }
 
     ++m_granted;

@@ -28,6 +28,7 @@
 #include <opencv2/objdetect.hpp>
 
 #include "core/net/protocol.h"
+#include "managers/face_quality.h"
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class Widget; }
@@ -260,8 +261,23 @@ private:
     // 认证成功的四条路径（密码/指纹/人脸/远程 unlock）都必须经过
     // requestUnlock() -> AccessController -> 本对象，不允许任何一处直接写 GPIO。
     accessterminal::DoorActuator* m_doorActuator = nullptr;
-    // 放行决策中枢：唯一的"谁能进门"出口（放行记账 + 静默期）。
+    // 放行决策中枢：唯一的"谁能进门"出口（放行记账 + 静默期 + 连续命中平滑）。
     accessterminal::AccessController* m_accessController = nullptr;
+
+    // ---- 人脸质量门（方案 P4，默认关闭）----
+    //
+    // 阈值来自配置 behavior.face_quality，在 setupModules() 里一次性读出。
+    // 默认全部"不限制"（min 0 / max 255），因此不配置时行为逐字节不变。
+    accessterminal::FaceQualityThresholds m_faceQualityThresholds;
+    /// 质量门是否**真的**启用了。
+    ///
+    /// 注意：这不是一个独立配置项，而是从阈值**推导**出来的 —— 只要有任何
+    /// 一项被收紧就为 true，全默认则为 false。刻意不存一个独立的"开关"
+    /// 布尔量：那会多出一份可以与阈值**互相矛盾**的状态（开关开、阈值全默认
+    /// 时门形同虚设；开关关、阈值已收紧时配置看起来生效了却没有）。
+    /// 单一事实来源消除整类误配。判别力由 tools/verify_face_gate_rule.py 钉住。
+    bool m_faceQualityEnabled = false;
+
     bool m_hasPerson = false;
 
     // ---- 其它 ----

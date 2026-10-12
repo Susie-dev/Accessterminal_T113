@@ -118,6 +118,54 @@ public:
     /// 指纹起始 ID。协议用 2 字节承载，限定到 [0, 65535] 与线格式一致。
     int fingerprintIdStart() const { return clampInt(m_fingerprintIdStart, 0, 65535); }
 
+    // ---- 人脸质量门与连续命中平滑（方案 P4，防假阳性）----
+    //
+    // **全部默认关闭**，因此不配置时行为与重构前逐字节一致。这与本工程其它
+    // "能力类"配置同一纪律（silent_period_ms 默认 0、max_attempts 默认 0）：
+    // 这些项一旦生效就会改变"谁进得来"，必须由现场标定显式开启。
+    //
+    // 为什么要有它们：本项目已实测确认 LBPH 在单 label 下
+    // `predictedLabel == 1` **恒为真**，距离阈值是**唯一的门** —— 一张模糊、
+    // 过曝或过暗的图只要凑巧落进阈值，门就开了。质量门先挡掉明显不可用的帧，
+    // 连续命中平滑再要求"窗口内连续 N 次都识别成功"。
+
+    /// 清晰度下限（Laplacian 方差）。0 = 不限制（默认）。
+    /// 上限 1e6：清晰度是方差，实测清晰人脸在数百量级，1e6 已远超任何真实值，
+    /// 但仍能挡住"多写几个 0"式的误配。
+    double faceMinSharpness() const { return clampDouble(m_faceMinSharpness, 0.0, 1e6); }
+    /// 亮度下限（灰度均值）。0 = 不限制（默认）。
+    double faceMinBrightness() const { return clampDouble(m_faceMinBrightness, 0.0, 255.0); }
+    /// 亮度上限（灰度均值）。255 = 不限制（默认）。
+    double faceMaxBrightness() const { return clampDouble(m_faceMaxBrightness, 0.0, 255.0); }
+    /// 对比度下限（灰度标准差）。0 = 不限制（默认）。
+    double faceMinContrast() const { return clampDouble(m_faceMinContrast, 0.0, 128.0); }
+    /// 人脸框面积占比下限（0~1）。0 = 不限制（默认）。
+    double faceMinAreaRatio() const { return clampDouble(m_faceMinAreaRatio, 0.0, 1.0); }
+
+    /// 人脸放行所需的连续命中次数。1 = 不启用（默认）。
+    /// 上限 10：超过 10 次门口的人早走了，且"到底要试几次"不可预期。
+    int faceRequiredStreak() const { return clampInt(m_faceRequiredStreak, 1, 10); }
+    /// 连续命中统计窗口（毫秒）。仅在 faceRequiredStreak > 1 时有意义。
+    /// **从第一次命中起算**（不是从最近一次）—— 详见 AccessController 的说明。
+    int faceStreakWindowMs() const { return clampInt(m_faceStreakWindowMs, 1, 60000); }
+
+    /**
+     * @brief 质量门是否**真的**启用了（有任何一项阈值被收紧即为 true）。
+     *
+     * 刻意不提供"启用开关"这个独立配置项：那份状态会与阈值**互相矛盾**
+     * （开关开、阈值全默认时门形同虚设；开关关、阈值已收紧时配置看起来
+     * 生效了却没有）。由阈值推导保证只有一个事实来源。
+     * 判别力由 tools/verify_face_gate_rule.py 钉住。
+     */
+    bool faceQualityEnabled() const
+    {
+        return faceMinSharpness() > 0.0
+               || faceMinBrightness() > 0.0
+               || faceMaxBrightness() < 255.0
+               || faceMinContrast() > 0.0
+               || faceMinAreaRatio() > 0.0;
+    }
+
     /// 管理员开锁密码（默认值沿用重构前的 "5788"）。
     ///
     /// **第 41 轮语义变更**：这个值现在只作为**首次初始化的引导值**。
@@ -163,6 +211,15 @@ private:
     double m_faceConfidenceThreshold = 90.0;
     int m_fingerprintIdStart = 1;
     QString m_doorPassword;
+
+    // 人脸质量门与连续命中平滑（默认全部关闭，见各自的访问器注释）。
+    double m_faceMinSharpness = 0.0;
+    double m_faceMinBrightness = 0.0;
+    double m_faceMaxBrightness = 255.0;
+    double m_faceMinContrast = 0.0;
+    double m_faceMinAreaRatio = 0.0;
+    int m_faceRequiredStreak = 1;
+    int m_faceStreakWindowMs = 5000;
 };
 
 } // namespace accessterminal

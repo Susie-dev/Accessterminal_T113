@@ -264,6 +264,42 @@ void Widget::setupGpio()
     // 属于需要显式决策的变更，因此默认 0；能力本身有单元测试覆盖
     // （tests/test_access_controller.cpp）。
     m_accessController->setSilentPeriodMs(kUnlockSilentPeriodMs);
+
+    // ---- 人脸质量门与连续命中平滑（方案 P4，默认全部关闭）----
+    //
+    // 装配点**直接读访问器**（与本工程其它配置消费者一致），不经过
+    // app_config 内的聚合函数：访问器各自带范围兜底，这里拿到的都是合法值。
+    // 默认配置（face_quality 段缺失）= 完全不限制 + requiredStreak == 1，
+    // 于是下面两处都不会改变任何行为。
+    {
+        m_faceQualityThresholds.minSharpness = cfg.faceMinSharpness();
+        m_faceQualityThresholds.minBrightness = cfg.faceMinBrightness();
+        m_faceQualityThresholds.maxBrightness = cfg.faceMaxBrightness();
+        m_faceQualityThresholds.minContrast = cfg.faceMinContrast();
+        m_faceQualityThresholds.minAreaRatio = cfg.faceMinAreaRatio();
+
+        // "是否启用"由阈值**推导**，不存独立开关（见 app_config.h 与 widget.h）。
+        m_faceQualityEnabled = cfg.faceQualityEnabled();
+
+        // 连续命中只给人脸设 —— 其余三条路径恒为 1，一次就放行。
+        // 这正是把它做成 per-method 的理由：若做成全局开关，为加严人脸而设
+        // requiredStreak=2 会**顺带**让"密码输一次不开门"。
+        m_accessController->setRequiredStreak(
+            accessterminal::AccessMethod::Face,
+            cfg.faceRequiredStreak(), cfg.faceStreakWindowMs());
+    }
+
+    if (m_faceQualityEnabled || cfg.faceRequiredStreak() > 1) {
+        qInfo() << "[人脸门] 质量门" << (m_faceQualityEnabled ? "启用" : "关闭")
+                << "清晰度>=" << m_faceQualityThresholds.minSharpness
+                << "亮度[" << m_faceQualityThresholds.minBrightness
+                << "," << m_faceQualityThresholds.maxBrightness << "]"
+                << "对比度>=" << m_faceQualityThresholds.minContrast
+                << "占比>=" << m_faceQualityThresholds.minAreaRatio
+                << "连续命中=" << cfg.faceRequiredStreak()
+                << "窗口=" << cfg.faceStreakWindowMs() << "ms";
+    }
+
     connect(m_accessController, &accessterminal::AccessController::actuated, this,
             [](const QString& source, bool realActuator) {
                 // 只在"没真的开门"时出声：现场必须能一眼看出是模拟开锁，
@@ -989,6 +1025,30 @@ void Widget::updateFrame()
                 [](const cv::Rect& a, const cv::Rect& b) { return a.area() < b.area(); });
             if (maxFace != m_faces.end()) {
                 const QRect faceRect(maxFace->x, maxFace->y, maxFace->width, maxFace->height);
+                // ---- 人脸质量门（方案 P4，默认关闭）----
+                //
+                // 放在 scaled() **之前**：质量评估本来就要遍历像素，而
+                // scaled(100,100) 会再产生一份小图；先判质量可以省掉
+                // "明显不可用"那些帧的缩放与随后的 LBPH predict()。
+                //
+                // 为什么要它：本工程已实测确认 LBPH 在单 label 下
+                // predictedLabel == 1 恒为真，距离阈值是**唯一的门** ——
+                // 一张模糊/过曝/过暗的图凑巧落进阈值就会开门。
+                //
+                // 默认阈值全部"不限制"，因此不配置时这里恒为 true，
+                // 行为与重构前逐字节一致（有测试守着这一点）。
+                if (m_faceQualityEnabled) {
+                    const accessterminal::FaceQualityReport q =
+                        accessterminal::FaceQuality::evaluate(
+                            frame, faceRect, m_faceQualityThresholds);
+                    if (!q.acceptable) {
+                        // 拒绝时**不改动冷却计时器**：这一帧本来就不该
+                        // 占用一次识别机会，让它立刻重试下一帧更合理。
+                        qInfo() << "[人脸质量] 本帧不达标，跳过识别:"
+                                << q.describe();
+                        return;
+                    }
+                }
                 const QImage faceImage =
                     frame.copy(faceRect).scaled(100, 100, Qt::KeepAspectRatio);
                 m_faceManager->recognize(faceImage);

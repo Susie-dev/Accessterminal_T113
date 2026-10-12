@@ -116,6 +116,7 @@ set(APP_SOURCES
     src/managers/credential_store.cpp
     src/managers/door_actuator.cpp
     src/managers/face_manager.cpp
+    src/managers/face_quality.cpp
     src/managers/fingerprint_manager.cpp
     src/managers/password_manager.cpp
 

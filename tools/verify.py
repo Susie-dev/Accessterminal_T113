@@ -3820,6 +3820,33 @@ def _cmake_call_containing(text, command, marker):
     return None
 
 
+def _brace_body(text, open_pos):
+    r"""从 `text[open_pos]`（必须是 `{`）按花括号配对取到分支体。
+
+    返回 `(body, close_pos)`；`body` 是花括号**内部**的文本，
+    `close_pos` 是配对 `}` 的下标。找不到配对时返回 `(None, open_pos)`。
+
+    为什么要单独抽出来：本项目已有多处需要"按分支"精确判定
+    （而不是在整文件里搜名字）。第 43 轮的 `[face-anti-fp]` 规则要求
+    断言"else 分支里不得出现计时调用"，那就必须把两个分支体分别切出来 ——
+    在整文件里搜字符串做不到这件事，而实测证明只搜名字会**假绿**
+    （把 `sinceFirst.start()` 删掉后名字仍在，规则照样通过）。
+
+    前提：调用方应传入**已剥离注释**的文本，否则注释里的花括号会打乱配对。
+    """
+    if open_pos >= len(text) or text[open_pos] != "{":
+        return None, open_pos
+    depth = 0
+    for k in range(open_pos, len(text)):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_pos + 1:k], k
+    return None, open_pos
+
+
 def _function_body(text, qualified_name):
     r"""返回 `qualified_name` 函数体的花括号内文本；找不到返回 None。
 
@@ -4775,6 +4802,251 @@ def check_credential_store_test_is_wired(root, src_root):
              "时序断言要等性质，不要等固定时长（README 第 14 条）")
 
 
+def check_face_anti_false_positive(root, src_root):
+    """
+    人脸防假阳性的两道门必须真实存在：**质量门**与**连续命中平滑**（方案 P4）。
+
+    背景（这是安全问题，不是体验问题）
+    ----------------------------------
+    本工程已实测确认：LBPH 在单 label 下 `predictedLabel == 1` **恒为真**
+    （tests/test_face_manager.cpp 的结论），于是 `face_confidence_threshold`
+    是**唯一的门** —— 一张模糊、过曝或过暗的图只要其距离凑巧落进阈值，
+    **门就开了**，而门外站的可能不是注册者。
+
+    本规则守四件事（每条都对应一个变异，见 tools/verify_face_anti_fp_rule.py）：
+
+    A. **质量门真的被接进识别路径**。最危险的退化是"类写好了、测试也全绿，
+       但 widget.cpp 根本没调用它" —— 那与没有这个类完全等价，而且比没有
+       更糟：它让人以为已经防住了。
+    B. **质量门在 scaled() 之前判**。放到后面等于先付出缩放与 predict 的
+       成本再丢弃，P4 想省的开销一点没省（且 predict 可能已产生副作用）。
+    C. **"是否启用"必须由阈值推导，不得是独立开关**。独立布尔量会与阈值
+       互相矛盾：开关开而阈值全默认时门形同虚设（静默失效）；
+       开关关而阈值已收紧时配置看起来生效了却没有。这类"两份状态"是
+       误配的温床。
+    D. **连续命中的窗口必须从"第一次命中"起算，不能从"最近一次"**。
+       从最近一次起算的话，只要命中间隔小于窗口就能无限累积 ——
+       一个人干站着（或一次持续误检）迟早会攒够 N 次，门等于没锁。
+       这是本规则里**最需要判别力**的一条。
+
+    另外守两条"不许静默改变行为"的承诺：
+      E. 质量门与连续命中都必须**默认关闭**（阈值全默认 / required == 1），
+         否则重构会悄悄改变"谁进得来"。
+      F. 连续命中必须**按认证方式**独立配置（`setRequiredStreak(method,...)`），
+         不能是全局开关 —— 否则为加严人脸而设的 N 会顺带让"密码输一次不开门"。
+    """
+    fq_h = os.path.join(src_root, "managers", "face_quality.h")
+    fq_cpp = os.path.join(src_root, "managers", "face_quality.cpp")
+    ac_h = os.path.join(src_root, "managers", "access_controller.h")
+    ac_cpp = os.path.join(src_root, "managers", "access_controller.cpp")
+    widget_cpp = os.path.join(src_root, "ui", "widget.cpp")
+    cfg_h = os.path.join(src_root, "config", "app_config.h")
+    cfg_json = os.path.join(root, "config", "appconfig.json")
+
+    tname = "tests/test_face_quality.cpp"
+    t_quality = os.path.join(root, tname)
+
+    for p in (fq_h, fq_cpp, ac_h, ac_cpp, widget_cpp, cfg_h):
+        if not os.path.isfile(p):
+            fail("[face-anti-fp] 缺少必需文件: %s" % p)
+            return
+
+    fqh = strip_comments_and_strings(read(fq_h))
+    fqc = strip_comments_and_strings(read(fq_cpp))
+    ach = strip_comments_and_strings(read(ac_h))
+    acc = strip_comments_and_strings(read(ac_cpp))
+    wid = strip_comments_and_strings(read(widget_cpp))
+    cfgh = strip_comments_and_strings(read(cfg_h))
+
+    # ---- A. 质量门必须被真的接进识别路径 ----
+    if not re.search(r"\bFaceQuality::evaluate\s*\(", wid):
+        fail("[face-anti-fp] widget.cpp 没有人脸质量门调用（应有 "
+             "`FaceQuality::evaluate(...)`）—— 类写了却不调用，与没有这个类"
+             "完全等价，而且更糟：它让人以为已经防住了")
+    # 结论必须真的被用来拦截（不能只评估不判断）。
+    if not re.search(r"\.acceptable\b", wid):
+        fail("[face-anti-fp] 质量门的结果没有被判断（缺少 `.acceptable`）—— "
+             "只评估不拦截等于没接")
+
+    # ---- B. 必须在人脸裁剪/缩放之前判 ----
+    #
+    # 注意判据要**精确**：同一函数里还有一处别处的 `scaled()`（把整帧缩到
+    # 检测用小图，见 kDetectWidth），它在质量门之前是**正确的**，与质量门无关。
+    # 若拿"函数里第一个 scaled(" 去比，就会把那个合法调用误报 —— 本规则的
+    # 第一版正是这样误报了自己（实测发现）。因此这里对齐的是**人脸裁剪**
+    # 这个确定的动作：`frame.copy(faceRect)`。
+    body = enclosing_function_body(wid, wid.find("FaceQuality::evaluate"))
+    if body is None:
+        fail("[face-anti-fp] 无法定位质量门所在的函数体（检查器已失效）")
+    else:
+        i_eval = body.find("FaceQuality::evaluate")
+        # 人脸裁剪在整个函数体里的位置（**从函数开头找**，不能从 i_eval 之后找，
+        # 否则比较恒为假 —— 本规则的第一版就踩了这个坑）。
+        i_crop = body.find("copy(faceRect)")
+        if i_eval >= 0 and i_crop >= 0 and i_eval > i_crop:
+            fail("[face-anti-fp] 质量门写在人脸裁剪（`copy(faceRect).scaled()`）"
+                 "**之后** —— 那样已经付出了缩放与 predict 的成本才丢弃，"
+                 "P4 要省的开销一点没省")
+
+    # ---- C. "是否启用"必须由阈值推导 ----
+    if not re.search(r"\bbool\s+faceQualityEnabled\s*\(\s*\)\s*const", cfgh):
+        fail("[face-anti-fp] app_config.h 缺少 `faceQualityEnabled()` —— "
+             "启用状态必须由阈值推导，不得是独立开关（会与阈值互相矛盾）")
+    # 推导体里必须真的引用阈值访问器（不能直接 return false/true）。
+    # 头文件里是内联定义（`bool faceQualityEnabled() const { ... }`），
+    # 没有 `AppConfig::` 前缀，直接按名字取函数体。
+    en_body = _function_body(cfgh, "faceQualityEnabled")
+    if en_body is None:
+        fail("[face-anti-fp] 无法解析 faceQualityEnabled() 的函数体")
+    elif not re.search(r"\bfaceMin\w*\s*\(|\bfaceMax\w*\s*\(", en_body):
+        fail("[face-anti-fp] faceQualityEnabled() 没有引用阈值访问器 —— "
+             "启用状态必须由阈值推导出来")
+
+    # ---- D. 连续命中的窗口必须从**第一次**命中起算 ----
+    #
+    # 这一条是本规则判别力最核心的地方，因此判据必须**按分支**来判，不能
+    # 只看"名字在文件里出现过"。第一版就是后者，实测发现：
+    #   - 只把 `sinceFirst.start()` 删掉（仍保留 `sinceFirst.isValid()`
+    #     等其它引用）时，规则依然判绿 —— 名字还在，计时却没了；
+    #   - 写成"`++pending` 后面跟 restart"的顺序匹配也很脆（真实变异里
+    #     restart 在 ++pending **之前**，顺序匹配抓不到）。
+    # 做法：把 `if (!s.hasFirst || expired) { ... } else { ... }` 两个分支
+    # 各自切出来，断言**else 分支（= 后续命中）里不得有任何计时调用**。
+    # "从最近一次起算"的写法（无论 restart() 还是 start()）必然落在 else 里，
+    # 因此这条判据与具体写法无关。
+    #
+    # 至于 `expired` 这个量本身：**不单独检查它由什么算出来**。实测表明
+    # "把 expired 写死为 false"这类变异无法靠文本判定可靠区分（`hasFirst`
+    # 的名字仍在分支条件与赋值里，名字存在 ≠ 机制存在）。真正能证明窗口
+    # 生效的是**运行期**行为，那由 tests/test_access_controller.cpp 的
+    # `streakWindowStartsAtFirstHitNotLast` 用例钉住（已实测：把窗口改成
+    # "从最近一次起算"后该用例变红）。静态规则只管结构与形态，
+    # 语义正确性交给单元测试 —— 这个分工写在这里以免后人误以为
+    # 静态规则已经守住了窗口语义。
+    if not re.search(r"\bhasFirst\b", acc):
+        fail("[face-anti-fp] access_controller.cpp 里没有 `hasFirst` 标记 —— "
+             "无法区分\"第一次命中\"与\"后续命中\"，窗口语义无从谈起")
+    if not re.search(r"\bsinceFirst\b", acc):
+        fail("[face-anti-fp] access_controller.cpp 里没有 `sinceFirst` 计时器 —— "
+             "连续命中的窗口必须从第一次命中起算")
+    # 必须**真的启动过**计时器（只声明、只查询不算）。
+    if not re.search(r"sinceFirst\s*\.\s*start\s*\(", acc):
+        fail("[face-anti-fp] 从未对 `sinceFirst` 调用 start() —— "
+             "窗口没有真正开始计时，连续命中会被无限期累积")
+
+    m_if = re.search(r"if\s*\(\s*!s\.hasFirst\s*\|\|\s*expired\s*\)\s*\{", acc)
+    if m_if is None:
+        fail("[face-anti-fp] 找不到 \"首次命中或已过期\" 的判定分支"
+             "（`if (!s.hasFirst || expired) {`）—— 检查器需同步更新，"
+             "**不要**让本规则静默失效")
+    else:
+        if_body, k = _brace_body(acc, m_if.end() - 1)
+        if if_body is None:
+            fail("[face-anti-fp] 无法解析 \"首次命中或已过期\" 的 if 分支体"
+                 "（检查器已失效，请同步更新本规则）")
+        else:
+            rest = acc[k + 1:]
+            m_else = re.match(r"\s*else\s*\{", rest)
+            if m_else is None:
+                fail("[face-anti-fp] \"首次命中或已过期\" 的分支没有 else —— "
+                     "后续命中与首次命中必须分开处理，否则窗口语义不成立")
+            else:
+                # 注意下标换算：m_else 是在**切片** rest 上匹配的，其 end() 是
+                # 相对 rest 的偏移，必须加回切片起点 (k+1) 才是 acc 里的位置。
+                # 漏掉这一步会取到错误的（甚至为空的）花括号区间 ——
+                # 第 43 轮实测：那个 bug 让 _brace_body 返回 None 并抛异常。
+                else_body, _ = _brace_body(acc, (k + 1) + m_else.end() - 1)
+                if else_body is None:
+                    fail("[face-anti-fp] 无法解析 \"后续命中\" 的 else 分支体"
+                         "（检查器已失效，请同步更新本规则）")
+                else:
+                    # 首次/过期分支里**必须**重新开始计时（否则窗口不会开启）。
+                    if not re.search(r"sinceFirst\s*\.\s*(?:re)?start\s*\(",
+                                     if_body):
+                        fail("[face-anti-fp] \"首次命中或已过期\"分支里没有重新"
+                             "开始计时（应有 `sinceFirst.start()`）—— 窗口不会开启")
+                    # **后续命中分支里不得有任何计时调用** —— 那正是
+                    # "从最近一次起算"。
+                    if re.search(r"sinceFirst\s*\.\s*(?:re)?start\s*\(",
+                                 else_body):
+                        fail("[face-anti-fp] 检测到\"后续命中也重置计时\""
+                             "（else 分支里出现 `sinceFirst` 的 start/restart）—— "
+                             "那是\"窗口从最近一次起算\"，会让干站着的人迟早攒够"
+                             " N 次，门等于没锁")
+
+    # ---- E. 默认必须关闭（不改变现场行为）----
+    if not re.search(r"m_faceRequiredStreak\s*=\s*1\b", cfgh):
+        fail("[face-anti-fp] m_faceRequiredStreak 默认值必须是 1（= 不启用）—— "
+             "否则重构会悄悄改变\"谁进得来\"")
+    if not re.search(r"m_faceMinSharpness\s*=\s*0\.0\b", cfgh):
+        fail("[face-anti-fp] m_faceMinSharpness 默认值必须是 0（= 不限制）")
+    if not re.search(r"m_faceMaxBrightness\s*=\s*255\.0\b", cfgh):
+        fail("[face-anti-fp] m_faceMaxBrightness 默认值必须是 255（= 不限制）")
+
+    # ---- F. 连续命中必须按认证方式独立配置 ----
+    if not re.search(r"setRequiredStreak\s*\(\s*(?:accessterminal::)?AccessMethod",
+                     wid):
+        fail("[face-anti-fp] widget.cpp 必须按**认证方式**设连续命中"
+             "（`setRequiredStreak(AccessMethod::Face, ...)`）—— "
+             "做成全局开关会顺带让\"密码输一次不开门\"")
+    if not re.search(r"\bkAccessMethodCount\b", ach):
+        fail("[face-anti-fp] access_controller.h 缺少 kAccessMethodCount —— "
+             "按方式存储的状态数组需要它")
+
+    # ---- 夹具与测试必须真的在（§78：会静默消失的检查比没有更糟）----
+    if not os.path.isfile(t_quality):
+        fail("[face-anti-fp] 缺少 %s —— 质量门必须有自己的单元测试" % tname)
+    else:
+        tq = read(t_quality)
+        # 对齐陷阱是这套代码里最容易静默出错的一处，必须有专门用例。
+        if not re.search(r"\bvoid\s+unalignedWidth\w*\s*\(\s*\)", tq):
+            fail("[face-anti-fp] test_face_quality.cpp 缺少「非 4 字节对齐宽度」"
+                 "用例 —— QImage 扫描线按 4 字节对齐，用 width() 而非 "
+                 "bytesPerLine() 定位行首会读到行尾填充，且只在特定宽度下发作")
+        # 「默认不限制」必须有断言。
+        if not re.search(r"\bvoid\s+defaultThresholds\w*\s*\(\s*\)", tq):
+            fail("[face-anti-fp] test_face_quality.cpp 缺少「默认阈值不限制任何"
+                 "输入」用例 —— 那是\"不配置时行为不变\"的承诺")
+
+    tac = os.path.join(root, "tests", "test_access_controller.cpp")
+    if not os.path.isfile(tac):
+        fail("[face-anti-fp] 缺少 tests/test_access_controller.cpp")
+        return
+    ta = read(tac)
+    if not re.search(r"\bvoid\s+streakWindow\w*\s*\(\s*\)", ta):
+        fail("[face-anti-fp] test_access_controller.cpp 缺少「窗口从第一次命中"
+             "起算」用例 —— 这是防假阳性最核心的一条语义")
+    if not re.search(r"\bvoid\s+streakIsPerMethod\w*\s*\(\s*\)", ta):
+        fail("[face-anti-fp] test_access_controller.cpp 缺少「按方式独立、不泄漏"
+             "到其它路径」用例")
+
+    # ---- 测试目标必须真的注册（否则测试文件存在但从不执行）----
+    tests_cmake = os.path.join(root, "tests", "CMakeLists.txt")
+    if os.path.isfile(tests_cmake):
+        cm = read(tests_cmake)
+        if "t113_test_face_quality" not in cm:
+            fail("[face-anti-fp] tests/CMakeLists.txt 没有注册 t113_test_face_quality"
+                 " —— 测试写了却从不执行（README 第 78 条）")
+        # 质量门不依赖 OpenCV，**不得**被放进 OpenCV 可选分支里，
+        # 否则没装 face 模块的机器会安静地少跑一组测试。
+        m = re.search(r"(?s)find_package\(OpenCV.*?\nendif\(\)", cm)
+        if m and "t113_test_face_quality" in m.group(0):
+            fail("[face-anti-fp] t113_test_face_quality 被放进了 OpenCV 可选分支 ——"
+                 " 它不依赖 OpenCV，放进去会让缺 face 模块的机器静默少跑一组测试")
+
+    # ---- 配置样例里必须有这一段（否则运维不知道有这些旋钮）----
+    if os.path.isfile(cfg_json):
+        cj = read(cfg_json)
+        for key in ("min_sharpness", "required_streak", "streak_window_ms"):
+            if key not in cj:
+                fail("[face-anti-fp] config/appconfig.json 缺少 face_quality.%s —— "
+                     "配置项没有样例，运维不知道它存在" % key)
+        # ONNX 的否定决定必须写在配置注释里（防止后来者"以为接了就能用"）。
+        if "ONNX" not in cj:
+            fail("[face-anti-fp] config/appconfig.json 未写明「不引入 ONNX 后端」"
+                 "的决定 —— 后来者会以为接了就能用")
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: python verify.py <项目根目录> [另一仓库根目录]")
@@ -4838,6 +5110,7 @@ def main():
     check_credentials_are_hashed_not_plaintext(root, src_root)
     check_credential_store_test_is_wired(root, src_root)
     check_latest_value_handoff(root, src_root)
+    check_face_anti_false_positive(root, src_root)
 
     print(f"校验目录: {root}")
     print("=" * 70)

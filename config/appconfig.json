@@ -27,7 +27,21 @@
     "face_detect_interval": 10,
     "face_recognize_interval_ms": 2000,
     "face_confidence_threshold": 90.0,
-    "fingerprint_id_start": 1
+    "fingerprint_id_start": 1,
+
+    "face_quality": {
+      "_comment": "人脸质量门与连续命中平滑（第 43 轮，方案 P4）。**以下默认值全部表示「不限制/不启用」，因此本段可以整段删除，行为与删除前逐字节一致。** 为什么需要：LBPH 在单用户下 predictedLabel 恒为 1，face_confidence_threshold 是**唯一的门** —— 一张模糊/过曝/过暗的图只要凑巧落进阈值就会开门。开启办法：把 min_sharpness 等调到现场实测的合理值（先用日志里的 [人脸质量] 一行观察真实指标分布，再决定阈值）。unit 见 src/managers/face_quality.h。",
+      "_comment_streak": "required_streak > 1 时要求「窗口内连续 N 次识别都成功」才放行，把单帧误判变成需要连续 N 次误判。窗口从**第一次**命中起算（不是从最近一次），因此慢速滴灌永远攒不满 —— 否则一个人干站着迟早会攒够，门等于没锁。本项**只影响人脸**，密码/指纹/远程始终一次放行。",
+      "_comment_onnx": "**明确决定：不引入 ONNX / 深度学习人脸后端。** 现场是 T113（Cortex-A7，无 NPU 加速可用），ONNX Runtime 会显著增大镜像与内存占用，而本工程无法在目标板上做精度标定与长期验证；「以为接了就能用」比不做更危险。防假阳性改由质量门 + 连续命中平滑这两项可解释、可现场标定的机制承担。若将来要换后端，请连同目标板实测数据一起决策。",
+
+      "min_sharpness": 0.0,
+      "min_brightness": 0.0,
+      "max_brightness": 255.0,
+      "min_contrast": 0.0,
+      "min_area_ratio": 0.0,
+      "required_streak": 1,
+      "streak_window_ms": 5000
+    }
   },
 
   "security": {

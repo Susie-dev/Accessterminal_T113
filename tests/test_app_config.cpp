@@ -88,6 +88,13 @@ private slots:
     void legacyEnvVarsStillHonored();
     void fingerprintIdStartMatchesWireRange();
     void pcmFileJoinsDirectory();
+
+    // 人脸质量门与连续命中平滑（第 43 轮，方案 P4）
+    void faceGateDefaultsToDisabled();
+    void faceGateEnableIsDerivedFromThresholds();
+    void faceGateValuesAreClamped();
+    void faceGateLegalValuesPassThrough();
+    void faceGateEnvOverridesWork();
 };
 
 void TestAppConfig::init() { clearEnv(); }
@@ -239,6 +246,149 @@ void TestAppConfig::legalValuesPassThroughUnchanged()
     QCOMPARE(cfg.faceConfidenceThreshold(), 77.5);
     QCOMPARE(cfg.fingerprintIdStart(), 42);
     QCOMPARE(cfg.doorPassword(), QStringLiteral("1234"));
+}
+
+/**
+ * 人脸质量门与连续命中平滑（第 43 轮，方案 P4）：**默认必须全部关闭**。
+ *
+ * 这一组守的是"不配置时行为逐字节不变"的承诺。它比看上去重要：质量门与
+ * 连续命中都直接决定"谁进得来"，一旦默认值被顺手改成"开"，重构就会悄悄
+ * 把现场用户挡在门外（或让人脸更严却无人知晓）。
+ *
+ * 同时钉住 faceQualityEnabled() 的**推导**语义：它不是独立开关，而是由
+ * 五项阈值里"是否有任何一项被收紧"算出来的。独立布尔量会与阈值互相矛盾
+ * （开关开而阈值全默认 → 静默失效；开关关而阈值已收紧 → 配置看起来生效
+ * 却没有），推导消除整类误配。
+ */
+void TestAppConfig::faceGateDefaultsToDisabled()
+{
+    clearEnv();
+    AppConfig& cfg = AppConfig::instance();
+    cfg.load(QStringLiteral("/nonexistent/definitely-missing.json"));
+
+    // 五项阈值全默认 = 不限制
+    QCOMPARE(cfg.faceMinSharpness(), 0.0);
+    QCOMPARE(cfg.faceMinBrightness(), 0.0);
+    QCOMPARE(cfg.faceMaxBrightness(), 255.0);
+    QCOMPARE(cfg.faceMinContrast(), 0.0);
+    QCOMPARE(cfg.faceMinAreaRatio(), 0.0);
+    // 连续命中默认 1 = 不启用
+    QCOMPARE(cfg.faceRequiredStreak(), 1);
+    // 推导结果必须是"未启用"—— 这是"不配置时行为不变"的核心断言
+    QVERIFY2(!cfg.faceQualityEnabled(),
+             "默认配置下质量门必须是关闭的，否则会悄悄改变谁能进门");
+}
+
+/// 任何一项阈值被收紧，推导出的"启用"就必须为真。
+void TestAppConfig::faceGateEnableIsDerivedFromThresholds()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    AppConfig& cfg = AppConfig::instance();
+
+    // 逐项单独收紧，每一项都必须让 faceQualityEnabled() 变真。
+    // 这正是"推导"与"独立开关"的区别：没有第二份状态可以对不上。
+    const char* json[] = {
+        "{\"behavior\":{\"face_quality\":{\"min_sharpness\":25.0}}}",
+        "{\"behavior\":{\"face_quality\":{\"min_brightness\":40.0}}}",
+        "{\"behavior\":{\"face_quality\":{\"max_brightness\":220.0}}}",
+        "{\"behavior\":{\"face_quality\":{\"min_contrast\":10.0}}}",
+        "{\"behavior\":{\"face_quality\":{\"min_area_ratio\":0.05}}}",
+    };
+    for (const char* j : json) {
+        const QString path = writeConfig(dir, j);
+        QVERIFY(cfg.load(path));
+        QVERIFY2(cfg.faceQualityEnabled(),
+                 j);   // 收紧阈值后必须判定为启用（失败时直接打印那段 JSON）
+    }
+
+    // 反向：阈值全默认时必须回到"未启用"（证明不是一旦打开就再也关不掉）。
+    const QString path = writeConfig(dir,
+        "{\"behavior\":{\"face_quality\":{\"min_sharpness\":0.0,"
+        "\"min_brightness\":0.0,\"max_brightness\":255.0,"
+        "\"min_contrast\":0.0,\"min_area_ratio\":0.0}}}");
+    QVERIFY(cfg.load(path));
+    QVERIFY2(!cfg.faceQualityEnabled(), "阈值回到默认后必须判定为关闭");
+}
+
+/// 质量门与连续命中的非法值必须被夹到文档化区间。
+void TestAppConfig::faceGateValuesAreClamped()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    AppConfig& cfg = AppConfig::instance();
+
+    const QString path = writeConfig(dir,
+        "{\"behavior\":{\"face_quality\":{"
+        "\"min_sharpness\":-5.0,"        // -> 0
+        "\"min_brightness\":-1.0,"       // -> 0
+        "\"max_brightness\":999.0,"      // -> 255
+        "\"min_contrast\":-9.0,"         // -> 0
+        "\"min_area_ratio\":-0.5,"       // -> 0
+        "\"required_streak\":0,"         // -> 1（0 = 不启用，不是"永远不放行"）
+        "\"streak_window_ms\":0}}}");    // -> 1
+
+    QVERIFY(cfg.load(path));
+    QCOMPARE(cfg.faceMinSharpness(), 0.0);
+    QCOMPARE(cfg.faceMinBrightness(), 0.0);
+    QCOMPARE(cfg.faceMaxBrightness(), 255.0);
+    QCOMPARE(cfg.faceMinContrast(), 0.0);
+    QCOMPARE(cfg.faceMinAreaRatio(), 0.0);
+    QCOMPARE(cfg.faceRequiredStreak(), 1);
+    QCOMPARE(cfg.faceStreakWindowMs(), 1);
+
+    // 上界
+    const QString path2 = writeConfig(dir,
+        "{\"behavior\":{\"face_quality\":{"
+        "\"required_streak\":9999,\"streak_window_ms\":99999999}}}");
+    QVERIFY(cfg.load(path2));
+    QCOMPARE(cfg.faceRequiredStreak(), 10);
+    QCOMPARE(cfg.faceStreakWindowMs(), 60000);
+
+    // required_streak = 1 是"不启用"；夹取绝不能把它变成 0 或负数
+    // （那会让放行条件永远不成立 —— 门再也打不开，是更严重的事故）。
+    QVERIFY(cfg.faceRequiredStreak() >= 1);
+}
+
+/// 合法值必须原样通过（不能因为加兜底而改变正常配置）。
+void TestAppConfig::faceGateLegalValuesPassThrough()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = writeConfig(dir,
+        "{\"behavior\":{\"face_quality\":{"
+        "\"min_sharpness\":30.5,\"min_brightness\":45.0,"
+        "\"max_brightness\":210.0,\"min_contrast\":12.5,"
+        "\"min_area_ratio\":0.08,"
+        "\"required_streak\":3,\"streak_window_ms\":4000}}}");
+
+    AppConfig& cfg = AppConfig::instance();
+    QVERIFY(cfg.load(path));
+    QCOMPARE(cfg.faceMinSharpness(), 30.5);
+    QCOMPARE(cfg.faceMinBrightness(), 45.0);
+    QCOMPARE(cfg.faceMaxBrightness(), 210.0);
+    QCOMPARE(cfg.faceMinContrast(), 12.5);
+    QCOMPARE(cfg.faceMinAreaRatio(), 0.08);
+    QCOMPARE(cfg.faceRequiredStreak(), 3);
+    QCOMPARE(cfg.faceStreakWindowMs(), 4000);
+    QVERIFY(cfg.faceQualityEnabled());
+}
+
+/// 环境变量覆盖必须与新配置项一致（现场标定靠它，不改文件）。
+void TestAppConfig::faceGateEnvOverridesWork()
+{
+    clearEnv();
+    qputenv("ACCESSTERMINAL_BEHAVIOR_FACE_QUALITY_MIN_SHARPNESS", QByteArray("18"));
+    qputenv("ACCESSTERMINAL_BEHAVIOR_FACE_QUALITY_REQUIRED_STREAK", QByteArray("4"));
+    qputenv("ACCESSTERMINAL_BEHAVIOR_FACE_QUALITY_STREAK_WINDOW_MS", QByteArray("2500"));
+
+    AppConfig& cfg = AppConfig::instance();
+    cfg.load(QStringLiteral("/nonexistent/definitely-missing.json"));
+
+    QCOMPARE(cfg.faceMinSharpness(), 18.0);
+    QCOMPARE(cfg.faceRequiredStreak(), 4);
+    QCOMPARE(cfg.faceStreakWindowMs(), 2500);
+    QVERIFY(cfg.faceQualityEnabled());   // 环境变量收紧后同样推导为启用
 }
 
 /// 超范围值必须被夹到文档化的区间，且不影响范围内的其它字段。

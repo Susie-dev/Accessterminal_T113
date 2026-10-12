@@ -137,6 +137,17 @@ bool AppConfig::load(const QString& configPath)
                 jsonDouble(behavior, "face_confidence_threshold", m_faceConfidenceThreshold);
             m_fingerprintIdStart = jsonInt(behavior, "fingerprint_id_start", m_fingerprintIdStart);
 
+            // 人脸质量门与连续命中平滑（方案 P4）。默认全部关闭，
+            // 不配置时行为逐字节不变。
+            const QJsonObject fq = jsonObject(behavior, "face_quality");
+            m_faceMinSharpness = jsonDouble(fq, "min_sharpness", m_faceMinSharpness);
+            m_faceMinBrightness = jsonDouble(fq, "min_brightness", m_faceMinBrightness);
+            m_faceMaxBrightness = jsonDouble(fq, "max_brightness", m_faceMaxBrightness);
+            m_faceMinContrast = jsonDouble(fq, "min_contrast", m_faceMinContrast);
+            m_faceMinAreaRatio = jsonDouble(fq, "min_area_ratio", m_faceMinAreaRatio);
+            m_faceRequiredStreak = jsonInt(fq, "required_streak", m_faceRequiredStreak);
+            m_faceStreakWindowMs = jsonInt(fq, "streak_window_ms", m_faceStreakWindowMs);
+
             const QJsonObject security = jsonObject(root, "security");
             m_doorPassword = jsonString(security, "door_password", m_doorPassword);
 
@@ -182,6 +193,23 @@ void AppConfig::applyEnvOverrides()
                 m_faceConfidenceThreshold, toDouble);
     envOverride("ACCESSTERMINAL_BEHAVIOR_FINGERPRINT_ID_START", m_fingerprintIdStart, toInt);
     envOverride("ACCESSTERMINAL_SECURITY_DOOR_PASSWORD", m_doorPassword, toQString);
+
+    // 人脸质量门与连续命中平滑（方案 P4）。与其它项一样支持环境变量覆盖，
+    // 便于现场标定而无需改文件。
+    envOverride("ACCESSTERMINAL_BEHAVIOR_FACE_QUALITY_MIN_SHARPNESS",
+                m_faceMinSharpness, toDouble);
+    envOverride("ACCESSTERMINAL_BEHAVIOR_FACE_QUALITY_MIN_BRIGHTNESS",
+                m_faceMinBrightness, toDouble);
+    envOverride("ACCESSTERMINAL_BEHAVIOR_FACE_QUALITY_MAX_BRIGHTNESS",
+                m_faceMaxBrightness, toDouble);
+    envOverride("ACCESSTERMINAL_BEHAVIOR_FACE_QUALITY_MIN_CONTRAST",
+                m_faceMinContrast, toDouble);
+    envOverride("ACCESSTERMINAL_BEHAVIOR_FACE_QUALITY_MIN_AREA_RATIO",
+                m_faceMinAreaRatio, toDouble);
+    envOverride("ACCESSTERMINAL_BEHAVIOR_FACE_QUALITY_REQUIRED_STREAK",
+                m_faceRequiredStreak, toInt);
+    envOverride("ACCESSTERMINAL_BEHAVIOR_FACE_QUALITY_STREAK_WINDOW_MS",
+                m_faceStreakWindowMs, toInt);
 }
 
 QString AppConfig::pcmFile(const QString& name) const
