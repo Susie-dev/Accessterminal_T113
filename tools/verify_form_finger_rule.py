@@ -36,125 +36,44 @@ def read(p):
 FILES = (FH, FF)
 
 # ---------------------------------------------------------------------------
-# 还原保险（README §61）：`finally` 不是还原保证。
-# 磁盘原始副本 + **中断哨兵** + atexit/SIGINT/SIGTERM/SIGBREAK。
+# 还原保险与互斥：**公共实现**（第 41 轮提取到 tools/fixture_pristine.py）。
 #
-# 哨兵（`.in-progress`）是第 37 轮补上的关键一环：只靠"磁盘副本 != 当前文件"
-# 来判断该不该自愈，会在**开发者刚改了被测文件**（完全正常）时静默回滚他的
-# 修改 —— 实测就这样丢过一整轮测试补强，而且基线还是绿的、看不出异常。
-# 正确判据是"上一次运行是否被**中断**"：有哨兵才自愈，否则用当前文件刷新副本。
+# 这段逻辑本文件原先自带一份，踩过三次坑（README §61/§62）：
+#   1. 只靠 `finally` 还原 -> 被强杀就留下污染源文件；
+#   2. 自愈判据写成"副本 != 当前文件" -> 静默回滚开发者的合法修改（第 37 轮）；
+#   3. "被中断"仍不够，**副本可能过期**（第 41 轮实测：把
+#      tests/shadows/ui/widget.h 回滚成第 37 轮之前的版本，抹掉影子头全部新增）。
+# 现在统一交给 PristineGuard（含新鲜度校验）。它自己也有单元自检：
+# tools/verify_fixture_pristine.py（20 项，含"拒绝用过期副本自愈"）。
 # ---------------------------------------------------------------------------
-BACKUP = os.path.join(os.environ['TEMP'], 'fi37rule_pristine')
-MARKER = os.path.join(BACKUP, '.in-progress')
-_ORIG = {}
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from fixture_pristine import PristineGuard  # noqa: E402
 
-
-def _backup_path(p):
-    return os.path.join(BACKUP, os.path.basename(p))
+_GUARD = PristineGuard(files=FILES, tag='fi37rule',
+                       lock_name='fi37_rewrite.lock')
+_ORIG = _GUARD.orig
 
 
 def _load_pristine():
-    healed = []
-    os.makedirs(BACKUP, exist_ok=True)
-    interrupted = os.path.exists(MARKER)
-    for p in FILES:
-        b = _backup_path(p)
-        if os.path.exists(b) and interrupted:
-            backup_text = read(b)
-            if read(p) != backup_text:
-                io.open(p, 'w', encoding='utf-8',
-                        newline='\n').write(backup_text)
-                healed.append(os.path.basename(p))
-            _ORIG[p] = backup_text
-        else:
-            _ORIG[p] = read(p)
-            io.open(b, 'w', encoding='utf-8',
-                    newline='\n').write(_ORIG[p])
-    io.open(MARKER, 'w', encoding='utf-8', newline='\n').write('running\n')
-    return healed
+    """建立/校验磁盘原始副本（含新鲜度校验），返回被自愈的文件列表。"""
+    return _GUARD.prepare()
 
 
 def _restore_all(*_a):
-    for p in FILES:
-        if p in _ORIG:
-            try:
-                io.open(p, 'w', encoding='utf-8',
-                        newline='\n').write(_ORIG[p])
-            except OSError:
-                pass
-    try:
-        os.remove(MARKER)
-    except OSError:
-        pass
-    try:
-        _release_lock()
-    except NameError:
-        pass
+    _GUARD.restore()
 
 
 def _install_guards():
-    import atexit
-    import signal
-    atexit.register(_restore_all)
-
-    def handler(signum, _frame):
-        _restore_all()
-        print('\n[中断] 收到信号 %d，已还原源文件，退出' % signum)
-        sys.exit(130)
-
-    for name in ('SIGINT', 'SIGTERM', 'SIGBREAK'):
-        sig = getattr(signal, name, None)
-        if sig is not None:
-            try:
-                signal.signal(sig, handler)
-            except (ValueError, OSError):
-                pass
-
-
-# ---------------------------------------------------------------------------
-# 并发互斥：与 verify_form_finger_test.py **共用同一把锁**。
-#
-# 两个夹具改的是同一批文件（form_finger.h/.cpp）。第 37 轮实测：并行跑会
-# 交叉污染 —— 规则夹具报"析构时不恢复"没被抓到，行为夹具报莫名其妙的误报，
-# 而单独串行重跑全部正常。共用锁即可彻底避免。
-# ---------------------------------------------------------------------------
-LOCK = os.path.join(os.environ['TEMP'], 'fi37_rewrite.lock')
+    _GUARD.install_guards()
 
 
 def _acquire_lock():
-    for _ in range(2):
-        try:
-            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, ('%d\n' % os.getpid()).encode('ascii'))
-            os.close(fd)
-            return True
-        except OSError:
-            try:
-                with io.open(LOCK, encoding='ascii') as fh:
-                    other = int(fh.read().strip())
-            except (OSError, ValueError):
-                other = None
-            alive = False
-            if other is not None:
-                try:
-                    os.kill(other, 0)
-                    alive = True
-                except OSError:
-                    alive = False
-            if alive:
-                return False
-            try:
-                os.remove(LOCK)
-            except OSError:
-                return False
-    return False
+    """拿不到锁返回 False（已有活着的夹具在改写同一批源文件）。"""
+    return _GUARD.acquire_lock()
 
 
 def _release_lock():
-    try:
-        os.remove(LOCK)
-    except OSError:
-        pass
+    _GUARD.release_lock()
 
 
 _HEALED = _load_pristine()

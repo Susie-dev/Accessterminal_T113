@@ -86,7 +86,15 @@ if [ -z "${QT_INC:-}" ]; then
         [ -n "$QT_INC" ] || QT_INC=/usr/include/x86_64-linux-gnu/qt5
     fi
 fi
-QTSP_INC="${QTSP_INC:-$(qt_query QT_INSTALL_HEADERS)}"   # QtSerialPort 头可能来自解出的 dev 包
+# QtSerialPort 的头可能来自单独解出的 dev 包，不在 QtCore 同一个前缀下，
+# 所以与 QT_INC 分开可配。默认回到 QT_INC（**不要**用 qt_query 的裸前缀）：
+# 本机 MSYS2 上 `qmake` 不在 PATH，qt_query 返回空串，于是
+# `-isystem ""` 退化成"当前目录"；而早期版本把裸的 /mingw64/include 传进来
+# 会**遮蔽 libstdc++** —— `#include <cstdlib>` 里的 `#include_next <stdlib.h>`
+# 再也找不到 mingw64/include 下的 stdlib.h，21 个文件全报
+# "stdlib.h: No such file or directory"。那看起来像代码问题，实际是路径问题。
+# （第 41 轮实测并修正：脚本本身此前未改，属既有缺口。）
+QTSP_INC="${QTSP_INC:-${QT_INC}}"
 
 if [ -z "${CV_INC:-}" ]; then
     if [ -d "$QT_INC/opencv5" ]; then
@@ -155,7 +163,7 @@ CXXFLAGS="-std=c++11 -fsyntax-only -Wall -Wextra -Wno-unused-parameter \
  -I$SRC_ROOT/src -I$OUT/ui -I$STUBS \
  -include host_compat.h \
  -isystem $QT_INC/QtCore -isystem $QT_INC/QtGui -isystem $QT_INC/QtWidgets \
- -isystem $QT_INC/QtNetwork -isystem $QTSP_INC -isystem $QTSP_INC/QtSerialPort -isystem $QT_INC/QtConcurrent \
+ -isystem $QT_INC/QtNetwork -isystem $QTSP_INC/QtSerialPort -isystem $QT_INC/QtConcurrent \
  -isystem $CV_INC -isystem $MOCS $EXTRA_FLAGS \
  -DQT_CORE_LIB -DQT_GUI_LIB -DQT_WIDGETS_LIB -DQT_NETWORK_LIB \
  -DQT_SERIALPORT_LIB -DQT_CONCURRENT_LIB $CV_COMPAT"

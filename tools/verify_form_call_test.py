@@ -47,79 +47,47 @@ def read(p):
 FILES = (SRC, WID)
 
 # ---------------------------------------------------------------------------
-# 崩溃/被强杀时的还原保险（第 36 轮真实事故）
+# 还原保险与互斥：**公共实现**（第 41 轮提取到 tools/fixture_pristine.py）。
 #
-# 事故经过：第一版把"原始内容"只放在内存里，靠 `finally` 还原。结果脚本跑到
-# 第一个变异（删掉 notifyPeerStopSend 那一行）时被**从外部强杀**，`finally`
-# 根本没机会执行，仓库里就留下了一个**被变异过的源文件** —— 而它看起来
-# 完全正常（只是少了一行）。后来下一次运行在启动预检时报"锚点出现 0 次"才
-# 暴露出来。这正是最危险的一类污染：脚本自己把被测代码改坏了，还静默退出。
+# 本文件原先自带的那一版是**最危险**的形态（第 41 轮复核时发现）：
+#   * 没有 `.in-progress` 标记，自愈判据是"副本 != 当前文件" —— 正是第 37 轮
+#     那个会**静默回滚开发者合法修改**的 bug（当时改的是 form_passwd，
+#     本文件因为共用同一批源文件而漏改）；
+#   * 完全没有互斥锁。
+# 而且它的副本可能**过期**：第 41 轮实测 fi36_pristine 里的副本一旦陈旧，
+# 就会被拿来当"原始内容"覆盖磁盘。现统一交给 PristineGuard。
 #
-# 三道防线：
-#   1. **磁盘上的原始副本**（不只在内存里）—— <临时目录>/fi36_pristine/
-#   2. **启动自愈**：若发现"磁盘副本"与当前文件不同，先用副本还原，
-#      再开始干活。于是上一次被强杀留下的污染会被下一次运行自动修好。
-#   3. **信号处理器 + atexit**：收到 SIGINT/SIGTERM/SIGBREAK 也走还原。
-#
-# 注意：`finally` 仍然保留（正常流程用），但它**不是**唯一保障。
+# 它自己的单元自检：tools/verify_fixture_pristine.py（20 项）。
+# 锁名必须与其它改写同一批源文件的夹具一致。
 # ---------------------------------------------------------------------------
-BACKUP = os.path.join(os.environ['TEMP'], 'fi36_pristine')
-_ORIG = {}
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from fixture_pristine import PristineGuard  # noqa: E402
 
-
-def _backup_path(p):
-    return os.path.join(BACKUP, os.path.basename(p))
+_GUARD = PristineGuard(files=FILES, tag='fi36',
+                       lock_name='fi37_rewrite.lock')
+_ORIG = _GUARD.orig
 
 
 def _load_pristine():
-    """建立/校验磁盘原始副本；返回被自愈的文件列表。"""
-    healed = []
-    os.makedirs(BACKUP, exist_ok=True)
-    for p in FILES:
-        b = _backup_path(p)
-        if os.path.exists(b):
-            backup_text = read(b)
-            cur = read(p)
-            if cur != backup_text:
-                # 上一次运行留下的污染（或被强杀）。用副本还原。
-                io.open(p, 'w', encoding='utf-8',
-                        newline='\n').write(backup_text)
-                healed.append(os.path.basename(p))
-            _ORIG[p] = backup_text
-        else:
-            _ORIG[p] = read(p)
-            io.open(b, 'w', encoding='utf-8',
-                    newline='\n').write(_ORIG[p])
-    return healed
+    """建立/校验磁盘原始副本（含新鲜度校验），返回被自愈的文件列表。"""
+    return _GUARD.prepare()
 
 
 def _restore_all(*_a):
-    for p in FILES:
-        if p in _ORIG:
-            try:
-                io.open(p, 'w', encoding='utf-8',
-                        newline='\n').write(_ORIG[p])
-            except OSError:
-                pass
+    _GUARD.restore()
 
 
 def _install_guards():
-    import atexit
-    import signal
-    atexit.register(_restore_all)
+    _GUARD.install_guards()
 
-    def handler(signum, _frame):
-        _restore_all()
-        print('\n[中断] 收到信号 %d，已还原源文件，退出' % signum)
-        sys.exit(130)
 
-    for name in ('SIGINT', 'SIGTERM', 'SIGBREAK'):
-        sig = getattr(signal, name, None)
-        if sig is not None:
-            try:
-                signal.signal(sig, handler)
-            except (ValueError, OSError):
-                pass
+def _acquire_lock():
+    """拿不到锁返回 False（已有活着的夹具在改写同一批源文件）。"""
+    return _GUARD.acquire_lock()
+
+
+def _release_lock():
+    _GUARD.release_lock()
 
 
 def need(s, n=1, p=SRC):
@@ -263,6 +231,21 @@ def mt(p):
 
 
 def main():
+    # 互斥：本夹具会改写 src/ui/form_call.cpp 与影子 widget.h。
+    # 第 41 轮发现它原先**完全没有锁** —— 与 form_finger 的两个夹具并发时会
+    # 交叉污染（第 37 轮同类事故）。现在统一走 PristineGuard 的锁。
+    if not _acquire_lock():
+        print('!! 已有另一个"改写源文件"的夹具在运行，请串行执行。')
+        print('   （锁文件: %s）' % os.path.join(
+            os.environ.get('TEMP') or '/tmp', 'fi37_rewrite.lock'))
+        return 3
+    try:
+        return _main_locked()
+    finally:
+        _release_lock()
+
+
+def _main_locked():
     if _HEALED:
         print('!! 检测到上一次运行留下的污染，已用磁盘原始副本自愈: %s'
               % ', '.join(_HEALED))

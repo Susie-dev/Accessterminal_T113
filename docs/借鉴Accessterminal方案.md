@@ -11,7 +11,7 @@
 
 ---
 
-## 进度总览（截至第 40 轮末）
+## 进度总览（截至第 41 轮）
 
 图例：✅ 完成 · 🟡 部分完成 · ⬜ 未开始。**每完成一步都要在这里与对应小节的
 "实施记录"里同时更新**，否则下一个人只能靠翻 git log 猜进度。
@@ -20,19 +20,33 @@
 |---|---|---|
 | **P0** 门锁语义与执行器分离 | ✅ 代码完成，**PE5 待板端裁决** | `214fd79` · 新测试 `t113_door_actuator`（3 条硬约束各配故障注入，3/3 变红）· 规则 `[actuator]` 夹具 4/4 抓到 |
 | **P1** 单一放行出口 `AccessController` | 🟡 **P1-a 完成**；P1-b/P1-c（提示音策略与人脸调度位移）未做 | `ae2b52f` · 新测试 `t113_access_controller` · `dead-slot` 告警 3 → 1 |
-| **P2** 凭据与安全模型 | ⬜ 未开始 | 现状缺口仍在：`password_manager.cpp:42` 明文比对 |
+| **P2** 凭据与安全模型 | 🟡 **存储层完成**；锁定旋钮与临时码**未接 UI/未接解锁路径**（见该节实施记录） | `src/managers/credential_store.*` 新增 · `password_manager.*` 改哈希校验 · 新测试 `t113_credential_store` 39/39 · `t113_test_password_manager` 16/16（含 5 条迁移路径）· 规则 `[credential]` 夹具 **12/12** 变红 · 行为夹具 **12/12** 变红 · `credential_store.cpp` 行覆盖 91.8% |
 | **P3** 并发与"最新值"约定 | ⬜ 未开始 | 开发约定第 72 条尚未落笔 |
 | **P4** 人脸质量门与防假阳性 | ⬜ 未开始 | — |
 | **P5** 工程卫生与文档对齐 | 🟡 4 项已完成，3 项未做（见该节实施记录） | `8308121`（Qt 5.9 重载）· `df22048`（devstubs 跨平台）· `ae2b52f`（`check_host_compile.sh` 支持 Linux、README 两处失真） |
 | **P6** 交叉编译预检 | ✅ 完成 | `18092db` · 首次交叉编译成功：`ELF 32-bit ARM`，516,644 字节，依赖闭包 **13/13** |
 | 五、建议的前三个提交 | ✅ 全部完成 | `7259117`（方案文档）· `8308121`（Qt5.9）· `214fd79`（P0） |
 
-**当前门禁水位（第 40 轮末，本机 Linux）**：`ctest` 20/20 · 主机端语法检查
-20/20 · `verify.py` rc=0（48 项检查、9 项告警、0 失败）· `check_signatures.py`
-rc=0 · `check_protocol_sync.py` rc=0 · 交叉编译产物核验通过。
+**当前门禁水位（第 41 轮，本机 Windows/MSYS2）**：`ctest` 21/21 · 主机端语法检查
+21/21 · `verify.py` rc=0（50 项检查、10 项告警、0 失败）· `check_signatures.py`
+rc=0 · `check_protocol_sync.py` rc=0 · cppcheck 无 warning/error ·
+**Debug/`--coverage` 构建也通过**（第 41 轮新加，见下）· 桌面仓库 `ctest` 7/7 ·
+跨仓库互操作 14/14 · 近似总覆盖率 **41.1% → 55.0%**。
 
-**下一件该做的事**：P2（安全模型，改动最大且是真实缺口）或 P1-b/P1-c（纯位移、
-风险低）；两者都不依赖板端裁决。板端裁决（PE5）与上板运行是另一条线，
+> **第 41 轮补的一条门禁：Debug 配置也要过。**
+> 本项目的门禁此前**只用 Release**。而 `credential_store.cpp` 里
+> `qBound(kMinIterations, ...)` 会把类内初始化的 `static const int`
+> **ODR-使用**掉 —— C++11 要求它另有类外定义。Release（-O2）把值内联，
+> 链接照样过；`--coverage -O0` 不内联，两个测试目标立刻
+> `undefined reference`。也就是说
+> **"Release 编译通过"并不等于"所有构建配置都能通过"**，
+> 而覆盖率构建恰好是 Debug，这才把它暴露出来。
+> 修复：在 `credential_store.cpp` 补齐四个类外定义（带注释说明别删）。
+> 教训已写进 README 开发约定第 72 条。
+
+**下一件该做的事**：P2 的**接线决策**（锁定旋钮与临时码要不要接到
+UI/解锁路径 —— 目前刻意只做存储层，见该节"未做的部分"），或 P1-b/P1-c
+（纯位移、风险低）；都不依赖板端裁决。板端裁决（PE5）与上板运行是另一条线，
 见 `docs/交接与继续开发.md` 的【决策】与【P0】。
 
 ---
@@ -325,11 +339,74 @@ Password, TempCode, Remote}`、唯一的 `unlock(userId, method, note)`、
 **验收门**：`t113_password_manager` 扩充 + 新增 `t113_credential_store` ·
 明文扫描规则绿 · 密码不进日志的静态 + 行为双证。
 
+#### 实施记录（第 41 轮）
+
+> **状态：🟡 存储层完成并已上测试；接线未做。**
+> 上面"要做的事"1~4 全部落地；但**锁定旋钮与临时码刻意没有接到 UI 与解锁
+> 路径**（用户显式选择"只做存储层，不接 UI"）。见下方"未做的部分"。
+
+| 设计项 | 落地形态 |
+|---|---|
+| 加盐 SHA-256 | `CredentialStore::hashSecret(plain, salt, iterations)`，格式 `sha256:<盐hex>:<迭代数>:<摘要hex>`。每用户**独立**盐；`makeSalt()` 优先读 `/dev/urandom`，取不到退回重复 `QUuid`（**刻意不用 `qrand`/`QRandomGenerator`** —— 前者不是密码学随机源，后者是 Qt 5.10+，越过 5.9 底线） |
+| 原子写 | `QSaveFile`（临时文件 + `commit()` 改名），写完 `setPermissions(ReadOwner\|WriteOwner)`。理由：门口机可能被直接断电，非原子写会留下半截 JSON → 下次启动解析失败 = "门忽然打不开" |
+| 按用户计数 / 锁定到期 | `failed` 与 `lockedUntilMs` 按 userId 存。**默认 `maxAttempts=0` = 从不锁定**，即"未配置时行为与重构前一致"；启用锁定是**显式**行为变更。`setLockoutMs` 上限 24h（防配置失误把门永久锁死） |
+| 临时码 | `issueTempCode` / `consumeTempCode` / `purgeTempCodes`：一次性 + 到期即失效 + 去重重试（上限 100 次，防码空间占满时挂死）。**只做存储层**，未接 UI |
+| `PasswordManager` 改哈希 | 成员从 `QString password` 改为 `CredentialStore m_credentials`；比对走**定长比较**（`constantTimeEquals` 累积异或）。对外信号契约**逐条不变** |
+| 非静默迁移 | 三条分支各打日志：①凭据文件已有效 → `qInfo` 说明配置文件不再参与；②配置值**已是哈希串** → 直接装入，**不报**"明文"（否则运维把哈希拷进配置后会被当明文再哈希一遍，谁也开不了门）；③明文 → `qWarning` 明说"检测到**明文**引导值，已现场加盐哈希"，**且绝不打印明文本身** |
+| 明文不写回配置 | 哈希写进**独立的** `credentials.json`（与 `appconfig.json` 同目录），那是运维手工编辑的文件、程序不改写它。运维首次启动后即可删掉 `security.door_password`（删掉仍能开门） |
+| 配置项不得明文 | 规则 `[credential]` 第 ③ 条：`config/appconfig.json` 里若 `security.door_password` 不是哈希串则**告警**（不失败 —— 删字段是运维动作，不该卡构建） |
+
+**新增测试与规则**
+
+- `tests/test_credential_store.cpp`，新目标 `t113_credential_store`：**39 条**用例，
+  行覆盖 **91.8%**。
+- `tests/test_password_manager.cpp` 由 12 条扩到 **16 条**，新增 **5 条迁移路径**
+  用例（明文迁移告警、哈希引导值直接装入且**不**报明文、无引导值时一律拒绝、
+  `setPassword` 覆盖迁移值、以及"任何分支都不泄漏明文"）。
+- `tools/verify.py` 新增两条规则：`check_credentials_are_hashed_not_plaintext`
+  与 `check_credential_store_test_is_wired`。
+- 两个故障注入夹具：`tools/verify_credential_rule.py`（静态规则）**12/12** 变异被抓；
+  `tools/verify_credential_store_test.py`（真编译真运行）**12/12** 变异被抓。
+  两者都带"对照必须保持绿"与"还原后逐字节一致"的守卫，并共用仓库级文件锁。
+
+**故障注入抓出的问题（本轮最有价值的部分）**
+
+| # | 抓到的对象 | 问题 | 处置 |
+|---|---|---|---|
+| 1 | **既有规则** `[hex-parse]` | 我在新代码里直接用了 `QByteArray::fromHex()`。它**不报错**，会跳过非法字符重新配对 —— 篡改过的哈希串会"成功"解出**内容全错**的字节，比解析失败更危险 | 新增 `isHexOnly()` 逐字符校验；包装函数**刻意不叫 `fromHex`**（否则其调用方会被该规则误判为未校验 —— 规则不做跨函数分析） |
+| 2 | **我的静态规则** | 6 处**假绿**：`"add_test(...)"` 子串在**注释行**里也成立；`"managers/credential_store.cpp"` 在上方注释块里就出现过；用例改名成 `..._REMOVED` 后裸名字子串仍在；只查 `"salt" in text` 时把函数签名里的 salt 也算进去了 | 改为**跳过注释行** + **按括号配平取那一个 `add_executable` 调用块** + 匹配**函数定义**而非裸名字 + 查 `toHex(salt)` 与 `iterateDigest([^)]*salt` |
+| 3 | **我的行为夹具** | "失败时不累加计数"被写成 `++r->failed; ++r->failed;`（**加倍**），根本不是它声称的退化，且加倍后更容易触发锁定 | 改为**整段删除** `++r->failed;` |
+| 4 | **我的行为夹具** | 对照项 `old == new`，被自己的"变异未落到磁盘"守卫拦下、报成夹具失败 | 对照改为真的改动字节 |
+| 5 | **我的测试** | 用 `hashSecret(plain, salt, n)` 观测 `setSecret()` 的结果 —— 盐是**测试自己**传的，所以把 `setSecret()` 内部改成固定盐，断言**照样绿** | 改用 `toJson()` 观测（顺带验证"盐确实进了落盘内容"），新增 `setSecretUsesAFreshSaltEachTime` |
+| 6 | **我的测试** | "到期自动解锁"的清理逻辑**删掉也全绿** —— `isLockedOut()` 是算出来的，时间一过自然为 false，看着像摆设 | 新增 `failureCountRestartsAfterLockoutExpires`：期满后再错**一次**，计数必须从 1 起；否则"刚解禁就被一次手误重新锁死" |
+| 7 | **我的测试** | 非法字符的构造让 `fromHex` 跳过非法字符后**长度也对不上**，长度判据掩盖了字符判据 | 构造改为"32 个合法字符 **+** 2 个非法字符"，跳过非法字符后长度**恰好正确** —— 唯一能拒绝它的理由只剩逐字符校验 |
+| 8 | **我的测试** | 断言"锁定期满后 `failedAttempts()==0`"失败 —— 清零是**惰性**的（发生在下一次 `verify()`），我把"惰性复位"当成"即时复位"。**测试写错**，不是实现错 | 保留 `isLockedOut()` 断言，把"计数清零"的观测点挪到下一次 `verify()` 之后 |
+| 9 | **Release-only 门禁** | 类内初始化的 `static const int` 被 `qBound()` **ODR-使用**，C++11 需要类外定义。Release（-O2）内联所以链接过；`--coverage -O0` 不内联 → `undefined reference`，两个目标链接失败 | 补齐四个类外定义（原地留注释说明别删）；门禁补上 **Debug 配置**；教训写进 README 第 72 条 |
+| 10 | **既有脚本** `check_host_compile.sh` | `-isystem $QTSP_INC` 在 `qmake` 缺失时退化成裸 `/mingw64/include`，**遮蔽 libstdc++**（`#include_next <stdlib.h>` 找不到），21 个文件全误报 | `QTSP_INC` 默认回到 `QT_INC`，并从 flags 去掉那个裸 `-isystem`；修完 **21/21** 通过 |
+| 11 | **既有测试写法** | 该脚本用环境变量无法表达"空引导值"（`envOverride()` 是 `if (!raw.isEmpty())`，设空串等于没设，会退回内置默认 `"5788"`） | 改用**真实配置文件**表达空串（`writeConfigWithDoorPassword()`），并把这一事实写成注释 |
+
+#### 未做的部分（**刻意**，不是遗漏）
+
+1. **锁定旋钮未接配置**：`maxAttempts` / `lockoutMs` 目前只能由测试设置，
+   `AppConfig` 不读它们。理由：加公开旋钮就必须遵守开发约定第 10 条
+   （"配置里公开的开关必须真的生效"），而"启用锁定"本身是**行为变更**
+   （正确口令在锁定期内也会被拒），应由运维显式决策，而不是随本次重构
+   悄悄生效。默认 `maxAttempts=0` 保证现场行为不变。
+2. **临时码未接 UI**：`issueTempCode` / `consumeTempCode` 只在存储层，
+   没有窗体、没有按键、没有解锁路径接入。**这属于"已实现但生产代码零调用"**，
+   覆盖率报告里会算作「不可达」—— 这是**如实反映**，不是缺陷。
+   接线需要产品决策（谁能签发、有效期多久、几位数、要不要与呼叫中心联动）。
+3. **多用户未启用**：`CredentialStore` 的 API 全按 userId 索引（为多用户准备），
+   但 `PasswordManager` 只用一个固定 ID `"door"`。多用户需要 UI 决策。
+4. **迭代哈希不是 PBKDF2/Argon2**：Qt5 没有 PBKDF2，本类也没有内存硬度参数。
+   相对明文比对是实质提升，但**不能**用来保护高价值口令 —— 这条已写进
+   `credential_store.h` 与 README，**不得**在别处被说成"用了 PBKDF2"。
+
 ---
 
 ### P3 · 并发与"最新值"约定（0.5 天）
 
-> **状态（第 40 轮末）：⬜ 未开始。**
+> **状态（第 41 轮）：⬜ 未开始。**
 
 **只借鉴语义，不搬代码**（理由见 2.2）。把 A 的"跨线程只传容量 1 的最新值，
 不排队"写成**开发约定第 72 条**，并配静态规则；若 `src/core/vision/v4l2_camera.*`
@@ -339,7 +416,7 @@ Password, TempCode, Remote}`、唯一的 `unlock(userId, method, note)`、
 
 ### P4 · 人脸质量门与防假阳性（1 天）
 
-> **状态（第 40 轮末）：⬜ 未开始。**（ONNX 那一半已决定**不做**，见第 3 条。）
+> **状态（第 41 轮）：⬜ 未开始。**（ONNX 那一半已决定**不做**，见第 3 条。）
 
 1. 新增 `src/managers/face_quality.{h,cpp}`：清晰度（Laplacian 方差）/ 亮度 /
    对比度 / 占比，纯逻辑；测试目标按本项目惯例**缺 OpenCV 时自动跳过**

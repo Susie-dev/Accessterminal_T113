@@ -31,7 +31,7 @@
   },
 
   "security": {
-    "_comment": "门禁密码。生产环境请修改默认值，或用环境变量 ACCESSTERMINAL_SECURITY_DOOR_PASSWORD 覆盖。",
+    "_comment": "door_password 现在只是**首次初始化的引导值**（第 41 轮，方案 P2）。程序**不会**改写本文件；首次启动时它会加盐哈希后写进同目录的 credentials.json，之后本字段即可删除（删掉仍能开门，因为凭据已在 credentials.json 里）。若某次校验后日志出现「检测到**明文**门禁密码引导值」，说明还在用它引导，请尽快删除本字段。也可以直接填一个 sha256:<盐hex>:<迭代数>:<摘要hex> 形式的哈希串，程序会原样装入、不会再哈希一遍。可用环境变量 ACCESSTERMINAL_SECURITY_DOOR_PASSWORD 覆盖。",
     "door_password": "5788"
   }
 }

@@ -83,6 +83,7 @@ SOURCES += \
     src/hal/gpio.cpp \
     src/managers/access_controller.cpp \
     src/managers/audio_manager.cpp \
+    src/managers/credential_store.cpp \
     src/managers/door_actuator.cpp \
     src/managers/face_manager.cpp \
     src/managers/fingerprint_manager.cpp \
@@ -106,6 +107,7 @@ HEADERS += \
     src/hal/gpio.h \
     src/managers/access_controller.h \
     src/managers/audio_manager.h \
+    src/managers/credential_store.h \
     src/managers/door_actuator.h \
     src/managers/face_manager.h \
     src/managers/fingerprint_manager.h \

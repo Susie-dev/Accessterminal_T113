@@ -113,6 +113,7 @@ set(APP_SOURCES
 
     src/managers/access_controller.cpp
     src/managers/audio_manager.cpp
+    src/managers/credential_store.cpp
     src/managers/door_actuator.cpp
     src/managers/face_manager.cpp
     src/managers/fingerprint_manager.cpp
@@ -141,6 +142,7 @@ set(APP_HEADERS
 
     src/managers/access_controller.h
     src/managers/audio_manager.h
+    src/managers/credential_store.h
     src/managers/door_actuator.h
     src/managers/face_manager.h
     src/managers/fingerprint_manager.h

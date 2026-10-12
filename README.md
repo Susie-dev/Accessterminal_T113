@@ -1047,6 +1047,99 @@ ALSA 播放 `/tmp/pcm/beep.pcm`（慢、依赖声卡、文件通常不存在）�
 （含 7 种"换写法把密码弄进日志"，其中 3 种静态规则看不出），3 个对照不误报。
 这是本轮最有价值的一组变异 —— 它保住的是门禁密码。
 
+### 凭据存储：门禁口令从**明文比对**改为**加盐哈希**（第 41 轮，方案 P2）
+
+上一节保住的是"密码不进日志"。但重构前本工程还有一个**更根本**的缺口：
+
+```cpp
+// src/managers/password_manager.cpp（重构前，第 42 行）
+const bool matched = (input == password);      // 明文比对
+```
+
+`password` 直接来自 `AppConfig`，而 `config/appconfig.json` 里写的是
+**明文** `"door_password": "5788"`。三件事同时成立：
+
+1. 配置文件被谁拿到，门禁密码就被谁拿到（运维、备份、整机镜像都算）；
+2. 进程内存被 dump 时，口令直接可读；
+3. `QString::operator==` **短路** —— 比较在第 1 个不同的字符处停下，
+   于是"前缀猜对几个字符"存在可观测的时序差异。
+
+第 41 轮新增 `src/managers/credential_store.{h,cpp}`，并把
+`PasswordManager` 的成员从 `QString password` 换成 `CredentialStore`。
+
+**落盘格式**（是契约，变了老凭据就读不出来）：
+
+```
+sha256:<盐hex>:<迭代数>:<摘要hex>
+```
+
+| 设计点 | 取值与理由 |
+|---|---|
+| 盐 | 每用户**独立** 16 字节。`makeSalt()` 先读 `/dev/urandom`，取不到退回重复 `QUuid`。**刻意不用 `qrand`**（不是密码学随机源）**也不用 `QRandomGenerator`**（Qt 5.10+，越过本工程 5.9 的 API 底线） |
+| 迭代 | 默认 10000，夹在 `[1, 200000]`。上限防"配置里写天文数字把开锁拖成秒级" |
+| 比对 | `constantTimeEquals()` 累积异或，长度不同才提前返回（长度不是秘密） |
+| 落盘 | `QSaveFile` 原子写 + `setPermissions(ReadOwner\|WriteOwner)`。门口机可能被直接断电，非原子写会留下半截 JSON → 下次启动解析失败 = **门忽然打不开** |
+| 锁定 | 按 userId 记 `failed` 与 `lockedUntilMs`。**默认 `maxAttempts=0` = 从不锁定** —— "未配置时行为与重构前一致"是硬约束；启用锁定是显式行为变更 |
+| 临时码 | 一次性 + 到期即失效，**只做存储层**，未接 UI |
+
+**迁移必须是显式的**（方案 P2 第 3 条）。三条分支各自打日志：
+
+| 情形 | 行为 | 日志 |
+|---|---|---|
+| `credentials.json` 已有该用户 | **以文件为准**，配置值不再参与 | `qInfo` 说明配置文件不再参与 |
+| 配置值已是 `sha256:...` | 直接装入 | `qInfo`，**不报**"明文" |
+| 配置值是明文 | 现场加盐哈希入内存，写进 `credentials.json` | **`qWarning`** 明说"检测到**明文**引导值"，**且绝不打印明文本身** |
+| 既无文件也无配置值 | 校验**一律拒绝**，不假造默认口令 | `qWarning` 说明原因 |
+
+明文**不写回** `appconfig.json` —— 那是运维手工编辑的文件，程序改写它会让
+"配置是人的输入"这一性质消失，掉电还有损坏风险。哈希住在**独立的**
+`credentials.json`（与配置同目录）。运维在首次启动后即可删掉
+`security.door_password`，**删掉仍能开门**。
+
+#### 安全边界：**不要高估**这个实现
+
+加盐 + 迭代哈希**不是** Argon2 / scrypt / PBKDF2 —— **Qt5 不提供 PBKDF2**，
+本类也没有内存硬度参数。它相对"明文比对"是实质提升（防彩虹表、防"两人同密码
+一眼看出"、防时序泄漏、防配置文件被读到即失守），但**不能**用来保护高价值
+口令。这条已写进 `credential_store.h` 的长注释，**不得**在别处被描述成
+"用了 PBKDF2"。
+
+#### 测试与故障注入
+
+- `tests/test_credential_store.cpp`（新目标 `t113_credential_store`）：**39 条**
+  用例，行覆盖 91.8%。
+- `tests/test_password_manager.cpp`：12 → **16 条**，新增 5 条迁移路径用例。
+- 静态规则 2 条：`check_credentials_are_hashed_not_plaintext`（明文成员 /
+  明文比较 / 是否真加盐 / 是否真用 `QSaveFile` / 配置里是否残留明文）、
+  `check_credential_store_test_is_wired`（目标是否真的建了、注册了、链接了
+  真实现，以及关键断言是否还在）。
+- 两个故障注入夹具各 **12/12** 变异被抓 + 对照不误报 + 还原后逐字节一致。
+
+#### 这轮的故障注入抓出了什么（12 处，全是我自己的错）
+
+写这轮代码时，"工具比人可靠"这条又一次成立。要点：
+
+| 抓到的对象 | 问题 |
+|---|---|
+| **既有规则** `[hex-parse]` | 我直接用了 `QByteArray::fromHex()`。它**不报错**，会跳过非法字符重新配对 —— 被篡改的哈希串会"成功"解出**内容全错**的字节，比解析失败危险得多 |
+| **我的新静态规则** | 6 处假绿。最典型两处：`"add_test(...)"` 子串在**注释行**里也成立（把那行注释掉，目标被摘出 ctest 而规则不响）；`"managers/credential_store.cpp"` 在上方**注释块**里就出现过（把目标里的链接删掉也不响） |
+| **我的新行为夹具** | 变异写错（把"不累加"写成"加倍"）、对照项 `old == new` 被自己的守卫拦下 |
+| **我的新测试** | ①用 `hashSecret(plain, salt, n)` 观测 `setSecret()` —— 盐是测试自己传的，"内部改固定盐"照样绿；②"到期自动解锁"的清理逻辑**删掉也全绿**（`isLockedOut()` 是算出来的）；③非法字符的构造让长度判据掩盖了字符判据 |
+| **Release-only 门禁** | `static const int` 被 `qBound()` ODR-使用，Debug 链接失败而 Release 通过（见开发约定第 72 条） |
+| **既有脚本** `check_host_compile.sh` | `-isystem $QTSP_INC` 在 `qmake` 缺失时退化成裸 `/mingw64/include`，遮蔽 libstdc++，21 个文件全误报 |
+
+#### 刻意没做的部分（不是遗漏）
+
+1. **锁定旋钮未接配置**：`maxAttempts` / `lockoutMs` 只能由测试设置。
+   加公开旋钮就必须遵守开发约定第 10 条（"配置里公开的开关必须真的生效"），
+   而"启用锁定"本身是行为变更（锁定期内正确口令也被拒），应由运维显式决策。
+2. **临时码未接 UI**：只在存储层，没有窗体、按键、解锁路径接入。
+   覆盖率报告会把它算作「不可达」—— 那是**如实反映**，不是缺陷。
+   接线需要产品决策（谁能签发、有效期、位数、要不要与呼叫中心联动）。
+3. **多用户未启用**：API 全按 userId 索引（已为多用户准备），
+   但 `PasswordManager` 只用一个固定 ID `"door"`。
+
+
 静态契约由 `check_form_passwd_contract_is_pinned` 钉住，
 自检见 `tools/verify_form_passwd_rule.py`（9 个变异全抓到，2 个对照不误报）。
 
@@ -1450,7 +1543,7 @@ TCP 是字节流，没有消息边界。一次 `readyRead` 可能拿到一条完
 
 ## 生命周期约定（由自动化检查强制）
 
-以下六十八条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下七十二条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频线程仅在收到 `accept` 后创建
@@ -3227,6 +3320,54 @@ if (!fingerprint->isOpen()) {
 在嵌入式 flash 上只是从"刷屏"变成"慢性泄漏"。同一状态只提示一次，状态改变时
 再提示（本轮的 `m_openFailureLogged` 即此意）。
 
+### 72. 编译通过要**按构建配置**分别确认，Release 绿不等于 Debug 绿
+
+第 41 轮做 P2（凭据改加盐哈希）时，`credential_store.cpp` 里写了：
+
+```cpp
+static const int kMinIterations = 1;      // 类内初始化
+...
+const int n = qBound(kMinIterations, iters, kMaxIterations);
+```
+
+**Release 下一切正常**：`ctest` 21/21、互操作 14/14、`verify.py` rc=0。
+但覆盖率构建（`--coverage -O0`，即 Debug）**链接失败**：
+
+```
+undefined reference to `accessterminal::CredentialStore::kMinIterations'
+undefined reference to `accessterminal::CredentialStore::kMaxIterations'
+```
+
+原因：C++11 里类内初始化的 `static const int` 只是**常量表达式，不是定义**。
+一旦某处 **ODR-使用** 它，链接期就需要真正的定义 —— 而 `qBound` 是模板，
+形参是 `const T&`，于是取了地址。-O2 下编译器把值直接内联、没有符号引用；
+-O0 下不内联，于是符号缺失。
+
+修法是补一行类外定义：
+
+```cpp
+// credential_store.cpp（文件作用域，不是类内）
+const int CredentialStore::kMinIterations;
+const int CredentialStore::kMaxIterations;
+```
+
+教训有两层：
+
+1. **技术层**：类内初始化的 `static const` 整数成员，只要被按引用传递、
+   取地址、或被模板接住，就必须另写类外定义。改用
+   `enum { kX = 1 };` 或（C++17 起）`static constexpr` 可以绕开，
+   但那两种写法分别有作用域/可用性的代价，本工程选**显式补定义**，
+   并在原地留下注释说明"别删"。
+2. **流程层（更重要）**：本项目此前的门禁**只跑 Release**。
+   于是"编译通过"这个最基础的信号，实际上只覆盖了一半配置。
+   补上 Debug 后立刻抓到了它。**凡是"编译/链接是否通过"的结论，
+   都要说清楚是在哪种构建配置下得到的。**
+
+配套：`tools/run_coverage.sh` 本身就是 Debug（`--coverage -O0`），
+所以**跑覆盖率不只是量覆盖率，也是一次 Debug 构建门禁** ——
+这轮之前它一直是红的（链接失败），却因为没人把它的退出码当门禁而没被发现。
+现在它进自检清单。
+
 ## 开发约定
 
 - **标准**：C++11（不可使用 C++17 的 inline 变量等特性）
@@ -3332,6 +3473,16 @@ bash tests/interop/run_interop.sh
 # 7. 单元测试（独立构建，不需要 ALSA）
 cmake -S tests -B /tmp/t113-tests -G Ninja && cmake --build /tmp/t113-tests \
   && ctest --test-dir /tmp/t113-tests --output-on-failure
+
+# 8. 覆盖率（**同时是一次 Debug 门禁**）
+#    Release 内联掉的东西在 -O0 下会成为真实符号引用。第 41 轮就是靠它
+#    抓到 `static const int` 缺类外定义（Release 全绿、Debug 链接失败）。
+#    见开发约定第 72 条。
+bash tools/run_coverage.sh
+
+# 9. 凭据相关的故障注入自检（改 P2 相关代码后必跑）
+python3 tools/verify_credential_rule.py        # 静态规则：12/12 变异应变红
+python3 tools/verify_credential_store_test.py  # 行为测试：12/12 变异应变红
 ```
 
 以上脚本在 CI 中也可直接使用，退出码非 0 即表示失败。

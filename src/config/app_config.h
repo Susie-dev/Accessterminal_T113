@@ -119,7 +119,26 @@ public:
     int fingerprintIdStart() const { return clampInt(m_fingerprintIdStart, 0, 65535); }
 
     /// 管理员开锁密码（默认值沿用重构前的 "5788"）。
+    ///
+    /// **第 41 轮语义变更**：这个值现在只作为**首次初始化的引导值**。
+    /// 运行时校验用的是 `CredentialStore` 里的加盐哈希（见 PasswordManager）。
+    /// 它可以是一个 `sha256:<salt>:<iterations>:<digest>` 哈希串（直接装入），
+    /// 也可以是明文（会被加盐哈希后装入，并打**显式的迁移告警**）。
+    /// 首次启动之后，可以从 appconfig.json 里删掉本字段 —— 已哈希的凭据
+    /// 存在 credentialStorePath() 里，删掉仍能开门。
     QString doorPassword() const { return m_doorPassword; }
+
+    /**
+     * @brief 凭据存储文件路径（加盐哈希落在这里，**不含明文**）。
+     *
+     * 默认取配置文件的同目录、文件名 `credentials.json`：
+     * 部署路径 `/etc/accessterminal/appconfig.json` → `/etc/accessterminal/credentials.json`。
+     * 配置文件路径为空（未加载）时返回空串 = **纯内存**，不落盘。
+     *
+     * 与 `door_password` 分开存放的理由：`appconfig.json` 是运维手工编辑的
+     * 文件，而凭据文件是程序托管的密钥材料，两者生命周期与权限要求不同。
+     */
+    QString credentialStorePath() const;
 
 private:
     AppConfig() = default;

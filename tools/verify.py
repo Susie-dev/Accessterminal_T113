@@ -244,12 +244,34 @@ def check_balance(root, src_root):
 def strip_comments_and_strings(text):
     """
     去掉注释与字符串字面量，避免把注释里的示例当作真实代码。
-    先处理块注释与字符串，最后处理行注释，避免相互干扰。
 
     注意：被删除的片段若跨多行，必须**保留其中的换行符**，否则删除后的文本
     行号会整体前移，所有基于 `text.count("\\n", 0, pos)` 的报错行号都会指向
     错误位置。这里对块注释保留换行、其余字符换成空格；对字符串/字符字面量
     保留首尾定界符与换行，仅清空内容（与既有行为一致）。
+
+    **处理顺序（第 41 轮修正，别调回去）**
+    ------------------------------------
+    顺序是：块注释 → 字符串 → **行注释** → 字符字面量。
+
+    行注释必须在**字符字面量之前**处理。原顺序把行注释放在最后，于是：
+
+        //     undefined reference to `accessterminal::CredentialStore::kMinIterations'
+        ...
+        QLatin1Char('0')        // 几千行之后
+
+    行注释里那个**孤立的撇号**会与几千行之后真正字符字面量的开引号配对，
+    正则一次吃掉整段代码 —— 实测把 `credential_store.cpp` 从 20184 字节
+    "剥"成 4349 字节，`toHex` / `iterateDigest` / `salt` 全部消失，
+    于是依赖它们的规则全部**静默误报**（本轮就撞上了：`[credential]`
+    报"盐没有参与哈希构造"，而代码里写得清清楚楚）。
+
+    任何英文注释里的 `don't` / `it's` / `kFoo'` 都会触发它 —— 这不是
+    某个文件的问题，是**每个 .cpp 都可能踩到**的定时炸弹。
+
+    为什么能安全地把行注释提前：此时字符串的内容**已经被清空**（第 2 步把
+    `"http://x"` 变成 `""`），所以字符串里的 `//` 不会被误当成注释。
+    顺序调换后，字符字面量正则也再不会被注释里的撇号污染。
     """
     def blank_keep_newlines(m):
         return re.sub(r"[^\n]", " ", m.group(0))
@@ -261,8 +283,10 @@ def strip_comments_and_strings(text):
 
     text = re.sub(r"/\*.*?\*/", blank_keep_newlines, text, flags=re.S)
     text = re.sub(r'"(?:\\.|[^"\\])*"', empty_string_keep_newlines, text)
-    text = re.sub(r"'(?:\\.|[^'\\])*'", empty_string_keep_newlines, text)
+    # 行注释：必须早于字符字面量（见上文说明）。字符串内容此时已清空，
+    # 所以这一步不会误伤 `"http://..."` 这类字面量。
     text = re.sub(r"//[^\n]*", "", text)
+    text = re.sub(r"'(?:\\.|[^'\\])*'", empty_string_keep_newlines, text)
     return text
 
 
@@ -4350,6 +4374,240 @@ def check_door_actuator_is_the_only_unlock_path(root, src_root):
              "放行中枢没有真正驱动门锁" % actuator_caller)
 
 
+def check_credentials_are_hashed_not_plaintext(root, src_root):
+    """
+    [credential] 门禁口令必须以加盐哈希存储，且明文不得落盘/落日志。
+
+    为什么需要这条规则（第 41 轮，方案 P2）
+    -------------------------------------
+    重构前 `PasswordManager::checkPassword()` 是 `input == password` ——
+    **明文比对**，而密码来自 AppConfig、落在 `config/appconfig.json` 里也是
+    明文（`"door_password": "5788"`）。门口机是**实体门禁设备**：
+      - 配置文件可被任何能读它的人拿到（运维、备份、整机镜像）；
+      - 门禁密码是物理准入凭据，泄漏 = 把钥匙交出去；
+      - 明文比对还会因短路比较泄漏"前缀匹配到第几位"的时序信息。
+
+    本项目此前**没有任何一条规则**守着这件亊 —— 只有 `check_no_secret_in_logs`
+    管"别把密码打进日志"，那是另一回事（日志 vs 存储）。
+
+    检查五项
+    --------
+      ① `PasswordManager` **不得**再把口令存成明文字符串成员：
+         `password_manager.h` 里不许出现 `QString password;` 这类成员声明；
+      ② 校验必须走 CredentialStore（`password_manager.cpp` 里必须调
+         `verify(`），不许再出现 `input == password` 式的明文比较；
+      ③ 部署用的 JSON 配置里不得留明文 `door_password`（**只告警**：
+         现场可能刚上线还没删，属运维动作，不该卡构建）；
+      ④ `credential_store.cpp` 必须真的用 `QCryptographicHash` 且**加盐**
+         （出现 `makeSalt` / `addData(salt`），否则"哈希"是装饰；
+      ⑤ 凭据的落盘写必须是**原子写**（`QSaveFile`）—— 门口机可能被直接
+         断电，非原子写会留下半截 JSON，下次启动解析失败 = "门忽然打不开"。
+
+    已知判别边界
+    ------------
+      * ①按**声明形式**匹配（``QString \\s+ password``），改名成 `pwd_` 之类
+        会漏报。本工程的口径是"宁可漏报也不误报"，且 ②（明文比较）与
+        行为测试（`test_password_manager.cpp` 的日志断言、
+        `test_credential_store.cpp` 的落盘断言）会从**输出**侧兜住。
+      * ③只看 `config/appconfig.json` 这一份**部署模板**；测试夹具里为了
+        表达"明文引导值"而写的临时配置不受影响。
+    """
+    import json
+
+    pm_h = os.path.join(src_root, "managers", "password_manager.h")
+    pm_cpp = os.path.join(src_root, "managers", "password_manager.cpp")
+    cs_h = os.path.join(src_root, "managers", "credential_store.h")
+    cs_cpp = os.path.join(src_root, "managers", "credential_store.cpp")
+
+    for path in (pm_h, pm_cpp, cs_h, cs_cpp):
+        if not os.path.exists(path):
+            fail("[credential] 缺少凭据相关文件: "
+                 + os.path.relpath(path, root).replace("\\", "/"))
+    if not os.path.exists(cs_cpp):
+        return
+
+    # ① PasswordManager 不得再持有明文字符串成员
+    if os.path.exists(pm_h):
+        rel = os.path.relpath(pm_h, root).replace("\\", "/")
+        text = strip_comments_and_strings(read(pm_h))
+        if re.search(r"\bQString\s+password\s*;", text):
+            fail("[credential] %s 仍声明明文口令成员 `QString password;` —— "
+                 "口令必须以加盐哈希存放在 CredentialStore 里，"
+                 "且明文只在栈上活一瞬间（第 41 轮，方案 P2）" % rel)
+
+    # ② 校验必须走 CredentialStore，不得明文比较
+    if os.path.exists(pm_cpp):
+        rel = os.path.relpath(pm_cpp, root).replace("\\", "/")
+        text = strip_comments_and_strings(read(pm_cpp))
+        if not re.search(r"\.\s*verify\s*\(", text):
+            fail("[credential] %s 里没有调用 CredentialStore::verify() —— "
+                 "口令校验必须经过加盐哈希比对" % rel)
+        # `input == password` / `password == input` 这类明文比较
+        if re.search(r"\binput\s*==\s*\w*password\w*", text) \
+                or re.search(r"\b\w*password\w*\s*==\s*input\b", text):
+            fail("[credential] %s 里出现明文口令比较（input == password）—— "
+                 "这正是第 41 轮修掉的那个缺口" % rel)
+
+    # ④ 哈希必须真的加盐
+    #
+    # 注意判据的精度 —— 故障注入实测（第 41 轮）：第一版只查
+    # `"salt" in text`，而把 `hashSecret()` 改成忽略 salt 参数后，
+    # 函数签名与参数名里**还**有 "salt"，于是规则一声不响（假绿）。
+    # 必须查**盐真的参与了摘要输出**：`toHex(salt)` 这个构造。
+    text = strip_comments_and_strings(read(cs_cpp))
+    rel = os.path.relpath(cs_cpp, root).replace("\\", "/")
+    if "QCryptographicHash" not in text:
+        fail("[credential] %s 没有使用 QCryptographicHash —— "
+             "口令未做哈希" % rel)
+    if not re.search(r"\bmakeSalt\s*\(", read(cs_h)):
+        fail("[credential] %s 没有 makeSalt() —— 无盐哈希挡不住彩虹表，"
+             "也无法避免相同口令产生相同摘要" % os.path.relpath(cs_h, root)
+             .replace("\\", "/"))
+    # 盐必须进入**写出的哈希串**（不只是出现在参数列表里）。
+    if not re.search(r"toHex\s*\(\s*salt\s*\)", text):
+        fail("[credential] %s 里盐没有参与哈希串的构造（应出现 "
+             "`toHex(salt)`）—— 只把 salt 当参数收下而不用，等于无盐哈希："
+             "相同口令会得到相同摘要，彩虹表直接命中" % rel)
+    # 且盐必须进入**摘要计算**（iterateDigest 的实参里要有 salt）。
+    if not re.search(r"iterateDigest\s*\([^)]*\bsalt\b", text):
+        fail("[credential] %s 的 iterateDigest() 调用没有把盐传进去 —— "
+             "盐必须在每一轮摘要里参与，否则不构成加盐哈希" % rel)
+
+    # ⑤ 落盘必须是原子写
+    #
+    # 同理：第一版只查 `"QSaveFile" not in text`，而**头文件包含**
+    # `#include <QSaveFile>` 仍在，于是把真正用法换成 QFile 后规则不响（假绿）。
+    # 必须查**真的在用**：`QSaveFile <变量>(` 形式。
+    if not re.search(r"\bQSaveFile\s+\w+\s*\(", read(cs_cpp)):
+        fail("[credential] %s 没有实际使用 QSaveFile —— 凭据落盘必须原子写"
+             "（只 `#include <QSaveFile>` 不算）：门口机可能被直接断电，"
+             "非原子写会留下半截 JSON，下次启动解析失败 = 门忽然打不开" % rel)
+
+    # ③ 部署配置里不得留明文门禁密码（只告警：删除是运维动作）
+    cfg = os.path.join(root, "config", "appconfig.json")
+    if os.path.exists(cfg):
+        try:
+            obj = json.loads(read(cfg))
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            sec = obj.get("security")
+            if isinstance(sec, dict) and "door_password" in sec:
+                val = sec.get("door_password")
+                # 已是哈希串则没问题（允许直接把哈希写进配置）。
+                looks_hashed = (isinstance(val, str)
+                                and val.startswith("sha256:")
+                                and val.count(":") == 3)
+                if not looks_hashed:
+                    warn("[credential] config/appconfig.json 里仍有**明文** "
+                         "security.door_password。它现在只作为首次初始化的"
+                         "引导值：首次启动后会加盐哈希写进同目录的 "
+                         "credentials.json，之后即可删除本字段（删掉仍能开门）。"
+                         "属运维动作，故仅告警。")
+
+
+def check_credential_store_test_is_wired(root, src_root):
+    """
+    [credential] CredentialStore 必须被真实链接进测试目标，且断言有判别力。
+
+    为什么单独一条
+    --------------
+    本工程的教训是"有测试 ≠ 被测到"：一个新类很容易被写成一个只跑
+    `QVERIFY(true)` 的空目标，或者干脆忘了加进 `tests/CMakeLists.txt`
+    （那它永远不跑，而 `verify.py` 也看不出来）。
+
+    检查三项
+    --------
+      ① `tests/CMakeLists.txt` 里存在 `t113_test_credential_store` 目标，
+         且 `add_test(NAME t113_credential_store` 把它注册进 ctest；
+      ② 该目标**链接真实的** `managers/credential_store.cpp`，
+         而不是某个替身 —— 哈希/加盐逻辑正是被测对象本身；
+      ③ 测试源里必须包含几条**关键断言**（否则"36 个用例"可能全是空断言）：
+         - 落盘不含明文（否定性断言必须存在）；
+         - 阳性对照（证明文件真的写成功了）；
+         - 时钟注入（锁定到期必须确定性验证，不能靠 sleep）。
+    """
+    cm = os.path.join(root, "tests", "CMakeLists.txt")
+    if not os.path.exists(cm):
+        fail("[credential] 找不到 tests/CMakeLists.txt")
+        return
+    text = read(cm)
+
+    # ---- 判据必须"抗注释" ----
+    #
+    # 故障注入实测（第 41 轮）：第一版用 `"add_test(NAME t113_credential_store"
+    # not in text`，而把那一行**注释掉**（`# add_test(...)`）之后，子串**仍然
+    # 存在**，规则一声不响 —— 目标被摘出 ctest 而无人察觉（假绿）。
+    # 所以这里必须逐行看、跳过注释行（CMake 的注释符是 '#'）。
+    def has_uncommented(pattern):
+        for line in text.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            if re.search(pattern, line):
+                return True
+        return False
+
+    if not has_uncommented(r"add_executable\s*\(\s*t113_test_credential_store\b"):
+        fail("[credential] tests/CMakeLists.txt 里没有 "
+             "t113_test_credential_store 目标（或它被注释掉了）—— "
+             "新类没有测试入口")
+    if not has_uncommented(r"add_test\s*\(\s*NAME\s+t113_credential_store\b"):
+        fail("[credential] t113_test_credential_store 没有用 add_test 注册"
+             "（或被注释掉了）—— 构建了但 ctest 不会跑它，等于永远不执行")
+
+    # ---- 链接真实的实现：必须落在**那个目标自己的** add_executable 里 ----
+    #
+    # 同样被故障注入抓到：第一版查全文件里有没有
+    # `"managers/credential_store.cpp"`，而它在上方的**注释块**里就出现过，
+    # 于是把目标里的链接行删掉后规则不响（假绿）。改为按括号配平取出
+    # 那一个 add_executable(...) 调用，只在它的源列表里找。
+    block = _cmake_call_containing(text, "add_executable",
+                                   "t113_test_credential_store")
+    if block is None:
+        fail("[credential] 找不到 t113_test_credential_store 的 "
+             "add_executable(...) 调用块")
+    elif "managers/credential_store.cpp" not in block:
+        fail("[credential] t113_test_credential_store 的源列表里没有真实的 "
+             "managers/credential_store.cpp —— 哈希逻辑必须用真实现测，"
+             "不能用替身（替身测不出加盐与迭代）")
+
+    tsrc = os.path.join(root, "tests", "test_credential_store.cpp")
+    if not os.path.exists(tsrc):
+        fail("[credential] 缺少 tests/test_credential_store.cpp")
+        return
+    body = read(tsrc)
+
+    # 关键断言：落盘不含明文。
+    # 必须匹配**函数定义**（`void xxx()`），不能只查裸名字 —— 把定义改名成
+    # `persistedFileContainsNoPlaintext_REMOVED` 后，裸名字子串仍在（假绿）。
+    if not re.search(r"\bvoid\s+persistedFileContainsNoPlaintext\s*\(\s*\)", body):
+        fail("[credential] test_credential_store.cpp 缺少"
+             "「落盘文件不含明文」用例（要有 `void "
+             "persistedFileContainsNoPlaintext()` 定义）—— "
+             "这是本类存在的全部意义")
+    if "!text.contains(secret)" not in body:
+        fail("[credential] 缺少「文件里不含明文口令」的**真断言**")
+
+    # 阳性对照：必须**成对**存在 —— 不能只看枚举名（它在别处也出现）。
+    # 判定要点：既要有"读回来能用正确口令通过"的那次 verify，
+    # 又要有"错口令仍被拒"的那次（后者防的是"读失败导致谁都通过"）。
+    if not re.search(r"\bstore2\s*\.\s*verify\s*\(", body):
+        fail("[credential] 缺少阳性对照「读回来真的能用正确口令通过」"
+             "（应有 `store2.verify(...)`）—— 只有「不含明文」的否定断言 "
+             "在文件没写成功时也会通过，是恒真的假绿")
+    if not re.search(r"store2\s*\.\s*verify\s*\([^;]*?VerifyOutcome::Rejected", body):
+        fail("[credential] 缺少「错口令仍被拒绝」的对照 —— "
+             "否则读失败（谁都过）这种情形测不出来")
+
+    # 时钟注入：锁定到期不许靠 sleep
+    if "setNowMsForTest" not in body:
+        fail("[credential] 锁定到期必须用时钟注入确定性验证，"
+             "不能用 sleep（慢且不确定）")
+    if re.search(r"\bQTest::qSleep\b|\bQThread::sleep\b|\bQTest::qWait\(\s*\d{4,}", body):
+        fail("[credential] test_credential_store.cpp 里出现长睡眠 —— "
+             "时序断言要等性质，不要等固定时长（README 第 14 条）")
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: python verify.py <项目根目录> [另一仓库根目录]")
@@ -4410,6 +4668,8 @@ def main():
         root, sys.argv[2] if len(sys.argv) > 2 else None)
     check_no_secret_in_logs(root, src_root)
     check_door_actuator_is_the_only_unlock_path(root, src_root)
+    check_credentials_are_hashed_not_plaintext(root, src_root)
+    check_credential_store_test_is_wired(root, src_root)
 
     print(f"校验目录: {root}")
     print("=" * 70)

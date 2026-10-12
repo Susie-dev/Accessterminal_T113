@@ -46,10 +46,16 @@
  */
 #include <QtTest/QtTest>
 
+#include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QSignalSpy>
 #include <QStringList>
+#include <QTemporaryDir>
 
 #include "config/app_config.h"
+#include "managers/credential_store.h"
 #include "managers/password_manager.h"
 
 using accessterminal::AppConfig;
@@ -118,6 +124,49 @@ void clearDoorPasswordEnv()
 {
     qunsetenv("ACCESSTERMINAL_SECURITY_DOOR_PASSWORD");
     AppConfig::instance().load(QStringLiteral("__nonexistent__.json"));
+}
+
+/**
+ * @brief 写一份最小可用的配置文件，指定 door_password 字段，返回其路径。
+ *
+ * 存在的理由：`AppConfig` 的 `envOverride()` 是 `if (!raw.isEmpty())` ——
+ * 环境变量设成空串等同于"没设"，于是会退回**内置默认口令** `"5788"`。
+ * 也就是说"引导值为空"这个状态**只能**由配置文件表达。凡是需要
+ * "没有引导值"的用例都得走这里。
+ *
+ * `door_password` 为**空串**时写成空串（不是省略字段）：
+ * 省略字段同样会退回内置默认值。
+ *
+ * 返回空串表示写失败。
+ */
+QString writeConfigWithDoorPassword(const QString& dirPath, const QString& pwd)
+{
+    const QString path = dirPath + QStringLiteral("/appconfig.json");
+    QJsonObject security;
+    security.insert(QStringLiteral("door_password"), pwd);
+    QJsonObject root;
+    root.insert(QStringLiteral("security"), security);
+
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        return QString();
+    }
+    f.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+    f.close();
+    return path;
+}
+
+/**
+ * @brief 引导值必须来自**进程内** QString，不经编码边界。
+ *
+ * 用配置文件 + `fromLocal8Bit` 传非 ASCII 会重演文件头第 2 条那个坑
+ * （本机 GBK 代码页下字节被重新解释），于是相关断言变成恒真。
+ * 凡是哨兵需要非 ASCII 的用例，一律用本函数（走 `setPassword` 或
+ * ASCII 配置值）。
+ */
+bool fileRoundTripsAsciiPath(const QString& p)
+{
+    return !p.isEmpty() && QFile::exists(p);
 }
 
 } // namespace
@@ -393,6 +442,193 @@ private slots:
             mgr.checkPassword(QStringLiteral("x"));
         }
         QVERIFY(true);
+    }
+
+    // -----------------------------------------------------------------------
+    // 方案 P2：明文引导值的**非静默**迁移（第 41 轮）
+    //
+    // 这一组守的是 P2 的核心承诺。此前它**一条运行期断言都没有** ——
+    // 只有静态规则看源码文本。而"迁移是否告警""明文有没有被写回文件"
+    // 这类性质只有在运行期才看得见。
+    // -----------------------------------------------------------------------
+
+    /**
+     * 明文引导值 -> 加盐哈希装入，且**必须**打迁移告警（不得静默）。
+     *
+     * 为什么"必须告警"是要断言的：静默迁移会让运维以为
+     * `appconfig.json` 里那个明文还在生效，于是永远不去删它 ——
+     * 明文就一直在配置文件里躺着。告警是**流程的一部分**，不是装饰。
+     */
+    void plaintextBootstrapIsMigratedWithAnExplicitWarning()
+    {
+        const QString plain = QString::fromLatin1(kSentinelPwd);
+        setDoorPasswordViaEnv(plain);
+
+        MsgCapture cap;
+        PasswordManager mgr;
+
+        const QString all = MsgCapture::joined();
+
+        // ---- 阳性对照：日志管道工作 ----
+        QVERIFY2(MsgCapture::count() > 0,
+                 "没有捕获到任何日志：捕获管道未生效，本用例其余断言无意义");
+
+        // ---- 真断言 1：迁移是**显式**的 ----
+        QVERIFY2(MsgCapture::contains(QStringLiteral("明文")),
+                 qPrintable(QStringLiteral(
+                     "明文引导值被静默迁移了 —— 没有打迁移告警。实际日志: ") + all));
+
+        // ---- 真断言 2：告警里**不得**出现明文本身 ----
+        // 否则"为了提醒而打印密码"就成了新的泄漏路径。
+        QVERIFY2(!all.contains(plain),
+                 qPrintable(QStringLiteral("迁移告警里泄漏了明文密码: ") + all));
+        QVERIFY2(!all.contains(QString::fromLatin1(plain.toUtf8().toHex())),
+                 qPrintable(QStringLiteral("迁移告警里泄漏了密码 hex: ") + all));
+
+        // ---- 真断言 3：凭据确实装进来了，且存的是**哈希**不是明文 ----
+        QVERIFY2(mgr.hasPassword(), "迁移后应当有可用凭据");
+        QSignalSpy spy(&mgr, &PasswordManager::passwordChecked);
+        mgr.checkPassword(plain);
+        QCOMPARE(spy.count(), 1);
+        QCOMPARE(spy.at(0).at(0).toBool(), true);
+
+        // 存储层里必须**只有**哈希：明文不得作为任何字段被留存。
+        // 用 toJson() 观测（它就是落盘内容，顺带验证"落盘不含明文"）。
+        const QJsonObject root = mgr.credentials().toJson();
+        const QByteArray json =
+            QJsonDocument(root).toJson(QJsonDocument::Compact);
+        const QString jsonText = QString::fromUtf8(json);
+        QVERIFY2(!jsonText.contains(plain),
+                 qPrintable(QStringLiteral("存储层序列化后仍含明文: ") + jsonText));
+        QCOMPARE(mgr.credentials().toJson()
+                     .value(QStringLiteral("users")).toArray().size(), 1);
+    }
+
+    /**
+     * 配置里给的**已经是哈希串** -> 直接装入，**不得**报"明文迁移"。
+     *
+     * 反面断言同样重要：如果哈希串也被当成明文走迁移路径，那运维把
+     * 哈希拷进配置后，程序会"把哈希当密码再哈希一遍" —— 结果谁也开不了门。
+     * 而且会打一条误导性的"检测到明文"告警。
+     */
+    void hashedBootstrapIsLoadedWithoutAMigrationWarning()
+    {
+        const QString plain = QString::fromLatin1("boot-hash-pwd-8801");
+        const QByteArray salt = accessterminal::CredentialStore::makeSalt();
+        const QString hashed = accessterminal::CredentialStore::hashSecret(
+            plain, salt, 1000);
+        QVERIFY(accessterminal::CredentialStore::looksLikeHash(hashed));
+
+        setDoorPasswordViaEnv(hashed);
+
+        MsgCapture cap;
+        PasswordManager mgr;
+        const QString all = MsgCapture::joined();
+
+        QVERIFY2(MsgCapture::count() > 0, "捕获管道未生效");
+
+        // ---- 真断言 1：哈希串不得被当成明文 ----
+        QVERIFY2(!all.contains(QStringLiteral("明文")),
+                 qPrintable(QStringLiteral(
+                     "配置里已是哈希串，却报了「检测到明文」—— "
+                     "说明 looksLikeHash() 的判断没生效。实际日志: ") + all));
+
+        // ---- 真断言 2：原明文仍然能开锁（证明装入的是这把锁的哈希）----
+        QVERIFY2(mgr.hasPassword(), "哈希引导值应当被装入");
+        QSignalSpy spy(&mgr, &PasswordManager::passwordChecked);
+        mgr.checkPassword(plain);
+        QCOMPARE(spy.count(), 1);
+        QCOMPARE(spy.at(0).at(0).toBool(), true);
+
+        // 反面：别的口令不能开。
+        mgr.checkPassword(plain + QStringLiteral("x"));
+        QCOMPARE(spy.at(1).at(0).toBool(), false);
+    }
+
+    /**
+     * 既无凭据文件、配置里也没有引导值 -> **一律拒绝**，且不假造默认口令。
+     *
+     * 唯一例外是重构前就存在的"空密码 + 空输入 = 通过"语义，它必须保留
+     * （README 里由既有用例钉住）。本用例把两者放在一起，免得将来有人
+     * 为了"一律拒绝"把空输入语义一起删掉。
+     *
+     * 为什么必须写**真实配置文件**：`envOverride()` 里是
+     * `if (!raw.isEmpty())` —— 环境变量设成空串等于"没设"，
+     * `AppConfig` 会退回内置默认值 `"5788"`。也就是说"空引导值"这个状态
+     * **只能**通过配置文件表达，用环境变量根本构造不出来（初版测试正因此
+     * 走了明文迁移分支而失败）。同时这也顺带证明了：删掉配置字段 ≠ 空引导值，
+     * 因为内置默认值会顶上。
+     */
+    void noBootstrapMeansNoPasswordAndRejectsEverything()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        // 显式的空串：这是唯一能表达"运维把口令清空了"的形态。
+        const QString cfgPath = writeConfigWithDoorPassword(dir.path(), QString());
+        QVERIFY(!cfgPath.isEmpty());
+        QVERIFY(fileRoundTripsAsciiPath(cfgPath));
+
+        AppConfig::instance().load(cfgPath);
+
+        MsgCapture cap;
+        PasswordManager mgr;
+        const QString all = MsgCapture::joined();
+
+        QVERIFY2(MsgCapture::count() > 0, "捕获管道未生效");
+
+        // 无凭据必须**有告警**（否则运维以为门禁在工作，实际谁都进不来）。
+        QVERIFY2(MsgCapture::contains(QStringLiteral("无可用门级密码")),
+                 qPrintable(QStringLiteral(
+                     "无可用凭据时应当告警说明「校验将一律拒绝」。实际日志: ")
+                     + all));
+
+        QVERIFY2(!mgr.hasPassword(), "没有任何来源时不应报告「有密码」");
+
+        // 非空输入一律拒绝（不能因为"没有密码"就放行）。
+        QSignalSpy spy(&mgr, &PasswordManager::passwordChecked);
+        mgr.checkPassword(QStringLiteral("anything"));
+        QCOMPARE(spy.count(), 1);
+        QCOMPARE(spy.at(0).at(0).toBool(), false);
+
+        // 空输入：**保留**重构前的 `input == password`（空==空）语义。
+        // 这条不是"新增放行"，而是逐字节保持历史行为。
+        mgr.checkPassword(QString());
+        QCOMPARE(spy.count(), 2);
+        QCOMPARE(spy.at(1).at(0).toBool(), true);
+    }
+
+    /**
+     * `setPassword()` 换密码后，**迁移进来的旧口令必须失效**。
+     *
+     * 这条把"引导值迁移"和"运行期改密"接在一起：如果 setPassword 只改了
+     * 某个旁路字段而没覆盖存储层，旧口令会继续能开门 —— 那是安全缺陷。
+     */
+    void setPasswordOverridesTheMigratedBootstrap()
+    {
+        const QString bootstrap = QString::fromLatin1("bootstrap-pwd-9902");
+        setDoorPasswordViaEnv(bootstrap);
+
+        PasswordManager mgr;
+        QSignalSpy spy(&mgr, &PasswordManager::passwordChecked);
+
+        // 迁移进来的口令可用。
+        mgr.checkPassword(bootstrap);
+        QCOMPARE(spy.at(0).at(0).toBool(), true);
+
+        // 运行期改密。
+        const QString fresh = QStringLiteral("fresh-pwd-3303");
+        mgr.setPassword(fresh);
+
+        // 新口令可用、旧引导值失效。
+        mgr.checkPassword(fresh);
+        QCOMPARE(spy.at(1).at(0).toBool(), true);
+        mgr.checkPassword(bootstrap);
+        QCOMPARE(spy.at(2).at(0).toBool(), false);
+
+        // 且两个口令都没有进日志。
+        const QString all = MsgCapture::joined();
+        QVERIFY2(!all.contains(bootstrap), "旧引导值泄漏到日志");
+        QVERIFY2(!all.contains(fresh), "新口令泄漏到日志");
     }
 };
 

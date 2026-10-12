@@ -8,6 +8,7 @@
 #include <QDebug>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -187,6 +188,26 @@ QString AppConfig::pcmFile(const QString& name) const
 {
     // 统一由 pcmDir 拼接，避免 "/tmp/pcm/xxx.pcm" 字面量散落各处。
     return QDir(m_pcmDir).filePath(name);
+}
+
+QString AppConfig::credentialStorePath() const
+{
+    // 与配置文件同目录、固定文件名。配置文件未加载（m_configPath 为空）
+    // 时返回空串 —— 那表示"纯内存"，不落盘。
+    //
+    // 特例：单元测试常用 "__nonexistent__.json" 这类不存在的相对路径来
+    // 表达"用默认值"。那种路径的目录是空的，QFileInfo::absolutePath()
+    // 会给出当前工作目录 —— 落盘到 CWD 是不该发生的副作用，所以对
+    // **不含目录分隔符** 的路径直接返回空串（= 纯内存）。
+    if (m_configPath.isEmpty()) {
+        return QString();
+    }
+    if (!m_configPath.contains(QLatin1Char('/'))
+        && !m_configPath.contains(QLatin1Char('\\'))) {
+        return QString();
+    }
+    return QFileInfo(m_configPath).absolutePath()
+           + QLatin1Char('/') + QStringLiteral("credentials.json");
 }
 
 } // namespace accessterminal

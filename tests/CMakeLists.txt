@@ -403,6 +403,7 @@ add_test(NAME t113_fingerprint_wire COMMAND t113_test_fingerprint_wire)
 add_executable(t113_test_password_manager
     test_password_manager.cpp
     ${ACCESSTERMINAL_SRC_ROOT}/managers/password_manager.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/managers/credential_store.cpp
     ${ACCESSTERMINAL_SRC_ROOT}/config/app_config.cpp
 )
 
@@ -416,6 +417,41 @@ target_link_libraries(t113_test_password_manager PRIVATE
 )
 
 add_test(NAME t113_password_manager COMMAND t113_test_password_manager)
+
+# ---------------------------------------------------------------------------
+# CredentialStore：口令**不得以明文留存**（第 41 轮，方案 P2）
+#
+# 重构前 `PasswordManager::checkPassword()` 是 `input == password` ——
+# **明文比对**；密码来自 AppConfig，落盘在 appconfig.json 里也是明文
+# （"door_password": "5788"）。门口机是实体门禁设备，配置文件可被任何能读它
+# 的人拿到（含运维、备份、镜像），而门禁密码就是物理准入凭据。
+#
+# 本目标把 CredentialStore 单独测：加盐迭代哈希、定长比较、按用户计数、
+# 锁定到期、临时码、以及**落盘文件里不含明文**。
+#
+# 关键写法（都是被本项目既有教训逼出来的）：
+#   - 「文件里不含明文」是**否定性**断言，极易恒真。因此每条都配阳性对照：
+#     文件存在且是合法 JSON、里面的哈希确实能验证正确口令、确实带 sha256 标记。
+#   - 「锁定会到期」用**时钟注入**确定性验证，不用 sleep（测试会慢且不确定）。
+#   - 「相同口令得到不同摘要」是**盐起作用唯一的直接证据**，必测。
+#
+# 纯逻辑类，只用 Qt5::Core + Qt5::Test，不需要硬件 / ALSA / OpenCV。
+# ---------------------------------------------------------------------------
+add_executable(t113_test_credential_store
+    test_credential_store.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/managers/credential_store.cpp
+)
+
+target_include_directories(t113_test_credential_store PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+)
+
+target_link_libraries(t113_test_credential_store PRIVATE
+    Qt5::Core
+    Qt5::Test
+)
+
+add_test(NAME t113_credential_store COMMAND t113_test_credential_store)
 
 # ---------------------------------------------------------------------------
 # GpioLine：物理门锁/补光线的 RAII 与资源生命周期（第 28 轮补）

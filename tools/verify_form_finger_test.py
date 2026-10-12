@@ -62,148 +62,51 @@ def read(p):
 FILES = (FF, FH, TF, SW, CM)
 
 # ---------------------------------------------------------------------------
-# 还原保险（README §61）：`finally` 不是还原保证。
-# 磁盘原始副本 + 启动自愈 + atexit/SIGINT/SIGTERM/SIGBREAK。
+# 还原保险与互斥：**公共实现**（第 41 轮提取到 tools/fixture_pristine.py）。
 #
-# 第 36 轮真实事故：第一版只把原文放内存里靠 finally 还原，脚本在第一个变异
-# 处被外部强杀，仓库里留下一个"看起来完全正常、只是少了一行"的源文件，
-# 直到下次运行预检报"锚点出现 0 次"才暴露。脚本自己把被测代码改坏了还静默
-# 退出 —— 最危险的一类污染。
+# 这里不再自己写一套 —— 这段逻辑踩过三次坑，每一层都是血的教训：
+#   1. 只靠 `finally` 还原 -> 被强杀就留下污染源文件（README §61）；
+#   2. 自愈只看"副本 != 当前文件" -> 静默回滚开发者的合法修改（第 37 轮）；
+#   3. "被中断"仍不够，**副本可能过期** -> 第 41 轮实测把
+#      tests/shadows/ui/widget.h 回滚成了第 37 轮之前的版本，
+#      抹掉了影子头的全部新增内容。
+# 现在统一由 PristineGuard 处理（含新鲜度校验），并且它自己有单元自检：
+# `tools/verify_fixture_pristine.py`（20 项，含"拒绝用过期副本自愈"）。
+#
+# 注意锁名必须与**其它改写同一批源文件**的夹具一致：
+#   verify_form_finger_rule.py / verify_credential_rule.py /
+#   verify_credential_store_test.py 都用 'fi37_rewrite.lock'。
 # ---------------------------------------------------------------------------
-BACKUP = os.path.join(os.environ['TEMP'], 'fi37_pristine')
-MARKER = os.path.join(BACKUP, '.in-progress')
-_ORIG = {}
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from fixture_pristine import PristineGuard  # noqa: E402
 
-
-def _backup_path(p):
-    return os.path.join(BACKUP, os.path.basename(p))
+_GUARD = PristineGuard(files=FILES, tag='fi37',
+                       lock_name='fi37_rewrite.lock')
+_ORIG = _GUARD.orig          # 兼容既有代码：_ORIG[p] 就是本次运行的基准内容
 
 
 def _load_pristine():
-    """建立/校验磁盘原始副本；返回被自愈的文件列表。
-
-    **只在"上一次运行被中断"时自愈。**
-    ----------------------------------------------------------------------
-    第 37 轮踩到的设计缺陷：第一版只要发现"磁盘副本 != 当前文件"就用副本
-    覆盖当前文件。这在"上一次被强杀留下污染"时是对的，但在**我自己刚改了
-    被测文件之后**（完全正常的工作流）就变成了**静默回滚我的修改** ——
-    实测就这么丢掉了一整轮测试补强，而且看起来一切正常（基线还是绿的）。
-
-    正确判据是"上一次运行是否**被中断**"，而不是"文件是否与副本不同"：
-      - 启动时若存在 `.in-progress` 标记 → 上次没跑完（被强杀/崩溃）→ 自愈；
-      - 否则 → 上次是正常结束的，副本只是**过期**了 → 用当前文件刷新副本，
-        绝不覆盖用户/开发者的修改。
-    标记在启动时创建、在正常结束时删除；`finally`/信号处理器也会把它删掉。
-    """
-    healed = []
-    os.makedirs(BACKUP, exist_ok=True)
-    interrupted = os.path.exists(MARKER)
-    for p in FILES:
-        b = _backup_path(p)
-        if os.path.exists(b) and interrupted:
-            backup_text = read(b)
-            if read(p) != backup_text:
-                io.open(p, 'w', encoding='utf-8',
-                        newline='\n').write(backup_text)
-                healed.append(os.path.basename(p))
-            _ORIG[p] = backup_text
-        else:
-            # 没有中断证据：以**当前**文件为准刷新副本（副本可能已过期）。
-            _ORIG[p] = read(p)
-            io.open(b, 'w', encoding='utf-8',
-                    newline='\n').write(_ORIG[p])
-    # 标记"本次运行开始"，供下一次启动判断是否被中断。
-    io.open(MARKER, 'w', encoding='utf-8', newline='\n').write('running\n')
-    return healed
+    """建立/校验磁盘原始副本（含新鲜度校验），返回被自愈的文件列表。"""
+    return _GUARD.prepare()
 
 
 def _restore_all(*_a):
-    for p in FILES:
-        if p in _ORIG:
-            try:
-                io.open(p, 'w', encoding='utf-8',
-                        newline='\n').write(_ORIG[p])
-            except OSError:
-                pass
-    try:
-        os.remove(MARKER)
-    except OSError:
-        pass
-    try:
-        _release_lock()
-    except NameError:
-        pass
+    """逐字节还原全部文件，清标记与锁。可安全重复调用。"""
+    _GUARD.restore()
 
 
 def _install_guards():
-    import atexit
-    import signal
-    atexit.register(_restore_all)
-
-    def handler(signum, _frame):
-        _restore_all()
-        print('\n[中断] 收到信号 %d，已还原源文件，退出' % signum)
-        sys.exit(130)
-
-    for name in ('SIGINT', 'SIGTERM', 'SIGBREAK'):
-        sig = getattr(signal, name, None)
-        if sig is not None:
-            try:
-                signal.signal(sig, handler)
-            except (ValueError, OSError):
-                pass
-
-
-# ---------------------------------------------------------------------------
-# 并发互斥：**两个改写同一批源文件的夹具绝不能同时跑**。
-#
-# 第 37 轮真实踩到：行为夹具还在后台跑时，我又触发了规则夹具（以及一次手工
-# 复现），三者都在改 form_finger.cpp / .h。结果是**交叉污染** ——
-# 规则夹具报"析构时不恢复"没被抓到、行为夹具报两个莫名其妙的误报/假绿，
-# 而单独串行重跑时**全部正常**。这属于第 36 轮"不要在扫描期间跑 verify.py"
-# 的同类错误，只是这次是两个扫描器互相踩。
-#
-# 用文件锁（独占创建）挡住：拿到锁才开工，否则立刻退出并说明原因。
-# 锁带 pid，便于人工确认；进程正常结束/被中断都会释放。
-# ---------------------------------------------------------------------------
-LOCK = os.path.join(os.environ['TEMP'], 'fi37_rewrite.lock')
+    """atexit + SIGINT/SIGTERM/SIGBREAK 还原。"""
+    _GUARD.install_guards()
 
 
 def _acquire_lock():
-    for _ in range(2):
-        try:
-            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, ('%d\n' % os.getpid()).encode('ascii'))
-            os.close(fd)
-            return True
-        except OSError:
-            # 已存在：判断持有者是否还活着（陈旧锁要能自动接管）。
-            try:
-                with io.open(LOCK, encoding='ascii') as fh:
-                    other = int(fh.read().strip())
-            except (OSError, ValueError):
-                other = None
-            alive = False
-            if other is not None:
-                try:
-                    os.kill(other, 0)
-                    alive = True
-                except OSError:
-                    alive = False
-            if alive:
-                return False
-            try:
-                os.remove(LOCK)
-            except OSError:
-                return False
-    return False
+    """拿不到锁返回 False（已有活着的夹具在改写同一批源文件）。"""
+    return _GUARD.acquire_lock()
 
 
 def _release_lock():
-    try:
-        os.remove(LOCK)
-    except OSError:
-        pass
+    _GUARD.release_lock()
 
 
 def need(s, n=1, p=FF):
