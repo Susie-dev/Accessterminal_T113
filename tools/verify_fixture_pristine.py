@@ -154,14 +154,58 @@ sb.cleanup()
 
 # ---------------------------------------------------------------------------
 print()
-print("=== 5. 互斥锁：活着的持有者必须挡住第二个实例 ===")
+print("=== 5. 互斥锁：活着的**别的进程**必须挡住第二个实例 ===")
 sb = Sandbox("fptest5")
-g = sb.make_guard()
-check("第一个实例拿到锁", g.acquire_lock())
+# 关键：必须让锁文件里的 pid 属于**另一个活着的进程**，否则测的是
+# "可重入"（5b）而不是"互斥"。第 41 轮实测：直接用两个同进程的 Guard，
+# 两边 pid 相同，可重入逻辑会正确地放行 —— 于是这条用例自己写错了。
+import subprocess  # noqa: E402
+import time  # noqa: E402
+
+sleeper = subprocess.Popen([sys.executable, "-c",
+                            "import time; time.sleep(30)"])
+time.sleep(0.8)
+lock_path = fp.temp_dir(sb.tag + ".lock")
+fp.write(lock_path, "%d\n" % sleeper.pid)
+try:
+    g = sb.make_guard()
+    check("别的活进程持锁时被拒绝", not g.acquire_lock())
+    check("被拒绝时未误标为已持有", not g.lock.held)
+finally:
+    sleeper.terminate()
+    sleeper.wait()
+# 持有者已死后应能接管
 g2 = sb.make_guard()
-check("第二个实例被拒绝", not g2.acquire_lock())
+check("持有者死后可接管", g2.acquire_lock())
+check("接管后锁属于本进程",
+      fp.read(lock_path).strip() == str(os.getpid()))
+g2.release_lock()
+sb.cleanup()
+
+# ---------------------------------------------------------------------------
+print()
+print("=== 5b. 同一进程内可重入（否则夹具会把自己锁在门外）===")
+sb = Sandbox("fptest5b")
+lock_path = fp.temp_dir(sb.tag + ".lock")
+# 模拟"夹具自带的另一套锁已经拿了这把锁"：锁文件里写本进程 pid。
+fp.write(lock_path, "%d\n" % os.getpid())
+g = sb.make_guard()
+check("持有者是本进程时可获取（可重入）", g.acquire_lock())
+check("标记为可重入", g.lock.reentrant)
 g.release_lock()
-check("释放后第三个实例可拿到", sb.make_guard().acquire_lock())
+check("可重入锁不能在 release 时删掉别人的锁",
+      os.path.exists(lock_path),
+      "锁被误删 —— 另一段代码还在持有它")
+# 正常自持锁必须真的能释放（**先 release 再查**：持有期间文件本来就该存在）
+try:
+    os.remove(lock_path)
+except OSError:
+    pass
+g2 = sb.make_guard()
+check("正常获取成功", g2.acquire_lock())
+check("持有期间锁文件存在", os.path.exists(lock_path))
+g2.release_lock()
+check("release 后锁文件被删（非可重入路径）", not os.path.exists(lock_path))
 sb.cleanup()
 
 # ---------------------------------------------------------------------------
@@ -176,6 +220,49 @@ check("陈旧锁被接管", g.acquire_lock())
 check("接管后锁文件属于本进程",
       fp.read(lock_path).strip() == str(os.getpid()))
 g.release_lock()
+sb.cleanup()
+
+# ---------------------------------------------------------------------------
+print()
+print("=== 6b. 存活探测：os.kill(pid,0) 在 Windows 上**不可靠** ===")
+# 第 41 轮实测：Windows 的 os.kill(pid,0) 对"曾经存在、现已正常退出"的 pid
+# **不抛异常**，于是被判为"活着" —— 陈旧锁永远无法接管，所有夹具静默停摆。
+# process_is_alive() 必须能正确区分这三种情形。
+import subprocess  # noqa: E402
+import time  # noqa: E402
+
+_dead = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+time.sleep(0.8)
+_dead_pid = _dead.pid
+_alive = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+time.sleep(0.8)
+try:
+    check("真活着的进程 -> True", fp.process_is_alive(_alive.pid))
+    check("本进程 -> True", fp.process_is_alive(os.getpid()))
+    _dead.terminate()
+    _dead.wait()
+    check("曾经存在、现已退出 -> False", not fp.process_is_alive(_dead_pid),
+          "被判为活着 —— 陈旧锁将永远无法接管")
+    check("从未存在的 pid -> False", not fp.process_is_alive(999999999))
+    check("pid<=0 -> False", not fp.process_is_alive(0)
+          and not fp.process_is_alive(-1))
+    # 反面证据：在 Windows 上必须与 os.kill 的结论不同，否则这条测试没意义
+    if os.name == "nt":
+        try:
+            os.kill(_dead_pid, 0)
+            naive = True
+        except OSError:
+            naive = False
+        check("（记录）os.kill 对已退出进程判为 %s" % ("活着" if naive else "已死"),
+              naive,
+              "如果 os.kill 也会判死，说明本机的行为与记录不同，请复核")
+finally:
+    for _p in (_dead, _alive):
+        try:
+            _p.terminate()
+            _p.wait()
+        except OSError:
+            pass
 sb.cleanup()
 
 # ---------------------------------------------------------------------------

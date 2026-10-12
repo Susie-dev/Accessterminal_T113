@@ -118,10 +118,20 @@ MUT = [
      '# target_compile_definitions removed'),
 
     # ---- 影子头安全阀被去掉 ----
+    #
+    # 第 41 轮修：锚点原先写的是**两个**宏的版本
+    # （`ACC_FORM_PASSWD_TEST` / `ACC_FORM_CALL_TEST`），但第 37 轮给影子头
+    # 加了第三个宏 `ACC_FORM_FINGER_TEST`（指纹窗体也要用它），
+    # 于是这条变异的锚点**从第 37 轮起就匹配不到了** ——
+    # 因为变异内的断言 `s.count(old) != 1` 会直接抛"锚点出现 0 次"，
+    # 夹具表现为整条用例失败（不是"没抓到"，而是夹具自己过期）。
+    # 这里按当前真实字节更新，并保留三宏形态。
     ("去掉影子 Widget 的 #error 安全阀", SW,
-     '#if !defined(ACC_FORM_PASSWD_TEST) && !defined(ACC_FORM_CALL_TEST)\n'
+     '#if !defined(ACC_FORM_PASSWD_TEST) && !defined(ACC_FORM_CALL_TEST) \\\n'
+     '    && !defined(ACC_FORM_FINGER_TEST)\n'
      '#  error "影子 ui/widget.h 只能用于测试；请在测试目标上定义 '
-     'ACC_FORM_PASSWD_TEST 或 ACC_FORM_CALL_TEST"\n#endif',
+     'ACC_FORM_PASSWD_TEST / ACC_FORM_CALL_TEST / ACC_FORM_FINGER_TEST"\n'
+     '#endif',
      '// 安全阀被移除'),
 
     # ---- 影子头缺 notifyPeerStopSend ----

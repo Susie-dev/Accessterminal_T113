@@ -93,6 +93,57 @@ def temp_dir(*parts):
     return os.path.join(base, *parts)
 
 
+def process_is_alive(pid):
+    """判断 pid 是否**仍然活着**。返回 True/False。
+
+    为什么不能只用 `os.kill(pid, 0)`（第 41 轮实测，Windows）
+    ----------------------------------------------------------------------
+    在 Windows 上 `os.kill(pid, 0)` 的行为是这样的：
+
+        * pid 从未存在（如 999999999）      -> OSError [WinError 87]
+        * pid 曾经存在、现已**正常退出**    -> **无异常**（被判为活着！）
+
+    也就是说它只能区分"从未存在"和"存在过"，**不能**区分"活着"与"已退出"。
+    后果很严重：夹具被强杀（`job_kill` / 任务管理器）留下的陈旧锁
+    **永远不会**被接管，之后每个夹具都会打印"另一个夹具正在改写源码"
+    然后拒绝干活 —— 整个自检体系静默停摆。
+
+    正确做法是用 Win32 API 查进程退出码：
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) 失败 -> 进程不存在；
+        GetExitCodeProcess() == STILL_ACTIVE(259)        -> 仍在运行。
+    非 Windows 平台退回 `os.kill(pid, 0)`（POSIX 语义是正确的）。
+
+    `PROCESS_QUERY_LIMITED_INFORMATION` 而非 `PROCESS_QUERY_INFORMATION`：
+    前者对权限的要求低得多（Vista 起可用），足以读退出码。
+    """
+    if pid is None or pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    # --- Windows ---
+    try:
+        import ctypes
+    except ImportError:                                  # pragma: no cover
+        return True                                      # 判不了就保守认为活着
+    k32 = ctypes.windll.kernel32
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False                                     # 打不开 = 不存在
+    try:
+        code = ctypes.c_ulong()
+        if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True                                  # 查不到就保守认为活着
+        return code.value == STILL_ACTIVE
+    finally:
+        k32.CloseHandle(handle)
+
+
 class _FileLock(object):
     """仓库级"正在改写源码"互斥锁（README §67）。
 
@@ -101,19 +152,29 @@ class _FileLock(object):
     而单独串行重跑时全部正常。
 
     锁带 pid；发现持有者已死则接管（清理陈旧锁）。
+
+    **同一进程内可重入**（第 41 轮补）：若锁的持有者 pid 就是本进程，
+    说明本夹具**自己**已经拿过这把锁（典型场景：夹具原先自带一套锁，
+    迁移到 PristineGuard 后两套共存），此时应视为"已持有"而非"被别人占"，
+    否则会出现**自己把自己锁在门外**的荒谬结果：
+    实测 `verify_door_actuator_test.py` 就是这样直接 rc=2 退出。
     """
 
     def __init__(self, lock_path):
         self.path = lock_path
         self.held = False
+        self.reentrant = False
 
     def acquire(self):
+        if self.held:
+            return True
         for _ in range(2):
             try:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 os.write(fd, ("%d\n" % os.getpid()).encode("ascii"))
                 os.close(fd)
                 self.held = True
+                self.reentrant = False
                 return True
             except OSError:
                 other = None
@@ -122,16 +183,20 @@ class _FileLock(object):
                         other = int(fh.read().strip())
                 except (OSError, ValueError):
                     other = None
-                alive = False
-                if other is not None:
-                    try:
-                        os.kill(other, 0)
-                        alive = True
-                    except OSError:
-                        alive = False
+                if other == os.getpid():
+                    # 本进程已经持有（另一套锁机制写的）。视为已持有，
+                    # 但**不要**在 release 时删掉它 —— 那把锁的主人是
+                    # 另一段代码，它自己会释放。
+                    self.held = True
+                    self.reentrant = True
+                    return True
+                alive = process_is_alive(other)
                 if alive:
                     return False
-                # 陈旧锁：持有者已死，清掉重来。
+                # 陈旧锁：持有者已死（或 pid 不可解析），清掉重来。
+                # 注意这里用的是 process_is_alive()，**不是** os.kill：
+                # Windows 上 os.kill(pid,0) 会把已退出的进程判成活着，
+                # 陈旧锁将永远无法接管（第 41 轮实测）。
                 try:
                     os.remove(self.path)
                 except OSError:
@@ -139,7 +204,7 @@ class _FileLock(object):
         return False
 
     def release(self):
-        if self.held:
+        if self.held and not self.reentrant:
             try:
                 os.remove(self.path)
             except OSError:
@@ -266,8 +331,16 @@ class PristineGuard(object):
         self.lock.release()
 
     def acquire_lock(self):
-        """拿到互斥锁返回 True；已被活着的进程持有返回 False。"""
+        """拿到互斥锁返回 True；已被**别的活进程**持有返回 False。
+
+        若锁的持有者就是本进程，视为可重入（已经持有），同样返回 True。
+        """
         return self.lock.acquire()
+
+    @property
+    def reentrant(self):
+        """本 Guard 是否走的"可重入"路径（锁的持有者就是本进程）。"""
+        return self.lock.reentrant
 
     def release_lock(self):
         self.lock.release()

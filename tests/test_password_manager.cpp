@@ -223,7 +223,14 @@ private slots:
         PasswordManager mgr;
 
         // 故意输错，触发"拒绝"路径 —— baseline 正是这条路径泄漏。
-        mgr.checkPassword(QStringLiteral("wrong-input-9"));
+        //
+        // 第 41 轮把输入换成 `zz-wrong-77`：它**全部由小写字母、数字和连字符
+        // 组成，且与日志里唯一可能出现的拉丁文本 `"[PasswordManager]"` 无
+        // 任何公共前缀**（该词不含 'z'、不含数字）。下面要逐前缀断言，
+        // 若输入含 'w'/'a'/'s' 之类字符，单字符前缀会与 "PasswordManager"
+        // 偶然重合，得到假红。选这个串是为了让"前缀断言"本身可靠。
+        const QString kInput = QStringLiteral("zz-wrong-77");
+        mgr.checkPassword(kInput);
 
         const QString all = MsgCapture::joined();
         const QByteArray hex = QByteArray(kSentinelPwd).toHex();
@@ -247,8 +254,31 @@ private slots:
         // ---- 用户输入同样不该出现 ----
         // 输入的每一部分都是密码的候选，且逐位日志（baseline 的
         // form_passwd.cpp 就有）会拼出完整密码。
-        QVERIFY2(!all.contains(QStringLiteral("wrong-input-9")),
+        QVERIFY2(!all.contains(kInput),
                  qPrintable(QStringLiteral("用户输入泄漏到日志: ") + all));
+
+        // ---- 第 41 轮补：**编码形式与截断形式**的用户输入同样算泄漏 ----
+        //
+        // 故障注入实测发现的真空白：上面只断言了"用户输入明文"不出现，
+        // 于是下面两种变异能**全绿通过**：
+        //   * `<< input.toUtf8().toHex()`  —— hex 是可逆编码，等于明文；
+        //   * `<< input.left(4) + "***"`    —— 前缀脱敏对短口令等于全泄。
+        // （它们原本抓不到，是因为断言只查了**已存储密码**的 hex 与前缀；
+        //   而 P2 之后产线代码里已经拿不到明文口令，真正剩下的泄漏口
+        //   就是用户输入本身 —— 断言必须跟着挪过来。）
+        QVERIFY2(!all.contains(QString::fromLatin1(kInput.toUtf8().toHex())),
+                 qPrintable(QStringLiteral("用户输入的 hex 形式泄漏到日志: ")
+                            + all));
+
+        // 逐个前缀都要断言：只查 `left(4)` 会漏掉 `left(2)`、`mid(0,n)`、
+        // `.at(0)` 等其它脱敏写法。n 从 1 起是安全的，因为 kInput 与日志里
+        // 的拉丁文本无公共前缀（见上面的选串说明）。
+        for (int n = 1; n <= kInput.size(); ++n) {
+            const QString prefix = kInput.left(n);
+            QVERIFY2(!all.contains(prefix),
+                     qPrintable(QStringLiteral("用户输入前缀泄漏(%1 字符): %2")
+                                    .arg(n).arg(all)));
+        }
     }
 
     /**
@@ -274,7 +304,11 @@ private slots:
         QCOMPARE(probeSpy.at(0).at(0).toBool(), true);
 
         MsgCapture cap;
-        mgr.checkPassword(QStringLiteral("nope"));
+        // 输入用 `zz-88`：全部由小写 z、数字和连字符组成，与日志里唯一
+        // 可能出现的拉丁文本 `"[PasswordManager]"` 无公共前缀
+        // （该词不含 'z'、不含数字），所以下面的逐前缀断言不会假红。
+        const QString kInput = QStringLiteral("zz-88");
+        mgr.checkPassword(kInput);
 
         const QString all = MsgCapture::joined();
         QVERIFY2(MsgCapture::contains(QStringLiteral("密码校验完成")),
@@ -294,6 +328,21 @@ private slots:
 
         QVERIFY2(!all.contains(QString::fromLatin1(secret.toUtf8().toHex())),
                  qPrintable(QStringLiteral("密码 hex 泄漏: ") + all));
+
+        // ---- 第 41 轮补：**用户输入**的截断/编码形式同样算泄漏 ----
+        //
+        // 本用例前面校验的是"已设置的口令"；而它最后那次 checkPassword 的
+        // **输入**同样是敏感候选。故障注入实测：把日志改成
+        // `<< input.left(4) + "***"` 时本用例仍然全绿 —— 因为断言只覆盖了
+        // secret，没覆盖 input。这里补上，两条路径都要干净。
+        for (int n = 1; n <= kInput.size(); ++n) {
+            const QString prefix = kInput.left(n);
+            QVERIFY2(!all.contains(prefix),
+                     qPrintable(QStringLiteral("用户输入前缀泄漏(%1 字符): %2")
+                                    .arg(n).arg(all)));
+        }
+        QVERIFY2(!all.contains(QString::fromLatin1(kInput.toUtf8().toHex())),
+                 qPrintable(QStringLiteral("用户输入 hex 泄漏: ") + all));
     }
 
     /**

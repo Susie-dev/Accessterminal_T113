@@ -131,16 +131,26 @@ if not (HAS_FP or HAS_FF):
     print("提示: 本仓库没有指纹代码，两条规则均为 no-op，仅执行 no-op 校验。")
 
 print("== check_declared_slot_is_reachable ==")
-# 真阳性：门口机仓库本就有 3 个不可达槽
+# 真阳性：门口机仓库本就有不可达槽
 case("真实仓库（有不可达槽）", "slot", None, 1 if HAS_FP else 0,
      requires=None)
-# 真阴性：把 startEnroll 变成被调用，则该项消失
-# 注意期望是 2 而不是 0：这个变异只让 startEnroll 变得可达，
-# 另外两个 Widget 槽仍然不可达。基线是 3 条，变异后少 1 条。
-case("给 startEnroll 加上调用者 -> 只剩 2 条", "slot",
+# 真阴性：把 startEnroll 变成被调用，则该项消失。
+#
+# 第 41 轮修正：期望值从 **2 改为 0**。
+# 第 23 轮写这条时全仓库有 **3** 个不可达槽，让 startEnroll 可达后
+# 还剩 2 个，所以当年写的是 2。此后 18 轮里另外两个槽陆续被处理掉
+# （一个接了线、一个删了），基线降到 **1 条**；于是"少 1 条"的正确结果
+# 变成 **0**，而旧期望 2 永远不可能再满足 —— 夹具表现为恒定的假红。
+#
+# 这里同时把"基线确实是 1 条、且那 1 条就是 startEnroll"钉死：
+# 第一条用例只断言 >=1，无法区分"基线 3 条"和"基线 1 条"，
+# 正是这个空档让过期期望藏了 18 轮。下面加一条精确基线的断言。
+case("真实仓库：不可达槽基线恰为 1 条（即 startEnroll）", "slot", None,
+     1, 1, requires=HAS_FP)
+case("给 startEnroll 加上调用者 -> 归零", "slot",
      patch(FM, 'emit enrollResult(false, id, "请按下手指进行第1次采集");',
            'startEnroll(0);\n    emit enrollResult(false, id, "请按下手指进行第1次采集");'),
-     0, 2, requires=HAS_FP)
+     0, 0, requires=HAS_FP)
 
 print()
 print("== check_live_fingerprint_enroll_sequence_is_pinned ==")

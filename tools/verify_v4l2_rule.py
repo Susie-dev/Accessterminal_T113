@@ -38,6 +38,9 @@ import shutil
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from fixture_pristine import PristineGuard  # noqa: E402
+
 for _s in (sys.stdout, sys.stderr):
     try:
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -185,7 +188,37 @@ def restore_all():
             write(p, o)
 
 
+# ---------------------------------------------------------------------------
+# 就地改写**真实仓库文件**的还原保险（第 41 轮补）。
+#
+# 本夹具原先只靠 `finally` 把内容写回内存里的 orig。第 36/41 轮实测：
+# 夹具被外部强杀时（Windows `job_kill` 走 TerminateProcess，finally /
+# atexit / 信号处理器**全都不执行**），仓库里就会留下一个被变异过的源文件，
+# 而且它看起来完全正常 —— 最危险的一类污染。
+#
+# 现在多一层 PristineGuard：磁盘副本 + 中断哨兵 + **新鲜度校验**
+# （副本过期时拒绝自愈，宁可留污染也不删合法改动）+ atexit/信号 + 互斥锁。
+# 它自己的单元自检：tools/verify_fixture_pristine.py。
+#
+# 注意：夹具内部原有的 `finally: 写回 orig` **保留**，它是第一道防线；
+# 本层是唯一能在被强杀后仍然生效的那道。
+# ---------------------------------------------------------------------------
+_GUARD = PristineGuard(files=[SRC, TEST, FAKE, CM, HARNESS, VERIFY], tag='g31v4', lock_name='fi37_rewrite.lock')
+
+
 def main():
+    if not _GUARD.acquire_lock():
+        print('!! 已有另一个"改写源文件"的夹具在运行，请串行执行。')
+        return 3
+    try:
+        _GUARD.prepare()
+        _GUARD.install_guards()
+        return _main_locked()
+    finally:
+        _GUARD.restore()
+
+
+def _main_locked():
     rc, x = run_verify()
     print('基线: rc=%d, X 行=%s' % (rc, x))
     if rc != 0 or x:

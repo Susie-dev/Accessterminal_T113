@@ -30,6 +30,9 @@ import os
 import re
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from fixture_pristine import process_is_alive  # noqa: E402
 import tempfile
 
 for _s in (sys.stdout, sys.stderr):
@@ -222,14 +225,11 @@ def _acquire_lock():
                     other = int(fh.read().strip())
             except (OSError, ValueError):
                 other = None
-            alive = False
-            if other is not None:
-                try:
-                    os.kill(other, 0)
-                    alive = True
-                except OSError:
-                    alive = False
-            if alive:
+            # 存活探测必须用 process_is_alive()，**不能用 os.kill(pid,0)**：
+            # 第 41 轮实测，Windows 上 os.kill 对"曾经存在、现已退出"的 pid
+            # 不抛异常，于是陈旧锁被判成"持有者还活着"、**永远无法接管**，
+            # 之后每个夹具都只会打印"另一个夹具正在改写源码"然后拒绝干活。
+            if process_is_alive(other):
                 return False
             try:
                 os.remove(LOCK)

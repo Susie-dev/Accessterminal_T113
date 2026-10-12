@@ -29,6 +29,9 @@ import shutil
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from fixture_pristine import PristineGuard  # noqa: E402
+
 # 标准输出固定 UTF-8 且不可编码字符降级为替代符：本机控制台是 GBK，
 # 脚本里的 ✓ 会抛 UnicodeEncodeError，且崩在**打印结果那一行**。
 for _s in (sys.stdout, sys.stderr):
@@ -61,47 +64,93 @@ ENV['PATH'] = (os.path.join(MSYS, 'mingw64', 'bin') + os.pathsep
 SAFE_LOG = ('    qDebug() << "[PasswordManager] 密码校验完成，结果:" '
             '<< (matched ? "通过" : "拒绝");')
 
+# ---------------------------------------------------------------------------
+# 第 41 轮更新：P2 把门级口令改成**加盐哈希**存储后，`PasswordManager` 里
+# **不再有** `password` 这个成员，因此这些变异原来引用的 `password` 变量
+# 已经不存在 —— 逐一替换成 `input`（用户本次输入）。
+#
+# 这不是"为了编译通过而凑合"：**泄漏口本来就只剩 `input` 了**。
+# 重构前有两个泄漏源（用户输入 + 已存储的正确密码）；现在产线代码里
+# 根本拿不到明文口令（只有盐和摘要），所以"打日志"能泄露的只有用户输入。
+# 而值守用例正是拿**正确口令**当输入去调的（`checkPassword(secret)`），
+# 所以打 `input` 依然是真实泄漏，那两条用例依然抓得住。
+#
+# 反过来说：**原来的"已存储密码"类变异现在不可能成立了**，这正是 P2 的
+# 预期效果。夹具如实反映这一点，而不是留一组编译不过的死变异。
+# ---------------------------------------------------------------------------
 MUT = [
-    ("还原 baseline 原句（input/password/双方 hex 全打）",
+    ("还原 baseline 原句（input 与双方 hex 全打）",
      '    qDebug() << "[PasswordManager] checkPassword: input=" << input\n'
-     '             << ", password=" << password\n'
-     '             << ", inputHex=" << input.toUtf8().toHex()\n'
-     '             << ", pwdHex=" << password.toUtf8().toHex();', True),
+     '             << ", inputHex=" << input.toUtf8().toHex();', True),
 
-    ("只打明文密码",
+    ("只打明文输入（用户键入的正确口令会落盘）",
      '    qDebug() << "[PasswordManager] 密码校验完成，结果:"\n'
-     '             << (matched ? "通过" : "拒绝") << password;', True),
+     '             << (matched ? "通过" : "拒绝") << input;', True),
 
-    ("只打密码的 hex",
+    ("只打输入的 hex",
      '    qDebug() << "[PasswordManager] 密码校验完成，结果:"\n'
-     '             << (matched ? "通过" : "拒绝") << password.toUtf8().toHex();', True),
+     '             << (matched ? "通过" : "拒绝") << input.toUtf8().toHex();', True),
 
-    ("前缀脱敏 password.left(4)",
+    ("前缀脱敏 input.left(4)",
      '    qDebug() << "[PasswordManager] 密码校验完成，结果:"\n'
-     '             << (matched ? "通过" : "拒绝") << password.left(4) + "***";', True),
+     '             << (matched ? "通过" : "拒绝") << input.left(4) + "***";', True),
 
     ("拼进字符串再打（绕过变量名+<<的静态正则形态）",
      '    qDebug() << QStringLiteral("[PasswordManager] 密码校验完成，结果:%1 raw=%2")\n'
-     '                    .arg(matched ? "通过" : "拒绝", password);', True),
+     '                    .arg(matched ? "通过" : "拒绝", input);', True),
 
     ("经辅助函数转一手再打",
-     '    { const QString dbg = password; qDebug() << "[PasswordManager] 密码校验完成，结果:"\n'
+     '    { const QString dbg = input; qDebug() << "[PasswordManager] 密码校验完成，结果:"\n'
      '             << (matched ? "通过" : "拒绝") << dbg; }', True),
 
     ("对照：只打长度",
      '    qDebug() << "[PasswordManager] 密码校验完成，结果:"\n'
-     '             << (matched ? "通过" : "拒绝") << password.size();', False),
+     '             << (matched ? "通过" : "拒绝") << input.size();', False),
 
     ("对照：只打空判定",
      '    qDebug() << "[PasswordManager] 密码校验完成，结果:"\n'
-     '             << (matched ? "通过" : "拒绝") << password.isEmpty();', False),
+     '             << (matched ? "通过" : "拒绝") << input.isEmpty();', False),
 ]
+
+# 说明：P2 之后**不再有**"已存储明文口令"这一类变异，因为产线代码里
+# 已经不存在明文口令变量。夹具若保留那种变异，只会编译失败并报假红。
+
 
 FAIL_CASES = ('correctPasswordNeverAppearsInLogs',
               'partialMaskingWouldStillCountAsLeak')
 
 
+# ---------------------------------------------------------------------------
+# 就地改写**真实仓库文件**的还原保险（第 41 轮补）。
+#
+# 本夹具原先只靠 `finally` 把内容写回内存里的 orig。第 36/41 轮实测：
+# 夹具被外部强杀时（Windows `job_kill` 走 TerminateProcess，finally /
+# atexit / 信号处理器**全都不执行**），仓库里就会留下一个被变异过的源文件，
+# 而且它看起来完全正常 —— 最危险的一类污染。
+#
+# 现在多一层 PristineGuard：磁盘副本 + 中断哨兵 + **新鲜度校验**
+# （副本过期时拒绝自愈，宁可留污染也不删合法改动）+ atexit/信号 + 互斥锁。
+# 它自己的单元自检：tools/verify_fixture_pristine.py。
+#
+# 注意：夹具内部原有的 `finally: 写回 orig` **保留**，它是第一道防线；
+# 本层是唯一能在被强杀后仍然生效的那道。
+# ---------------------------------------------------------------------------
+_GUARD = PristineGuard(files=[PM], tag='g27pl', lock_name='fi37_rewrite.lock')
+
+
 def main():
+    if not _GUARD.acquire_lock():
+        print('!! 已有另一个"改写源文件"的夹具在运行，请串行执行。')
+        return 3
+    try:
+        _GUARD.prepare()
+        _GUARD.install_guards()
+        return _main_locked()
+    finally:
+        _GUARD.restore()
+
+
+def _main_locked():
     orig = io.open(PM, encoding='utf-8', errors='replace').read()
     if orig.count(SAFE_LOG) != 1:
         print('[夹具错误] 安全日志锚点出现 %d 次' % orig.count(SAFE_LOG))

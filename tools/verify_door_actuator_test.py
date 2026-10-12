@@ -35,6 +35,9 @@ import re
 import shutil
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from fixture_pristine import PristineGuard, process_is_alive# noqa: E402
 import tempfile
 
 for _s in (sys.stdout, sys.stderr):
@@ -168,60 +171,68 @@ def _run():
 
 
 # ---------------------------------------------------------------------------
-# 仓库级"正在改写源码"文件锁
+# 并发互斥：交给 **PristineGuard**（第 41 轮统一）。
 #
-# 为什么要锁：夹具是"原地改写源文件 → 跑校验 → 还原"，任何**读源码**的操作与
-# 它并发都会看到中间状态。第 40 轮实测：一边跑夹具、一边后台
+# 本夹具原先自带一套 LOCK/_acquire_lock/_release_lock，用的是**同一把锁**
+# （fi37_rewrite.lock）。第 41 轮给 main() 套上 PristineGuard 之后，
+# 内层这套变成纯冗余，而且实测会造成"自己把自己锁在门外"：
+# Guard 已经持有锁 -> 内层再拿 -> 只看到"文件已存在且持有者活着" -> rc=2。
+#
+# 保留两套没有价值：同一进程内不存在竞争，而 Guard 已经提供了
+#   (a) 跨进程互斥、(b) 陈旧锁接管（用可靠的 process_is_alive，
+#       而不是 Windows 上会误判的 os.kill）、(c) 同一进程内可重入。
+# 删掉内层这套，只留一处实现（README §34：同一逻辑不要留两份）。
+#
+# 为什么要锁：夹具是"原地改写源文件 -> 跑校验 -> 还原"，任何**读源码**的
+# 操作与它并发都会看到中间状态。第 40 轮实测：一边跑夹具、一边后台
 # `cmake --build && ctest`，构建把**变异后的** door_actuator.cpp 编进目标文件，
-# 于是 t113_door_actuator / t113_access_controller 双双 Failed，而串行重跑
-# 20/20 全过 —— 与第 37 轮"两个夹具互相踩"是同一类错误，只是这次踩的是构建。
-#
-# 锁名沿用既有两个 form_finger 夹具的 fi37_rewrite.lock，因此四个夹具之间也
-# 互斥；目录优先用 TEMP（Windows 惯例），没有就退到系统临时目录（Linux）——
-# 既有两个夹具直接读 os.environ['TEMP']，在 Linux 上会 KeyError，本夹具不重复
-# 那个跨平台问题。
+# 于是 t113_door_actuator / t113_access_controller 双双 Failed，
+# 而串行重跑 20/20 全过 —— 与第 37 轮"两个夹具互相踩"是同一类错误。
 # ---------------------------------------------------------------------------
 LOCK = os.path.join(os.environ.get('TEMP') or tempfile.gettempdir(),
                     'fi37_rewrite.lock')
 
 
 def _acquire_lock():
-    for _ in range(2):
-        try:
-            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, ('%d\n' % os.getpid()).encode('ascii'))
-            os.close(fd)
-            return True
-        except OSError:
-            try:
-                with io.open(LOCK, encoding='ascii') as fh:
-                    other = int(fh.read().strip())
-            except (OSError, ValueError):
-                other = None
-            alive = False
-            if other is not None:
-                try:
-                    os.kill(other, 0)
-                    alive = True
-                except OSError:
-                    alive = False
-            if alive:
-                return False
-            try:
-                os.remove(LOCK)
-            except OSError:
-                return False
-    return False
+    """委托给 PristineGuard（它在 main() 之前已构造）。"""
+    return _GUARD.acquire_lock()
 
 
 def _release_lock():
-    try:
-        os.remove(LOCK)
-    except OSError:
-        pass
+    _GUARD.release_lock()
+
+
+# ---------------------------------------------------------------------------
+# 就地改写**真实仓库文件**的还原保险（第 41 轮补）。
+#
+# 本夹具原先只靠 `finally` 把内容写回内存里的 orig。第 36/41 轮实测：
+# 夹具被外部强杀时（Windows `job_kill` 走 TerminateProcess，finally /
+# atexit / 信号处理器**全都不执行**），仓库里就会留下一个被变异过的源文件，
+# 而且它看起来完全正常 —— 最危险的一类污染。
+#
+# 现在多一层 PristineGuard：磁盘副本 + 中断哨兵 + **新鲜度校验**
+# （副本过期时拒绝自愈，宁可留污染也不删合法改动）+ atexit/信号 + 互斥锁。
+# 它自己的单元自检：tools/verify_fixture_pristine.py。
+#
+# 注意：夹具内部原有的 `finally: 写回 orig` **保留**，它是第一道防线；
+# 本层是唯一能在被强杀后仍然生效的那道。
+# ---------------------------------------------------------------------------
+_GUARD = PristineGuard(files=[ACTUATOR], tag='g32da', lock_name='fi37_rewrite.lock')
 
 
 def main():
+    if not _GUARD.acquire_lock():
+        print('!! 已有另一个"改写源文件"的夹具在运行，请串行执行。')
+        return 3
+    try:
+        _GUARD.prepare()
+        _GUARD.install_guards()
+        return _main_locked()
+    finally:
+        _GUARD.restore()
+
+
+def _main_locked():
     if not _acquire_lock():
         print("另一个夹具正在改写源码（%s）—— 请等它跑完再试" % LOCK)
         print("（构建/ctest/verify.py 也不要与夹具并发：会读到变异后的源码）")

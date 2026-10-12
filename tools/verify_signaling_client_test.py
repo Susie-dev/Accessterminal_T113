@@ -28,6 +28,9 @@ import shutil
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from fixture_pristine import PristineGuard  # noqa: E402
+
 # 把标准输出固定为 UTF-8 且不可编码字符降级为替代符。
 #
 # 必要性（第 25 轮实测）：本机控制台是 GBK；脚本里的 ✓ 会抛
@@ -166,6 +169,25 @@ if r.returncode != 0:
 print()
 
 problems = []
+# ---------------------------------------------------------------------------
+# 就地改写**真实仓库文件**的还原保险（第 41 轮补）。
+#
+# 本夹具原先只把 orig 留在内存、靠 finally 写回。夹具被外部强杀时
+# （Windows `job_kill` 走 TerminateProcess，finally / atexit / 信号处理器
+# **全都不执行**），仓库里就会留下被变异过的源文件 —— 而且看起来完全正常。
+#
+# 现在多一层 PristineGuard：磁盘副本 + 中断哨兵 + 新鲜度校验
+# （副本过期时拒绝自愈）+ atexit/信号 + 互斥锁。
+# 单元自检：tools/verify_fixture_pristine.py。
+# ---------------------------------------------------------------------------
+_GUARD = PristineGuard(files=[SC], tag='g24sc',
+                       lock_name='fi37_rewrite.lock')
+if not _GUARD.acquire_lock():
+    print('!! 已有另一个"改写源文件"的夹具在运行，请串行执行。')
+    sys.exit(3)
+_GUARD.prepare()
+_GUARD.install_guards()
+
 try:
     for item in MUTATIONS:
         # 普通项 (name, case, old, new)；复合变异 (name, case, [(old,new),...])
@@ -239,4 +261,5 @@ print()
 print('变异 %d 个，致命问题 %d 个' % (len(MUTATIONS), len(problems)))
 if problems:
     print('问题清单:', problems)
+_GUARD.restore()
 sys.exit(1 if problems else 0)
