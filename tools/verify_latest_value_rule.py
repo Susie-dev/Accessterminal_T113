@@ -104,15 +104,16 @@ MUT = [
        "    // quint64 frameGeneration() const;  // 变异：删掉声明")]),
 
     ("代际号自增挪出 lastFrame 的临界区", "没有和 lastFrame 的赋值放在同一个",
+     # 注意：这里的锚点在第 45 轮清理掉 `// 逐行注释：…` 噪声后**同步更新过**。
+     # 那些机器生成的注释曾被当成锚点文本的一部分，清理时如果不改这里，
+     # 夹具会报"锚点出现 0 次"——幸好它**报错**而不是静默跳过（见 README §78）。
      [(CAM_CPP,
        "        lastFrame = img;\n"
        "        // 代际号与帧**在同一临界区内**自增，消费者才能把\"代际号\"当作\n"
        "        // \"这一帧\"的可靠标识（见头文件里 frameGeneration 的说明）。\n"
        "        ++lastFrameGeneration;\n"
-       "    // 逐行注释：结束当前代码块作用域。\n"
        "    }",
        "        lastFrame = img;\n"
-       "    // 逐行注释：结束当前代码块作用域。\n"
        "    }\n"
        "    // 变异：自增搬到了临界区之外\n"
        "    if (loaded) { ++lastFrameGeneration; }")]),
@@ -127,17 +128,13 @@ MUT = [
      [(CAM_CPP,
        "    // QImage::size() 对空图返回 QSize(0,0)，因此没有帧时天然给出 (0,0)，\n"
        "    // 无需额外分支 —— 与\"先 getFrame() 判 isNull() 再取 size()\"等价。\n"
-       "    // 逐行注释：返回当前函数的执行结果或结束函数。\n"
        "    return lastFrame.size();",
-       "    // 逐行注释：返回当前函数的执行结果或结束函数。\n"
        "    return getFrame().size();")]),
 
     ("frameSize() 里出现 QImage", "里出现了 QImage",
      [(CAM_CPP,
-       "    // 逐行注释：返回当前函数的执行结果或结束函数。\n"
        "    return lastFrame.size();",
        "    const QImage snapshot = lastFrame;\n"
-       "    // 逐行注释：返回当前函数的执行结果或结束函数。\n"
        "    return snapshot.size();")]),
 
     ("拿掉人脸检测的丢弃式背压闸门", "没有『丢弃式』背压闸门",
