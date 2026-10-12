@@ -3861,11 +3861,13 @@ def _function_body(text, qualified_name):
 
     前提：调用方应传入**已剥离注释**的文本，否则注释里的花括号会打乱配对。
     """
-    marker = qualified_name + "("
-    i = text.find(marker)
-    if i < 0:
+    # 允许函数名与 `(` 之间有空白/换行：`marker = name + "("` 这种精确匹配
+    # 会被"换行后接左括号"的排版搞成"找不到函数"，于是规则报"无法解析" ——
+    # 而那是纯粹的格式变化，不该让规则变红（第 44 轮的对照变异就是这么失败的）。
+    m = re.search(re.escape(qualified_name) + r"\s*\(", text)
+    if m is None:
         return None
-    j = text.find("{", i + len(marker))
+    j = text.find("{", m.end())
     if j < 0:
         return None
     depth = 0
@@ -5047,6 +5049,144 @@ def check_face_anti_false_positive(root, src_root):
                  "的决定 —— 后来者会以为接了就能用")
 
 
+def check_resource_paths_are_resolved(root, src_root):
+    """`[resource-path]` 运行时资源路径必须只有一处真相，且失败要报清单。
+
+    为什么单独成规则（第 44 轮，方案 P5）
+    ------------------------------------
+    实测缺陷：人脸分类器路径在**三处**互不一致 ——
+      - `app_config.cpp` 默认值  : /root/haarcascade_frontalface_default.xml
+      - 根 CMakeLists.txt install: ${CMAKE_INSTALL_DATADIR}/accessterminal
+      - `deploy/install.sh`      : $PREFIX/share/
+    于是"按文档全新部署"的机器上默认配置指向的文件**根本不存在**，
+    `cv::CascadeClassifier::load()` 静默返回 false，人脸识别一直是关的，
+    而日志只有一行"加载失败" —— 现场会误判成摄像头坏了。
+
+    这类缺陷的通用形态是"**同一个资源名散落在多处，谁也不知道哪处才是真的**"。
+    规则守三件事：
+      A. 存在一个统一的解析入口，且 widget 用它（不再直接 load 配置值）；
+      B. 解析失败时必须**打印完整候选清单**（只打印"失败"就是老毛病）；
+      C. 文件名常量在各处一致（新增一处硬编码就会偏离）。
+    """
+    rp_h = os.path.join(src_root, "config", "resource_paths.h")
+    rp_cpp = os.path.join(src_root, "config", "resource_paths.cpp")
+    for p in (rp_h, rp_cpp):
+        if not os.path.isfile(p):
+            fail("[resource-path] 缺少 %s —— 运行时资源路径必须有统一的解析入口"
+                 "（否则同一个路径会散落各处、互相不一致而无人发现）"
+                 % os.path.relpath(p, root))
+            return
+
+    h = strip_comments_and_strings(read(rp_h))
+    c = strip_comments_and_strings(read(rp_cpp))
+
+    # ---- A. 解析入口存在，且候选优先级写在实现里 ----
+    if "cascadeSearchPaths" not in h or "resolveCascadePath" not in h:
+        fail("[resource-path] resource_paths.h 缺少 cascadeSearchPaths / "
+             "resolveCascadePath —— 路径解析必须是可测的纯逻辑，"
+             "不能埋在 widget.cpp（那是未测文件）里")
+    if "cascadeFileName" not in h:
+        fail("[resource-path] resource_paths.h 缺少 cascadeFileName —— "
+             "文件名必须是**单一常量**，硬编码多处必然偏离")
+
+    # ---- B. 「配置优先」必须真的**把配置值放进候选**（兼容性的核心）----
+    #
+    # 注意判据不能只是"出现了 configured 这个词"：它本来就在函数签名
+    # `const QString& configured` 里，于是"整段『把配置加进候选』的代码被
+    # 删掉"仍然会判绿。第 44 轮的夹具 A3 就精确地揭出了这个假绿。
+    # 正确的形态判据是：函数体里必须有**把 configure 变量插入 out** 的动作。
+    body_b = _function_body(strip_comments_only(read(rp_cpp)),
+                            "cascadeSearchPaths")
+    if body_b is None:
+        fail("[resource-path] 无法解析 cascadeSearchPaths 的函数体"
+             "（检查器需同步更新，别让本规则静默失效）")
+    elif not re.search(r"out\s*<<\s*\w*(?:cfg|configured)|"
+                       r"out\s*\.\s*(?:append|push_back)\s*\(\s*\w*(?:cfg|configured)",
+                       body_b):
+        fail("[resource-path] cascadeSearchPaths 没有把配置里显式写明的路径"
+             "放进候选清单 —— 现场部署是「配置说什么就是什么」，"
+             "回退只能在它不存在时发生")
+
+    # ---- C. 必须**真的启动过**失败清单（只打印"失败"查不出问题）----
+    wid = read(os.path.join(src_root, "ui", "widget.cpp"))
+    ws = strip_comments_and_strings(wid)
+    if "resolveCascadePath" not in ws:
+        fail("[resource-path] widget.cpp 没有调用 resolveCascadePath —— "
+             "类写了却不调用，与没有它等价")
+    # 失败分支必须把候选清单打出来。
+    if not re.search(r"cascadeSearchPaths\s*\(", ws):
+        fail("[resource-path] widget.cpp 在加载失败时没有打印候选清单 —— "
+             "现场只看到「加载失败」是无从排查的（这正是重构前的老毛病）")
+
+    # ---- D. 非 Linux 平台不得做平台相关的路径解析 ----
+    #
+    # `QFileInfo::absolutePath()` 在 Windows 上会把 "/etc/x/y.json" 变成
+    # "C:/etc/x/y.json"。主机上算出来的候选与目标机不同 —— 测试在主机过、
+    # 上板却不一样，是最难发现的一类假绿。第 44 轮实测过这一点。
+    body = _function_body(strip_comments_only(read(rp_cpp)),
+                          "cascadeSearchPaths")
+    if body is not None and re.search(r"absolutePath\s*\(", body):
+        fail("[resource-path] cascadeSearchPaths 里用了 QFileInfo::absolutePath()"
+             " —— 它做平台相关的绝对化（Windows 上会把 /etc/... 变成 "
+             "C:/etc/...），会让主机上算出的候选与目标机不同")
+
+    # ---- E. 文件名常量必须在所有当事处一致 ----
+    #
+    # 这条正是本规则存在的理由：三处不一致的**具体形态**就是文件名/目录
+    # 各不相同。任何一个地方写错名字，人脸识别就会静默失灵。
+    NAME = "haarcascade_frontalface_default.xml"
+    # 注意：字典的值统一是**文件路径**（下面一律 read()），不要混入已读文本 ——
+    # 第 44 轮第一版就在这里写错，规则对着 cpp 的内容去 os.path.isfile()，
+    # 报出"找不到 src/config/resource_paths.cpp"这种误导性的失败。
+    sites = {
+        "src/config/resource_paths.cpp":
+            os.path.join(src_root, "config", "resource_paths.cpp"),
+        "config/appconfig.json": os.path.join(root, "config", "appconfig.json"),
+        "CMakeLists.txt": os.path.join(root, "CMakeLists.txt"),
+        "deploy/install.sh": os.path.join(root, "deploy", "install.sh"),
+    }
+    for label, path in sites.items():
+        if not os.path.isfile(path):
+            fail("[resource-path] 找不到 %s" % label)
+            continue
+        if NAME not in read(path):
+            fail("[resource-path] %s 里没有出现分类器文件名 %s —— "
+                 "四处必须一致，任何一处偏离都会让人脸识别静默失灵"
+                 % (label, NAME))
+
+    # ---- F. 必须有单元测试，且测试目标已注册 ----
+    t = os.path.join(root, "tests", "test_resource_paths.cpp")
+    if not os.path.isfile(t):
+        fail("[resource-path] 缺少 tests/test_resource_paths.cpp —— "
+             "路径回退顺序是纯逻辑，必须可测（widget.cpp 不在覆盖率分母里）")
+    else:
+        ts = read(t)
+        # 「配置优先」必须有断言 —— 那是"不改变正确部署行为"的承诺。
+        if not re.search(r"\bvoid\s+(?:configuredPathIsAlwaysFirst|"
+                         r"resolvePrefersConfigured\w*)\s*\(\s*\)", ts):
+            fail("[resource-path] test_resource_paths.cpp 缺少「配置路径优先」用例"
+                 " —— 那是「不改变现场行为」的承诺")
+        # 回退行为必须被测（否则"修复"无从证明）。
+        if not re.search(r"\bvoid\s+resolveFallsBack\w*\s*\(\s*\)", ts):
+            fail("[resource-path] test_resource_paths.cpp 缺少「配置路径不存在时"
+                 "回退」用例 —— 这正是本修复要解决的问题，必须被钉住")
+        # 平台无关性必须有断言（主机与目标机必须算出一致的候选）。
+        if not re.search(r"absolutePath|盘符", ts):
+            fail("[resource-path] test_resource_paths.cpp 没有断言「候选里不得"
+                 "出现盘符」—— 平台相关解析是本模块踩过的真实坑")
+    tc = os.path.join(root, "tests", "CMakeLists.txt")
+    if os.path.isfile(tc):
+        tcs = read(tc)
+        # 必须检查 **add_test 注册**，不能只查目标名是否存在 ——
+        # `add_executable(t113_test_resource_paths ...)` 里也有这个名字，
+        # 于是"把 add_test 那一行删掉"会让判据照样通过：目标编得出、
+        # ctest 却永远不会跑它。第 44 轮的夹具 E1 精确揭出了这个假绿。
+        if not re.search(r"add_test\s*\(\s*NAME\s+t113_resource_paths\b", tcs):
+            fail("[resource-path] tests/CMakeLists.txt 没有用 add_test 注册 "
+                 "t113_resource_paths —— 目标编得出但 ctest 不跑它"
+                 "（README 第 78 条：会静默消失的检查比没有更糟）")
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: python verify.py <项目根目录> [另一仓库根目录]")
@@ -5111,6 +5251,7 @@ def main():
     check_credential_store_test_is_wired(root, src_root)
     check_latest_value_handoff(root, src_root)
     check_face_anti_false_positive(root, src_root)
+    check_resource_paths_are_resolved(root, src_root)
 
     print(f"校验目录: {root}")
     print("=" * 70)

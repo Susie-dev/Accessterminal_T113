@@ -100,6 +100,7 @@ set(APP_SOURCES
     src/main.cpp
 
     src/config/app_config.cpp
+    src/config/resource_paths.cpp
 
     src/core/net/signaling_client.cpp
     src/core/media/audio_receiver_thread.cpp

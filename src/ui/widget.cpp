@@ -14,6 +14,7 @@
 #include "ui_widget.h"
 
 #include "config/app_config.h"
+#include "config/resource_paths.h"
 #include "core/media/audio_receiver_thread.h"
 #include "core/media/audio_sender_thread.h"
 #include "core/media/camera_preview_server.h"
@@ -387,9 +388,26 @@ void Widget::setupModules()
     // 判定阈值来自配置（重构前是 FaceManager 内硬编码的 90，同名配置项不生效）。
     m_faceManager->setConfidenceThreshold(cfg.faceConfidenceThreshold());
 
-    const bool cascadeLoaded = loadFaceCascade(cfg.faceCascadePath());
-    qInfo() << "[人脸检测] 分类器加载" << (cascadeLoaded ? "成功" : "失败")
-            << cfg.faceCascadePath();
+    // 人脸分类器路径解析（第 44 轮）：配置里写的路径**优先**；只有它不存在时
+    // 才按部署脚本/CMake install 的落点回退寻找。重构前三处路径不一致，
+    // 默认部署下 load() 静默失败、人脸识别一直是关的且不报错。
+    const QString cascadePath = accessterminal::resolveCascadePath(
+        cfg.faceCascadePath(), cfg.configPath());
+    const bool cascadeLoaded = loadFaceCascade(
+        cascadePath.isEmpty() ? cfg.faceCascadePath() : cascadePath);
+    if (cascadeLoaded) {
+        qInfo() << "[人脸检测] 分类器加载成功:" << cascadePath;
+    } else {
+        // 失败时把**完整候选清单**打出来。只打印"加载失败"是重构前的老毛病：
+        // 现场无从判断到底找了哪些位置、哪个才是对的。
+        qWarning() << "[人脸检测] 分类器加载失败，已尝试以下位置:";
+        const QStringList tried = accessterminal::cascadeSearchPaths(
+            cfg.faceCascadePath(), cfg.configPath());
+        for (const QString& p : tried) {
+            qWarning() << "    -" << p;
+        }
+        qWarning() << "    请在配置 resources.face_cascade 里写明正确路径";
+    }
 
     connect(m_faceManager, &FaceManager::faceSampled, this,
             [this](int current, int /*total*/) {

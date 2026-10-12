@@ -73,6 +73,7 @@ LIBS += -lpthread
 SOURCES += \
     src/main.cpp \
     src/config/app_config.cpp \
+    src/config/resource_paths.cpp \
     src/core/net/signaling_client.cpp \
     src/core/media/audio_receiver_thread.cpp \
     src/core/media/audio_sender_thread.cpp \
@@ -96,6 +97,7 @@ SOURCES += \
 
 HEADERS += \
     src/config/app_config.h \
+    src/config/resource_paths.h \
     src/core/net/protocol.h \
     src/core/net/signaling_client.h \
     src/core/media/audio_receiver_thread.h \

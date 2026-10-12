@@ -103,6 +103,33 @@ target_link_libraries(t113_test_app_config PRIVATE
 add_test(NAME t113_app_config COMMAND t113_test_app_config)
 
 # ---------------------------------------------------------------------------
+# 资源路径解析（第 44 轮，方案 P5）
+#
+# 守的是"人脸分类器路径三处不一致导致默认部署静默失灵"这个真实缺陷。
+# 链接**真实的** resource_paths.cpp（不复制实现）；只需 Qt5::Core，
+# 不依赖 OpenCV/ALSA/libgpiod。
+#
+# 为什么必须有这个测试：修复的价值全在"回退顺序"与"去重"这些纯逻辑上，
+# 而它们恰好是 widget.cpp 里那几行（**从未被任何测试目标链接**，见覆盖率
+# 报告的未测文件清单）。把它抽成独立模块，就是让它可测。
+# ---------------------------------------------------------------------------
+add_executable(t113_test_resource_paths
+    test_resource_paths.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/config/resource_paths.cpp
+)
+
+target_include_directories(t113_test_resource_paths PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+)
+
+target_link_libraries(t113_test_resource_paths PRIVATE
+    Qt5::Core
+    Qt5::Test
+)
+
+add_test(NAME t113_resource_paths COMMAND t113_test_resource_paths)
+
+# ---------------------------------------------------------------------------
 # AudioManager 写循环 / XRUN 恢复 / 打断 / 析构等待
 #
 # 本工程出过两个真实缺陷的类（第 11 轮 XRUN 静默丢数据、第 12 轮
